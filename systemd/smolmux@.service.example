@@ -1,0 +1,32 @@
+# smolmux broker as a systemd user service, one instance per serial port.
+#
+# Install:
+#   cp smolmux@.service.example ~/.config/systemd/user/smolmux@.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now smolmux@ttyUSB0
+#
+# The instance name (%i) is the device under /dev - smolmux@ttyUSB0 opens
+# /dev/ttyUSB0. For stable names use a udev alias (see
+# docs/persistent-serial-devices.md) and e.g.:
+#   systemctl --user enable --now smolmux@serial-rpi-console
+# (systemd escapes '/' as '-'; %I un-escapes it back.)
+#
+# Adjust ExecStart flags: -b baud, -p profile, log dirs. Binaries installed
+# to /usr/local/bin assumed.
+
+[Unit]
+Description=smolmux broker on /dev/%I
+# Start when the device appears, stop when it goes away:
+#   BindsTo=dev-%i.device
+#   After=dev-%i.device
+# (leave commented for USB dongles you re-plug a lot - the broker's own
+# auto-reconnect with backoff handles that more gracefully)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smolmux /dev/%I -b 115200
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

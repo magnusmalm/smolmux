@@ -1,0 +1,49 @@
+{
+    "name": "GDB MI",
+    "device_type": "debugger",
+    "description": "GDB Machine Interface (MI3) subprocess",
+    "prompt_pattern": "\\(gdb\\)",
+    "command_prefix": "",
+    "response_mode": "prompt",
+    "default_timeout_ms": 10000,
+    "boot_banner": "=thread-group-added",
+    "commands": [
+        {"cmd": "-exec-continue", "description": "Continue execution"},
+        {"cmd": "-exec-step", "description": "Step one source line"},
+        {"cmd": "-exec-next", "description": "Step over one source line"},
+        {"cmd": "-exec-finish", "description": "Execute until function returns"},
+        {"cmd": "-exec-interrupt", "description": "Interrupt running target"},
+        {"cmd": "-exec-run", "description": "Start the program"},
+        {"cmd": "-stack-list-frames", "description": "List stack frames"},
+        {"cmd": "-stack-list-locals 1", "description": "List local variables"},
+        {"cmd": "-data-evaluate-expression", "description": "Evaluate expression"},
+        {"cmd": "-break-insert", "description": "Insert breakpoint"},
+        {"cmd": "-break-delete", "description": "Delete breakpoint"},
+        {"cmd": "-break-list", "description": "List breakpoints"},
+        {"cmd": "-thread-info", "description": "Thread information"},
+        {"cmd": "-target-disconnect", "description": "Disconnect from target"},
+        {"cmd": "-gdb-exit", "description": "Exit GDB"}
+    ],
+    "anomaly_patterns": [
+        {
+            "name": "remote_closed",
+            "pattern": "Remote connection closed",
+            "severity": "critical"
+        },
+        {
+            "name": "target_signal",
+            "pattern": "Program received signal SIG",
+            "severity": "warning"
+        },
+        {
+            "name": "mi_error",
+            "pattern": "\\^error,msg=",
+            "severity": "warning"
+        },
+        {
+            "name": "target_exited",
+            "pattern": "\\*stopped,reason=\"exited",
+            "severity": "warning"
+        }
+    ]
+}

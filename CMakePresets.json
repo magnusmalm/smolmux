@@ -1,0 +1,57 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21 },
+    "configurePresets": [
+        {
+            "name": "default",
+            "displayName": "Default (dynamic, debug)",
+            "binaryDir": "build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "release",
+            "displayName": "Release (dynamic)",
+            "binaryDir": "build-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "musl",
+            "displayName": "Musl static (zero deps)",
+            "binaryDir": "build-musl",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/musl-toolchain.cmake",
+                "SM_MUSL_STATIC": "ON",
+                "SM_STRIP": "ON"
+            }
+        },
+        {
+            "name": "musl-aarch64",
+            "displayName": "Musl static aarch64 (cross-compile)",
+            "binaryDir": "build-musl-aarch64",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/musl-toolchain.cmake",
+                "SM_MUSL_STATIC": "ON",
+                "SM_STRIP": "ON",
+                "TARGET_ARCH": "aarch64"
+            }
+        },
+        {
+            "name": "musl-armv7",
+            "displayName": "Musl static armv7l (cross-compile)",
+            "binaryDir": "build-musl-armv7",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/musl-toolchain.cmake",
+                "SM_MUSL_STATIC": "ON",
+                "SM_STRIP": "ON",
+                "TARGET_ARCH": "armv7l"
+            }
+        }
+    ]
+}

@@ -1,0 +1,25 @@
+{
+    "name": "samc21",
+    "description": "Microchip SAM C21 (Cortex-M0+) via EDBG/OpenOCD. Architectural defaults from gdb_identify_target / gdb_generate_profile on SAM C21.",
+    "arch": "arm",
+    "gdb_path": "gdb-multiarch",
+    "gdb_init_commands": [
+        "set pagination off",
+        "set print pretty on"
+    ],
+    "important_registers": [
+        "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+        "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc", "xpsr",
+        "msp", "psp", "control", "primask"
+    ],
+    "fault_registers": [],
+    "peripheral_map": {
+        "SCB": "0xE000ED00",
+        "NVIC": "0xE000E100",
+        "SysTick": "0xE000E010",
+        "DWT": "0xE0001000",
+        "DSU": "0x41002000"
+    },
+    "rtos": "",
+    "rtos_commands": []
+}

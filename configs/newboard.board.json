@@ -1,0 +1,18 @@
+{
+    "board": "newboard",
+    "wires": [
+        {
+            "role": "console",
+            "link": "uart",
+            "device": "/dev/serial/by-id/usb-REPLACE-ME",
+            "baud": 115200,
+            "profile": "linux-shell"
+        },
+        {
+            "role": "swd",
+            "link": "gdb",
+            "gdb_path": "gdb-multiarch",
+            "target": "localhost:3333"
+        }
+    ]
+}

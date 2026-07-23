@@ -1,0 +1,24 @@
+{
+    "name": "esp-idf-uart",
+    "device_type": "mcu",
+    "description": "Espressif ESP32-family UART console (ESP-IDF / Arduino-ESP32 ROM + app boot log over USB-UART). Matches ESP-ROM banners on ESP32/S2/S3/C3-class chips. No interactive shell assumed - use pin reset or your flasher for a fresh banner. Baud typically 115200.",
+    "prompt_pattern": "",
+    "commands": [
+        "/* no default shell - reset the MCU and read the boot banner */"
+    ],
+    "boot_banner": "ESP-ROM:",
+    "boot_stall_timeout_ms": 8000,
+    "boot_stages": [
+        {"name": "rom", "pattern": "ESP-ROM:"},
+        {"name": "flash_boot", "pattern": "SPI_FAST_FLASH_BOOT"},
+        {"name": "app_entry", "pattern": "entry 0x"}
+    ],
+    "custom_anomaly_patterns": [
+        {"name": "guru_meditation", "pattern": "Guru Meditation Error", "severity": "critical"},
+        {"name": "brownout", "pattern": "Brownout detector was triggered", "severity": "critical"},
+        {"name": "panic_abort", "pattern": "abort\\(\\) was called", "severity": "critical"},
+        {"name": "stack_smashing", "pattern": "Stack smashing protect", "severity": "critical"},
+        {"name": "download_boot", "pattern": "DOWNLOAD_BOOT", "severity": "info"},
+        {"name": "rst_panic", "pattern": "rst:0x[0-9a-fA-F]+ \\(RTCWDT|TG[0-9]WDT|SW_CPU|PANIC\\)", "severity": "warning"}
+    ]
+}

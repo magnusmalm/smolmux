@@ -1,0 +1,6 @@
+# smolmux minimal config - UART only, no sinks, no watcher
+# CONFIG_SM_ENABLE_GDB is not set
+# CONFIG_SM_ENABLE_SINK_MCP is not set
+# CONFIG_SM_ENABLE_SINK_TCP is not set
+# CONFIG_SM_ENABLE_SINK_WS is not set
+# CONFIG_SM_ENABLE_WATCHER is not set

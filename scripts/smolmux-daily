@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# smolmux-daily - Convenient launcher for daily use / dogfooding
+# Usage:
+#   smolmux-daily stm32mp157 /dev/ttyUSB0
+#   smolmux-daily uboot /dev/ttyUSB0
+#   smolmux-daily generic /dev/ttyUSB0
+#
+
+set -euo pipefail
+
+TARGET="${1:-}"
+PORT="${2:-}"
+
+if [[ -z "$TARGET" || -z "$PORT" ]]; then
+    echo "Usage: $0 <target> <port>"
+    echo "  Targets: stm32mp157, uboot, generic"
+    echo "Example:"
+    echo "  $0 stm32mp157 /dev/ttyUSB0"
+    echo "  $0 uboot /dev/ttyUSB0"
+    exit 1
+fi
+
+if [[ ! -e "$PORT" ]]; then
+    echo "Error: $PORT does not exist"
+    exit 1
+fi
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="$BASE_DIR/build"
+
+if [[ ! -x "$BUILD_DIR/smolmux" ]]; then
+    echo "Error: $BUILD_DIR/smolmux not found. Run 'cmake --build build' first."
+    exit 1
+fi
+
+# Log directory under home for easy access
+LOG_BASE="$HOME/smolmux-logs"
+mkdir -p "$LOG_BASE"
+
+DATE=$(date +%Y-%m-%d_%H%M%S)
+LOG_DIR="$LOG_BASE/${TARGET}-${DATE}"
+mkdir -p "$LOG_DIR"
+
+echo "=== smolmux-daily ==="
+echo "Target : $TARGET"
+echo "Port   : $PORT"
+echo "Logs   : $LOG_DIR"
+echo
+
+case "$TARGET" in
+    stm32mp157|mp157|stm32)
+        PROFILE="$BASE_DIR/configs/uboot.smolmux-profile.json"
+        BAUD=115200
+        EXTRA_ARGS=""
+        echo "Using STM32MP157 U-Boot profile (generic uboot profile file)"
+        ;;
+
+    uboot)
+        PROFILE="$BASE_DIR/configs/uboot.smolmux-profile.json"
+        BAUD=115200
+        EXTRA_ARGS=""
+        echo "Using generic U-Boot profile"
+        ;;
+
+    generic|*)
+        PROFILE=""
+        BAUD=115200
+        EXTRA_ARGS=""
+        echo "Using generic settings (no profile)"
+        ;;
+esac
+
+CMD=("$BUILD_DIR/smolmux" "$PORT" -b "$BAUD" -l "$LOG_DIR" -t "$LOG_DIR" -v)
+
+if [[ -n "$PROFILE" && -f "$PROFILE" ]]; then
+    CMD+=(-p "$PROFILE")
+fi
+
+CMD+=($EXTRA_ARGS)
+
+echo "Command: ${CMD[*]}"
+echo "Starting smolmux... (Ctrl-C to stop)"
+echo "Monitor with: $BUILD_DIR/smolmux-monitor /tmp/smolmux-$(basename "$PORT").sock"
+echo
+
+exec "${CMD[@]}"

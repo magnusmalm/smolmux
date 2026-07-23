@@ -1,0 +1,5 @@
+# smolmux UART-only config
+# Copy to .config and run cmake to use.
+# CONFIG_SM_ENABLE_PCRE2 is not set
+CONFIG_SM_ENABLE_SINK_MCP=y
+CONFIG_SM_ENABLE_WATCHER=y

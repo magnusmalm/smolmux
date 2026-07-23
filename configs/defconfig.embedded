@@ -1,0 +1,6 @@
+# smolmux embedded config - UART + MCP + watcher, no network sinks
+# CONFIG_SM_ENABLE_GDB is not set
+# CONFIG_SM_ENABLE_SINK_TCP is not set
+# CONFIG_SM_ENABLE_SINK_WS is not set
+CONFIG_SM_ENABLE_SINK_MCP=y
+CONFIG_SM_ENABLE_WATCHER=y
