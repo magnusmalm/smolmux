@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `smolmux-cli shutdown` (alias `stop`) - stop one broker cleanly: SIGTERM by
+  its discovered pid, then wait until the socket disappears. Refuses to guess
+  when several brokers run and no `-s` is given.
+- Busy-port startup failures now name the holding smolmux broker (pid, socket,
+  board) with a shutdown hint, or point at `fuser` when the holder is another
+  process.
+- ESP profiles: first boot stage (`reset`) matches Arduino-ESP32 `rst:0x..`
+  cold boots as well as the classic `ESP-ROM:` banner.
+- New board manifest example: Waveshare ESP32-S3-Touch-LCD-1.28.
+
 ## 0.1.2 - first public release
 
 Portable C11 device multiplexer: one broker holds one wire (serial UART,
