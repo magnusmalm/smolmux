@@ -1,7 +1,7 @@
 {
     "name": "esp32-arduino-lvgl",
     "device_type": "mcu",
-    "description": "Arduino-ESP32 + LVGL demo firmware that prints 'Hello Arduino!' and 'Setup done' after ESP-ROM boot (e.g. Waveshare ESP32-S3-Touch-LCD stock LVGL_Arduino). Little steady-state UART traffic after boot. Prefer esp-idf-uart for generic ESP-IDF apps.",
+    "description": "Arduino-ESP32 + LVGL demo firmware that prints 'Hello Arduino!' and 'Setup done' after boot (e.g. Waveshare ESP32-S3-Touch-LCD stock LVGL_Arduino). First boot stage matches either the classic 'ESP-ROM:' banner or the Arduino/IDF 'rst:0x..' reset-reason line - cold boots on some Arduino cores never print ESP-ROM. Little steady-state UART traffic after boot. Prefer esp-idf-uart for generic ESP-IDF apps.",
     "prompt_pattern": "",
     "commands": [
         "/* no shell on stock LVGL demos - hard-reset and capture banner */"
@@ -9,7 +9,7 @@
     "boot_banner": "ESP-ROM:",
     "boot_stall_timeout_ms": 8000,
     "boot_stages": [
-        {"name": "rom", "pattern": "ESP-ROM:"},
+        {"name": "reset", "pattern": "ESP-ROM:|rst:0x[0-9a-fA-F]+"},
         {"name": "flash_boot", "pattern": "SPI_FAST_FLASH_BOOT"},
         {"name": "app_entry", "pattern": "entry 0x"},
         {"name": "arduino_hello", "pattern": "Hello Arduino!"},

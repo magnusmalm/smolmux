@@ -124,10 +124,36 @@ static void test_load_from_file(void)
     ASSERT_INT_EQ(sm_board_manifest_load("/nonexistent/x.board.json", &m), -1);
 }
 
+/* Every shipped example manifest must parse (guards configs/ against schema
+ * drift and typos in new board examples). */
+static void test_shipped_manifests_parse(void)
+{
+    const char *names[] = {
+        "esp32-uart.board.json",
+        "newboard.board.json",
+        "samc21.board.json",
+        "esp32-s3-touch-lcd-1.28.board.json",
+        NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "configs/%s", names[i]);
+        if (access(path, R_OK) != 0)
+            snprintf(path, sizeof(path), "../configs/%s", names[i]);
+        ASSERT(access(path, R_OK) == 0, "shipped manifest found");
+
+        sm_board_manifest_t m;
+        ASSERT_INT_EQ(sm_board_manifest_load(path, &m), 0);
+        ASSERT(m.board[0], "manifest names its board");
+        ASSERT(m.wire_count >= 1, "manifest has at least one wire");
+    }
+}
+
 int main(void)
 {
     printf("test_board_manifest\n");
     RUN_TEST(test_valid_manifest);
+    RUN_TEST(test_shipped_manifests_parse);
     RUN_TEST(test_defaults);
     RUN_TEST(test_rejects);
     RUN_TEST(test_socket_derivation);

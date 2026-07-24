@@ -15,6 +15,50 @@ static size_t feed(sm_boot_tracker_t *t, const char *s, double ts)
     return sm_boot_feed(t, (const uint8_t *)s, strlen(s), ts);
 }
 
+/* ISSUE-DF-ESP-3: Arduino-ESP32 cold boots may never print "ESP-ROM:" - the
+ * shipped ESP profiles' first stage matches the "rst:0x.." reset-reason line
+ * as an alternative. Mirror of configs/esp32-arduino-lvgl stages, fed a
+ * captured Arduino-style boot (no ESP-ROM) and then a classic IDF boot. */
+static void add_esp_stages(sm_boot_tracker_t *t)
+{
+    sm_boot_add_stage(t, "reset",         "ESP-ROM:|rst:0x[0-9a-fA-F]+");
+    sm_boot_add_stage(t, "flash_boot",    "SPI_FAST_FLASH_BOOT");
+    sm_boot_add_stage(t, "app_entry",     "entry 0x");
+    sm_boot_add_stage(t, "arduino_hello", "Hello Arduino!");
+    sm_boot_add_stage(t, "lvgl_ready",    "Setup done");
+}
+
+static void test_esp_reset_alternation(void)
+{
+    sm_boot_tracker_t t;
+    sm_boot_init(&t);
+    add_esp_stages(&t);
+
+    /* Arduino-style cold boot: reset reason line, no ESP-ROM banner. */
+    size_t n = feed(&t,
+        "Build:Mar 27 2021\n"
+        "rst:0x1 (POWERON),boot:0x18 (SPI_FAST_FLASH_BOOT)\n"
+        "SPIWP:0xee\n"
+        "mode:DIO, clock div:1\n"
+        "load:0x3fce3808,len:0x44c\n"
+        "entry 0x403c98d0\n"
+        "Hello Arduino! V8.3.10\n"
+        "I am LVGL_Arduino\n"
+        "Setup done\n", 1.0);
+    ASSERT_INT_EQ((int)n, 5);
+    ASSERT_INT_EQ(t.furthest, 4);
+    ASSERT(t.stages[0].reached, "reset stage reached without ESP-ROM");
+    ASSERT(sm_boot_terminal_reached(&t), "full Arduino boot tracked");
+
+    /* Classic IDF boot: the ESP-ROM: alternative must still fire (stage-0
+     * re-arrival is treated as a reboot and restarts the pipeline). */
+    ASSERT_INT_EQ((int)feed(&t, "ESP-ROM:esp32s3-20210327\n", 10.0), 1);
+    ASSERT(t.stages[0].reached, "reset stage reached via ESP-ROM");
+    ASSERT_INT_EQ(t.furthest, 0);
+
+    sm_boot_destroy(&t);
+}
+
 static void test_sequential_advance(void)
 {
     sm_boot_tracker_t t;
@@ -195,6 +239,7 @@ int main(void)
     RUN_TEST(test_reboot_reset_on_stage0);
     RUN_TEST(test_explicit_reset);
     RUN_TEST(test_empty_tracker_is_inert);
+    RUN_TEST(test_esp_reset_alternation);
 
     TEST_REPORT();
 }

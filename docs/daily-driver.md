@@ -350,6 +350,19 @@ should die when the command exits (Ctrl-C stops them all). `board down` finds a
 board's wires by their `--board` label and their pid via `SO_PEERCRED`, so there
 is no pidfile to go stale.
 
+To stop a **single** broker that isn't part of a board (or to replace the one
+holding a port), use `shutdown` (alias `stop`) - same SIGTERM-by-discovered-pid
+mechanism, scoped to one socket:
+
+```bash
+smolmux-cli -s /run/user/1000/smolmux-ttyUSB0.sock shutdown
+smolmux-cli shutdown        # works unqualified when exactly one broker is up
+```
+
+It waits until the broker's socket disappears, so when it returns the port is
+genuinely free. With several brokers running and no `-s` it refuses and lists
+them rather than guessing a kill target.
+
 ## Linux console login and multi-wire
 
 Lessons from factory Buildroot/BusyBox-style images and boards with more than

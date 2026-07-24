@@ -1,7 +1,7 @@
 {
     "name": "esp-idf-uart",
     "device_type": "mcu",
-    "description": "Espressif ESP32-family UART console (ESP-IDF / Arduino-ESP32 ROM + app boot log over USB-UART). Matches ESP-ROM banners on ESP32/S2/S3/C3-class chips. No interactive shell assumed - use pin reset or your flasher for a fresh banner. Baud typically 115200.",
+    "description": "Espressif ESP32-family UART console (ESP-IDF / Arduino-ESP32 ROM + app boot log over USB-UART). First boot stage matches the 'ESP-ROM:' banner or the 'rst:0x..' reset-reason line (Arduino cores may cold-boot without ESP-ROM). No interactive shell assumed - use pin reset or your flasher for a fresh banner. Baud typically 115200.",
     "prompt_pattern": "",
     "commands": [
         "/* no default shell - reset the MCU and read the boot banner */"
@@ -9,7 +9,7 @@
     "boot_banner": "ESP-ROM:",
     "boot_stall_timeout_ms": 8000,
     "boot_stages": [
-        {"name": "rom", "pattern": "ESP-ROM:"},
+        {"name": "reset", "pattern": "ESP-ROM:|rst:0x[0-9a-fA-F]+"},
         {"name": "flash_boot", "pattern": "SPI_FAST_FLASH_BOOT"},
         {"name": "app_entry", "pattern": "entry 0x"}
     ],

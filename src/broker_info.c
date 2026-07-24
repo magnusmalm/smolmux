@@ -4,11 +4,14 @@
 #include "util/json_helpers.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -192,4 +195,87 @@ void sm_broker_info_format(const sm_broker_info_t *info, char *buf, size_t len)
              info->connected ? "up" : "down",
              info->suspended ? " (suspended)" : "",
              info->client_count, info->client_count == 1 ? "" : "s", board);
+}
+
+int sm_broker_stop_by_socket(const char *socket_path, int timeout_ms,
+                             int *pid_out, char *errbuf, size_t errlen)
+{
+    if (timeout_ms <= 0)
+        timeout_ms = 5000;
+
+    sm_broker_info_t info;
+    if (sm_broker_probe(socket_path, &info, 800) != 0 || !info.reachable) {
+        struct stat st;
+        if (stat(socket_path, &st) == 0)
+            snprintf(errbuf, errlen,
+                     "broker at %s is not responding (stale socket?)",
+                     socket_path);
+        else
+            snprintf(errbuf, errlen, "no broker socket at %s", socket_path);
+        return -1;
+    }
+    if (info.pid <= 0) {
+        snprintf(errbuf, errlen, "broker at %s did not reveal its pid",
+                 socket_path);
+        return -1;
+    }
+    if (pid_out)
+        *pid_out = info.pid;
+
+    if (kill(info.pid, SIGTERM) != 0) {
+        snprintf(errbuf, errlen, "SIGTERM pid %d: %s", info.pid,
+                 strerror(errno));
+        return -1;
+    }
+
+    /* The broker's clean teardown unlinks the socket; that is the completion
+     * signal (checking the pid instead would race pid reuse). */
+    int waited_ms = 0;
+    while (waited_ms < timeout_ms) {
+        struct stat st;
+        if (stat(socket_path, &st) != 0 && errno == ENOENT)
+            return 0;
+        usleep(50 * 1000);
+        waited_ms += 50;
+    }
+    snprintf(errbuf, errlen, "broker pid %d did not exit within %d ms",
+             info.pid, timeout_ms);
+    return -1;
+}
+
+/* realpath() with fall-through: a vanished device or non-path endpoint keeps
+ * its literal spelling so the comparison still has something to work with. */
+static void normalize_path(const char *in, char *out, size_t len)
+{
+    char resolved[PATH_MAX];
+    if (realpath(in, resolved))
+        snprintf(out, len, "%s", resolved);
+    else
+        snprintf(out, len, "%s", in);
+}
+
+int sm_find_broker_for_endpoint(const char *port, sm_broker_info_t *out,
+                                int timeout_ms)
+{
+    char want[PATH_MAX];
+    normalize_path(port, want, sizeof(want));
+
+    char socks[32][SM_SOCK_PATH_MAX];
+    size_t n = sm_discover_all_sockets(socks, 32);
+    size_t shown = n < 32 ? n : 32;
+
+    for (size_t i = 0; i < shown; i++) {
+        sm_broker_info_t info;
+        if (sm_broker_probe(socks[i], &info, timeout_ms) != 0 ||
+            !info.reachable || !info.endpoint[0])
+            continue;
+        char have[PATH_MAX];
+        normalize_path(info.endpoint, have, sizeof(have));
+        if (strcmp(want, have) == 0) {
+            if (out)
+                *out = info;
+            return 0;
+        }
+    }
+    return -1;
 }

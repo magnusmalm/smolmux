@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #define TEST_SOCK "/tmp/smolmux-test.sock"
 #define STARTUP_DELAY 150000  /* 150ms */
@@ -130,6 +131,204 @@ static void teardown(test_ctx_t *ctx)
     sm_broker_destroy(&ctx->broker);
     close(ctx->master);
     close(ctx->slave);
+}
+
+/* --- sm_broker_stop_by_socket: real child process, SIGTERM path --- */
+
+static sm_broker_t g_child_broker;
+
+static void child_sigterm(int sig)
+{
+    (void)sig;
+    sm_broker_stop(&g_child_broker);
+}
+
+/* Fork a child running a real broker on a fresh PTY, mimicking main.c's
+ * SIGTERM handler -> sm_broker_stop -> clean teardown (socket unlinked).
+ * Parent keeps the PTY master open for the test's duration. */
+static pid_t fork_broker_process(const char *sock, int *master_out,
+                                 char *slave_name_out, size_t slave_name_len)
+{
+    int master = -1, slave = -1;
+    if (openpty(&master, &slave, NULL, NULL, NULL) != 0)
+        return -1;
+    if (slave_name_out)
+        snprintf(slave_name_out, slave_name_len, "%s", ttyname(slave));
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = child_sigterm;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM, &sa, NULL);
+
+        char *slave_name = ttyname(slave);
+        sm_link_t *link = sm_uart_new(slave_name, 115200, 0);
+        sm_broker_init(&g_child_broker, link, sock);
+        snprintf(g_child_broker.port, sizeof(g_child_broker.port), "%s",
+                 slave_name);
+        g_child_broker.baudrate = 115200;
+        broker_thread(&g_child_broker);
+        sm_broker_destroy(&g_child_broker);
+        _exit(0);
+    }
+    close(slave);
+    *master_out = master;
+    return pid;
+}
+
+static void stop_test_sock_path(char *out, size_t len, const char *tag)
+{
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0])
+        tmp = "/tmp";
+    snprintf(out, len, "%s/test-broker-%s-%d.sock", tmp, tag, (int)getpid());
+}
+
+static void test_stop_by_socket(void)
+{
+    char sock[SM_SOCK_PATH_MAX];
+    stop_test_sock_path(sock, sizeof(sock), "stop");
+    unlink(sock);
+
+    int master = -1;
+    pid_t pid = fork_broker_process(sock, &master, NULL, 0);
+    ASSERT(pid > 0, "forked broker child");
+
+    int fd = -1;
+    for (int i = 0; i < 150; i++) {
+        fd = connect_unix(sock);
+        if (fd >= 0)
+            break;
+        usleep(20 * 1000);
+    }
+    ASSERT(fd >= 0, "child broker reachable");
+    if (fd >= 0)
+        close(fd);
+
+    int bpid = -1;
+    char err[256] = "";
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 5000, &bpid, err,
+                                           sizeof(err)), 0);
+    ASSERT_INT_EQ(bpid, (int)pid);
+
+    struct stat st;
+    ASSERT(stat(sock, &st) != 0 && errno == ENOENT,
+           "socket unlinked after stop");
+
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid, "child reaped");
+    ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "child exited cleanly");
+    close(master);
+
+    /* Second stop must fail loudly, not hang or invent a pid. */
+    err[0] = '\0';
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 1000, NULL, err,
+                                           sizeof(err)), -1);
+    ASSERT(strstr(err, "no broker socket") != NULL,
+           "second stop reports missing broker");
+}
+
+/* sm_find_broker_for_endpoint: direct path, by-id-style symlink, negative.
+ * Discovery only globs smolmux-*.sock under XDG_RUNTIME_DIR and /tmp, so the
+ * test broker lives in a private XDG dir with a glob-matching name. */
+static void test_find_broker_for_endpoint(void)
+{
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    /* 80 keeps xdg + "/smolmux-find-test.sock" inside SM_SOCK_PATH_MAX. */
+    char xdg[80];
+    snprintf(xdg, sizeof(xdg), "%s/smolmux-find-xdg-%d", tmpdir, (int)getpid());
+    ASSERT(mkdir(xdg, 0700) == 0 || errno == EEXIST, "mkdir private XDG");
+    char saved_xdg[256] = {0};
+    const char *prev_xdg = getenv("XDG_RUNTIME_DIR");
+    if (prev_xdg)
+        snprintf(saved_xdg, sizeof(saved_xdg), "%s", prev_xdg);
+    setenv("XDG_RUNTIME_DIR", xdg, 1);
+
+    char sock[SM_SOCK_PATH_MAX];
+    snprintf(sock, sizeof(sock), "%s/smolmux-find-test.sock", xdg);
+    unlink(sock);
+
+    int master = -1;
+    char slave_name[128] = "";
+    pid_t pid = fork_broker_process(sock, &master, slave_name,
+                                    sizeof(slave_name));
+    ASSERT(pid > 0, "forked broker child");
+    ASSERT(slave_name[0], "captured pty slave name");
+
+    int fd = -1;
+    for (int i = 0; i < 150; i++) {
+        fd = connect_unix(sock);
+        if (fd >= 0)
+            break;
+        usleep(20 * 1000);
+    }
+    ASSERT(fd >= 0, "child broker reachable");
+    if (fd >= 0)
+        close(fd);
+
+    sm_broker_info_t info;
+    memset(&info, 0, sizeof(info));
+    ASSERT_INT_EQ(sm_find_broker_for_endpoint(slave_name, &info, 800), 0);
+    ASSERT_STR_EQ(info.socket, sock);
+    ASSERT_INT_EQ(info.pid, (int)pid);
+
+    /* A by-id-style symlink to the same device must match via realpath. */
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0])
+        tmp = "/tmp";
+    char link_path[256];
+    snprintf(link_path, sizeof(link_path), "%s/test-byid-link-%d", tmp,
+             (int)getpid());
+    unlink(link_path);
+    ASSERT_INT_EQ(symlink(slave_name, link_path), 0);
+    memset(&info, 0, sizeof(info));
+    ASSERT_INT_EQ(sm_find_broker_for_endpoint(link_path, &info, 800), 0);
+    ASSERT_STR_EQ(info.socket, sock);
+    unlink(link_path);
+
+    /* A port nobody holds finds nothing. */
+    ASSERT_INT_EQ(sm_find_broker_for_endpoint("/dev/null", NULL, 800), -1);
+
+    char err[256] = "";
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 5000, NULL, err,
+                                           sizeof(err)), 0);
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid, "child reaped");
+    close(master);
+
+    if (prev_xdg)
+        setenv("XDG_RUNTIME_DIR", saved_xdg, 1);
+    else
+        unsetenv("XDG_RUNTIME_DIR");
+    rmdir(xdg);
+}
+
+static void test_stop_by_socket_stale(void)
+{
+    char sock[SM_SOCK_PATH_MAX];
+    stop_test_sock_path(sock, sizeof(sock), "stale");
+    unlink(sock);
+
+    /* Bind then close without unlinking: the file remains, nobody listens. */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT(fd >= 0, "socket created");
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock);
+    ASSERT_INT_EQ(bind(fd, (struct sockaddr *)&addr, sizeof(addr)), 0);
+    close(fd);
+
+    char err[256] = "";
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 1000, NULL, err,
+                                           sizeof(err)), -1);
+    ASSERT(strstr(err, "not responding") != NULL, "stale socket reported");
+    unlink(sock);
 }
 
 /* --- Tests --- */
@@ -1802,6 +2001,9 @@ int main(void)
     RUN_TEST(test_boot_stall_fires);
     RUN_TEST(test_boot_no_stall_when_complete);
     RUN_TEST(test_broker_listens_on_derived_long_byid_socket);
+    RUN_TEST(test_stop_by_socket);
+    RUN_TEST(test_stop_by_socket_stale);
+    RUN_TEST(test_find_broker_for_endpoint);
 
     TEST_REPORT();
 }

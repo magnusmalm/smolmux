@@ -1538,6 +1538,10 @@ static void usage(const char *prog)
         "  board up <manifest>     Start every wire in a *.board.json manifest\n"
         "    --foreground, -F      Tie the wires' lifetime to this run (Ctrl-C stops all)\n"
         "  board down <name>       Stop all running wires of a board (SIGTERM)\n"
+        "\n"
+        "  shutdown                Stop one broker cleanly (alias: stop)\n"
+        "                          Uses -s <path>, or the sole running broker;\n"
+        "                          SIGTERM + wait until the socket disappears\n"
         "  board status <name>     Show a board's active wires\n"
         "  board list [dir]        List *.board.json manifests (dir, $SMOLMUX_BOARD_DIR,\n"
         "                          or ~/.config/smolmux) and which are up\n"
@@ -2116,6 +2120,49 @@ static int cmd_break_uboot(int argc, char **argv)
     return matched ? 0 : 2;   /* 2 = flooded but no prompt (timeout) */
 }
 
+/* Explicit -s path from the global options, for commands that manage a broker
+ * without connecting through the needs_broker path (shutdown). */
+static const char *g_socket_arg;
+
+/* Stop one broker cleanly: probe its pid, SIGTERM, wait for the socket to
+ * disappear. Uses the explicit -s path, or the sole running broker; with
+ * several brokers up it refuses and lists them (never guess a kill target). */
+static int cmd_shutdown(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+
+    char sock[SM_SOCK_PATH_MAX];
+    if (g_socket_arg) {
+        snprintf(sock, sizeof(sock), "%s", g_socket_arg);
+    } else {
+        char paths[16][SM_SOCK_PATH_MAX];
+        size_t n = sm_discover_all_sockets(paths, 16);
+        if (n == 0) {
+            fprintf(stderr, "error: no broker socket found\n"
+                    "  Use -s <path> or start a broker first\n");
+            return 1;
+        }
+        if (n > 1) {
+            size_t shown = n < 16 ? n : 16;
+            fprintf(stderr, "error: %zu brokers running — pick one with -s:\n", n);
+            for (size_t i = 0; i < shown; i++)
+                fprintf(stderr, "  %s\n", paths[i]);
+            return 1;
+        }
+        snprintf(sock, sizeof(sock), "%s", paths[0]);
+    }
+
+    int pid = -1;
+    char err[256];
+    int timeout = cli.timeout_ms > 0 ? cli.timeout_ms : 5000;
+    if (sm_broker_stop_by_socket(sock, timeout, &pid, err, sizeof(err)) != 0) {
+        fprintf(stderr, "error: %s\n", err);
+        return 1;
+    }
+    printf("Stopped broker pid %d (%s removed).\n", pid, sock);
+    return 0;
+}
+
 static const subcmd_t subcmds[] = {
     {"send",       cmd_send,       1, "controller"},
     {"read",       cmd_read,       1, "observer"},
@@ -2128,6 +2175,8 @@ static const subcmd_t subcmds[] = {
     {"brokers",    cmd_brokers,    0, NULL},
     {"boards",     cmd_boards,     0, NULL},
     {"board",      cmd_board,      0, NULL},
+    {"shutdown",   cmd_shutdown,   0, NULL},
+    {"stop",       cmd_shutdown,   0, NULL},
     {"sysrq",      cmd_sysrq,     1, "controller"},
     {"break-uboot", cmd_break_uboot, 1, "controller"},
     {"pin",        cmd_pin,       1, "controller"},
@@ -2165,7 +2214,7 @@ int main(int argc, char *argv[])
     /* Use '+' prefix to stop at first non-option */
     while ((opt = getopt_long(argc, argv, "+s:jt:vVh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 's': socket_path = optarg; break;
+        case 's': socket_path = optarg; g_socket_arg = optarg; break;
         case 'j': cli.json_output = 1; break;
         case 't': cli.timeout_ms = atoi(optarg); break;
         case 'v': cli.verbose = 1; break;
@@ -2217,7 +2266,7 @@ int main(int argc, char *argv[])
         char discovered[108];
         if (!socket_path) {
             if (sm_discover_socket(discovered, sizeof(discovered)) == 0) {
-                socket_path = discovered;
+                socket_path = discovered;   /* g_socket_arg stays NULL: explicit -s only */
             } else {
                 fprintf(stderr, "error: no broker socket found\n"
                         "  Use -s <path>, set $SMOLMUX_SOCKET, or start a broker\n");

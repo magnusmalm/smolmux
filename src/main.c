@@ -1,5 +1,6 @@
 #include "constants.h"
 #include "broker.h"
+#include "broker_info.h"
 #include "device_profile.h"
 #include "links/uart.h"
 #include "logger.h"
@@ -33,6 +34,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <glob.h>
 #include <unistd.h>
@@ -43,6 +45,37 @@ static void signal_handler(int sig)
 {
     (void)sig;
     sm_broker_stop(&broker);
+}
+
+/* After a startup failure on a UART port, say WHO holds it instead of leaving
+ * the operator to fuser/lsof archaeology. Re-opens the port briefly to get a
+ * fresh errno; only speaks when that confirms a busy/permission failure. */
+static void diagnose_busy_port(const char *port)
+{
+    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        return;                     /* port opens fine — failure was elsewhere */
+    }
+    if (errno != EBUSY && errno != EACCES && errno != EPERM)
+        return;
+    int open_errno = errno;
+
+    sm_broker_info_t holder;
+    if (sm_find_broker_for_endpoint(port, &holder, 800) == 0) {
+        fprintf(stderr,
+                "port %s is held by smolmux pid=%d socket=%s%s%s%s\n"
+                "  stop it with: %s-cli -s %s shutdown\n",
+                port, holder.pid, holder.socket,
+                holder.board[0] ? " board=" : "",
+                holder.board[0] ? holder.board : "",
+                holder.suspended ? " (suspended)" : "",
+                SM_NAME, holder.socket);
+    } else if (open_errno == EBUSY) {
+        fprintf(stderr,
+                "port %s is held by another process (try: fuser -v %s)\n",
+                port, port);
+    }
 }
 
 #if SM_ENABLE_GDB
@@ -705,6 +738,9 @@ int main(int argc, char *argv[])
 
     /* Run */
     int rc = sm_broker_run(&broker);
+    /* Setup failures (rc<0) on a UART port: name the holder if one exists. */
+    if (rc < 0 && port && !enable_gdb && !serial_tcp_target)
+        diagnose_busy_port(port);
     sm_broker_destroy(&broker);
 
     SM_LOG_INFO("main", "exiting (rc=%d)", rc);
