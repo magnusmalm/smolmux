@@ -1,0 +1,23 @@
+{
+    "name": "uboot",
+    "device_type": "bootloader",
+    "description": "U-Boot bootloader",
+    "prompt_pattern": "=>\\s*$|U-Boot>\\s*$",
+    "commands": [
+        "version",
+        "bdinfo",
+        "printenv",
+        "boot",
+        "reset",
+        "md",
+        "mmc info",
+        "mmc list",
+        "fatls mmc 0",
+        "env print"
+    ],
+    "boot_banner": "U-Boot ",
+    "custom_anomaly_patterns": [
+        {"name": "uboot_abort", "pattern": "Abort", "severity": "warning"},
+        {"name": "bad_crc", "pattern": "Bad CRC", "severity": "warning"}
+    ]
+}

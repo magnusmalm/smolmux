@@ -1,0 +1,37 @@
+{
+    "name": "nrf9151-zephyr",
+    "description": "Nordic nRF9151 SiP with Zephyr RTOS",
+    "arch": "arm",
+    "gdb_path": "arm-zephyr-eabi-gdb",
+    "gdb_init_commands": [
+        "set pagination off",
+        "set print pretty on"
+    ],
+    "important_registers": [
+        "r0", "r1", "r2", "r3", "r4", "r5",
+        "r12", "sp", "lr", "pc", "xpsr",
+        "msp", "psp", "control", "primask", "basepri"
+    ],
+    "fault_registers": [
+        {"name": "CFSR",  "address": "0xE000ED28"},
+        {"name": "HFSR",  "address": "0xE000ED2C"},
+        {"name": "DFSR",  "address": "0xE000ED30"},
+        {"name": "MMFAR", "address": "0xE000ED34"},
+        {"name": "BFAR",  "address": "0xE000ED38"},
+        {"name": "AFSR",  "address": "0xE000ED3C"}
+    ],
+    "peripheral_map": {
+        "UARTE0": "0x40008000",
+        "UARTE1": "0x40009000",
+        "TWIM0":  "0x40003000",
+        "GPIO0":  "0x40842500",
+        "TIMER0": "0x4000F000",
+        "RTC0":   "0x40014000",
+        "WDT":    "0x40018000",
+        "NVMC":   "0x40039000"
+    },
+    "rtos": "zephyr",
+    "rtos_commands": [
+        "info threads"
+    ]
+}

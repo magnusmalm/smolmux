@@ -1,0 +1,7 @@
+build/
+.config
+*.bak
+.code-analyze/
+deps/musl-*
+build-release-*/
+dist/

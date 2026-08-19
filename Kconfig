@@ -1,0 +1,82 @@
+mainmenu "smolmux configuration"
+
+menu "Links"
+
+config SM_ENABLE_UART
+	bool "UART serial link (termios)"
+	default y
+	help
+	  Enable the UART serial port link. Uses termios for
+	  serial I/O with configurable baud rate, DTR/RTS control,
+	  break signaling, and exclusive device locking.
+
+config SM_ENABLE_GDB
+	bool "GDB MI subprocess link"
+	default n
+	help
+	  Enable the GDB MI link. Launches GDB as a subprocess with
+	  --interpreter=mi3 and communicates via stdin/stdout pipes.
+	  Useful for debugging targets via gdbserver.
+
+config SM_ENABLE_LINK_SERIAL_TCP
+	bool "Serial-over-TCP device link"
+	default n
+	help
+	  Enable the serial-over-TCP link. The broker connects OUT to a
+	  raw/telnet TCP device server (ser2net, socat TCP-LISTEN, esp-link,
+	  a terminal server) and treats the byte stream as the device.
+	  Inbound telnet IAC negotiation is stripped and refused.
+
+endmenu
+
+menu "Regex"
+
+config SM_ENABLE_PCRE2
+	bool "PCRE2 regex engine (instead of POSIX ERE)"
+	default n
+	help
+	  Use PCRE2 for the expect engine and anomaly detector
+	  instead of POSIX ERE. Adds a dependency on libpcre2-8
+	  but provides full Perl-compatible regex syntax.
+
+endmenu
+
+menu "Sinks"
+
+config SM_ENABLE_SINK_MCP
+	bool "MCP stdio sink (Claude Code integration)"
+	default y
+	help
+	  Enable the in-process MCP JSON-RPC 2.0 server that reads
+	  from stdin and writes to stdout. Provides Claude Code
+	  integration without a separate MCP client process.
+
+config SM_ENABLE_SINK_TCP
+	bool "TCP sink (remote serial access)"
+	default n
+	help
+	  Enable a TCP listener that accepts remote clients speaking
+	  the same newline-delimited JSON protocol as Unix socket
+	  clients. No protocol translation needed.
+
+config SM_ENABLE_SINK_WS
+	bool "WebSocket sink (browser access)"
+	default n
+	help
+	  Enable a WebSocket listener for browser-based access.
+	  Uses a dedicated thread with socketpair bridges.
+	  Plain WS only; put nginx/caddy in front for WSS.
+
+endmenu
+
+menu "Tools"
+
+config SM_ENABLE_WATCHER
+	bool "Watcher (autonomous anomaly reporter)"
+	default y
+	help
+	  Enable the smolmux-watcher daemon that connects to the broker
+	  as an observer, watches for anomaly messages, fetches output
+	  history, and writes markdown incident reports to disk.
+
+endmenu

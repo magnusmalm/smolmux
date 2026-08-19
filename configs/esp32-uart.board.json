@@ -1,0 +1,12 @@
+{
+    "board": "esp32-uart",
+    "wires": [
+        {
+            "role": "console",
+            "link": "uart",
+            "device": "/dev/serial/by-id/usb-REPLACE-WITH-YOUR-CH34x-OR-CP210x-if00",
+            "baud": 115200,
+            "profile": "esp-idf-uart"
+        }
+    ]
+}

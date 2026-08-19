@@ -1,0 +1,17 @@
+{
+    "board": "samc21-bench",
+    "wires": [
+        {
+            "role": "console",
+            "link": "uart",
+            "device": "/dev/ttyACM1",
+            "baud": 115200
+        },
+        {
+            "role": "swd",
+            "link": "gdb",
+            "gdb_path": "gdb-multiarch",
+            "target": "localhost:3333"
+        }
+    ]
+}

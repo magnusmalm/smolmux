@@ -1,0 +1,42 @@
+{
+    "name": "nrf9151-zephyr",
+    "device_type": "zephyr",
+    "description": "nRF9151 SiP running Zephyr RTOS with modem AT interface",
+    "prompt_pattern": "uart:~\\$\\s*$",
+    "commands": [
+        "kernel version",
+        "kernel uptime",
+        "kernel threads",
+        "kernel stacks",
+        "kernel reboot cold",
+        "log status",
+        "log disable",
+        "log enable inf",
+        "device list",
+        "at AT+CFUN?",
+        "at AT+CEREG?",
+        "at AT+CGDCONT?",
+        "at AT+CGSN",
+        "at AT+COPS?",
+        "at AT+CSQ",
+        "at AT%XMONITOR",
+        "at AT%XTEMP?",
+        "at AT+CPIN?",
+        "net iface",
+        "net dns",
+        "net ping 8.8.8.8"
+    ],
+    "boot_banner": "*** Booting nRF Connect SDK",
+    "custom_anomaly_patterns": [
+        {"name": "zephyr_fatal", "pattern": "FATAL EXCEPTION|E: \\*\\*\\* Booting|E: r[0-9]+/", "severity": "critical"},
+        {"name": "zephyr_mpu_fault", "pattern": "MPU FAULT|MemManage|BusFault|UsageFault|SecureFault|HardFault", "severity": "critical"},
+        {"name": "zephyr_assert", "pattern": "ASSERTION FAIL|__ASSERT_NO_MSG", "severity": "critical"},
+        {"name": "zephyr_stack_overflow", "pattern": "stack overflow|STACK CHECK", "severity": "critical"},
+        {"name": "at_error", "pattern": "ERROR|\\+CME ERROR|\\+CMS ERROR", "severity": "warning"},
+        {"name": "at_timeout", "pattern": "AT command timeout|Sending AT command timed out", "severity": "warning"},
+        {"name": "modem_crash", "pattern": "Modem has crashed|NRF_MODEM_DFU|nrf_modem_lib: Modem fault", "severity": "critical"},
+        {"name": "lte_disconnect", "pattern": "LTE cell changed|Network registration status: Not registered|PSM timer expired", "severity": "info"},
+        {"name": "watchdog_reset", "pattern": "WDT|wdt.*timeout|Watchdog", "severity": "critical"},
+        {"name": "heap_alloc_fail", "pattern": "failed to allocate|k_malloc failed|out of memory|heap.*exhaust", "severity": "warning"}
+    ]
+}

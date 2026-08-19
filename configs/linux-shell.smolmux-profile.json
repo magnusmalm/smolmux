@@ -1,0 +1,35 @@
+{
+    "name": "linux-shell",
+    "device_type": "linux",
+    "description": "Linux serial shell. Empty password still shows Password:; send username then blank line (not shell cmds). Prefer write for login; send --expect only after # or $. BusyBox may lack journalctl (use logread/dmesg).",
+    "prompt_pattern": "\\$\\s*$|\\#\\s*$",
+    "commands": [
+        "uname -a",
+        "dmesg | tail",
+        "logread | tail -40",
+        "free -h",
+        "df -h",
+        "uptime",
+        "cat /proc/cpuinfo",
+        "ip addr",
+        "ps",
+        "ps aux",
+        "top -bn1 | head -20",
+        "journalctl -n 50 --no-pager"
+    ],
+    "boot_banner": "login:",
+    "boot_stall_timeout_ms": 15000,
+    "boot_stages": [
+        {"name": "spl",       "pattern": "U-Boot SPL"},
+        {"name": "uboot",     "pattern": "U-Boot 20"},
+        {"name": "kernel",    "pattern": "Starting kernel"},
+        {"name": "linux",     "pattern": "Linux version"},
+        {"name": "userspace", "pattern": "Freeing unused kernel"},
+        {"name": "login",     "pattern": "login:"},
+        {"name": "shell",     "pattern": "^[#\\$]\\s*$"}
+    ],
+    "custom_anomaly_patterns": [
+        {"name": "kernel_warn", "pattern": "WARNING: CPU:", "severity": "warning"},
+        {"name": "hung_task", "pattern": "INFO: task .* blocked for more than", "severity": "warning"}
+    ]
+}
