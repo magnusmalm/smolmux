@@ -15,7 +15,10 @@
 typedef struct sm_board_wire {
     char role[32];      /* wire role on the board: console, swd, aux, ... */
     char link[8];       /* "uart" or "gdb" */
-    char device[128];   /* UART: device path (/dev/ttyUSB0) */
+    char device[256];   /* UART: resolved open path */
+    char by_id[256];    /* optional dual-key */
+    char by_path[256];
+    char policy[32];    /* unique_serial | seat | prompt */
     int  baud;          /* UART: baud (default SM_DEFAULT_BAUD) */
     char gdb_path[128]; /* GDB: gdb binary (default "gdb") */
     char target[128];   /* GDB: target spec (host:port) */

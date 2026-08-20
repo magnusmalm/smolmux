@@ -217,22 +217,9 @@ static int st_flush_write_queue(sm_link_t *self)
 /* Send raw bytes (no telnet escaping): write what we can, queue the rest. */
 static int raw_send(serial_tcp_data_t *d, const uint8_t *data, size_t len)
 {
-    size_t written = 0;
-    while (written < len) {
-        ssize_t n = send(d->fd, data + written, len - written, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (sm_link_wq_enqueue(&d->wq, data + written, len - written) != 0)
-                    return -1;
-                return 0;
-            }
-            return -1;
-        }
-        if (n == 0)
-            return -1;
-        written += (size_t)n;
-    }
-    return 0;
+    /* Same order rule as UART: never write past a queued tail. send() vs
+     * write() is equivalent on a connected SOCK_STREAM. */
+    return sm_link_wq_write(d->fd, &d->wq, data, len);
 }
 
 /* Outbound: telnet-escape a literal 0xFF as IAC IAC so the server sees data,

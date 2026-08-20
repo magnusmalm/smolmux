@@ -28,6 +28,15 @@ void sm_autoresponder_destroy(sm_autoresponder_t *ar)
     memset(ar, 0, sizeof(*ar));
 }
 
+void sm_autoresponder_reset_window(sm_autoresponder_t *ar)
+{
+    if (!ar) return;
+    ar->window_len = 0;
+    ar->search_offset = 0;
+    if (ar->window && ar->window_cap)
+        ar->window[0] = '\0';
+}
+
 void sm_autoresponder_clear(sm_autoresponder_t *ar)
 {
     for (size_t i = 0; i < ar->rule_count; i++)
@@ -83,6 +92,20 @@ int sm_autoresponder_add(sm_autoresponder_t *ar, const char *name,
     return 0;
 }
 
+void sm_autoresponder_set_owner(sm_autoresponder_t *ar, const char *name,
+                                const char *owner)
+{
+    if (!ar || !name) return;
+    for (size_t i = 0; i < ar->rule_count; i++) {
+        if (strcmp(ar->rules[i].name, name) == 0) {
+            snprintf(ar->rules[i].created_by,
+                     sizeof(ar->rules[i].created_by), "%s",
+                     owner ? owner : "");
+            return;
+        }
+    }
+}
+
 int sm_autoresponder_remove(sm_autoresponder_t *ar, const char *name)
 {
     for (size_t i = 0; i < ar->rule_count; i++) {
@@ -131,8 +154,11 @@ size_t sm_autoresponder_feed(sm_autoresponder_t *ar, const uint8_t *data,
 
     window_append(ar, data, len);
 
-    const size_t overlap = 256;
-    size_t search_start = (ar->search_offset > overlap) ? ar->search_offset - overlap : 0;
+    /* Look back only through the incomplete last line so a still-visible
+     * "login:" cannot rematch after cooldown when a new byte arrives. */
+    size_t search_start = ar->search_offset;
+    while (search_start > 0 && ar->window[search_start - 1] != '\n')
+        search_start--;
     const char *region = (const char *)ar->window + search_start;
     size_t region_len = ar->window_len - search_start;
 

@@ -17,6 +17,7 @@
  * smolmux-gdb-mcp feeds it into an MI line assembler. */
 
 typedef void (*sm_broker_output_fn)(void *user, const uint8_t *data, size_t len);
+typedef void (*sm_broker_event_fn)(void *user, const char *type, cJSON *root);
 
 typedef struct sm_broker_conn {
     int fd;               /* broker socket; set by the caller after connecting */
@@ -32,6 +33,8 @@ typedef struct sm_broker_conn {
 
     sm_broker_output_fn on_output;  /* called per decoded SM_MSG_OUTPUT payload */
     void *on_output_user;
+    sm_broker_event_fn on_event;    /* link_down / link_up / suspended / resumed */
+    void *on_event_user;
 } sm_broker_conn_t;
 
 /* Allocate the read buffer and set running=1, fd=-1. Returns 0, or -1 on OOM. */
@@ -42,6 +45,8 @@ void sm_broker_conn_destroy(sm_broker_conn_t *c);
 
 void sm_broker_conn_set_output_cb(sm_broker_conn_t *c,
                                   sm_broker_output_fn fn, void *user);
+void sm_broker_conn_set_event_cb(sm_broker_conn_t *c,
+                                 sm_broker_event_fn fn, void *user);
 
 /* Fill buf with a fresh wire id ("mcp-XXXXXXXX"). */
 void sm_broker_conn_gen_wire_id(sm_broker_conn_t *c, char *buf, size_t len);
@@ -53,9 +58,10 @@ int  sm_broker_conn_send(sm_broker_conn_t *c, cJSON *msg);
 /* Read whatever is available on the socket and process complete lines. Each
  * SM_MSG_OUTPUT is decoded and delivered to on_output. If wire_id is non-NULL,
  * returns the first message whose "id" matches (caller cJSON_Deletes it); if
- * wire_id is NULL, returns the first welcome (matched by type — it carries no
- * id). Returns NULL if no matching message completed this read. Clears running
- * on EOF. */
+ * wire_id is NULL, returns the first welcome OR error (both matched by type —
+ * neither carries an id), so callers of the startup handshake must check the
+ * type of what they get back rather than assuming a welcome. Returns NULL if
+ * no matching message completed this read. Clears running on EOF. */
 cJSON *sm_broker_conn_read(sm_broker_conn_t *c, const char *wire_id);
 
 /* Poll the socket up to timeout_ms for a message matching wire_id (or a welcome

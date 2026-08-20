@@ -63,7 +63,10 @@ int sm_expect_add(sm_expect_engine_t *eng, const char *id,
     }
     req->buf_len = 0;
     req->matched = 0;
+    req->aborted = 0;
     req->search_offset = 0;
+    req->abort_reason[0] = '\0';
+    req->abort_pattern[0] = '\0';
 
     eng->count++;
     return 0;
@@ -115,7 +118,7 @@ size_t sm_expect_collect(sm_expect_engine_t *eng, double now,
 
     for (size_t i = 0; i < eng->count && collected < max_out; ) {
         sm_expect_request_t *req = &eng->requests[i];
-        int done = req->matched || (now >= req->deadline);
+        int done = req->matched || req->aborted || (now >= req->deadline);
 
         if (!done) {
             i++;
@@ -126,10 +129,15 @@ size_t sm_expect_collect(sm_expect_engine_t *eng, double now,
         sm_expect_result_t *r = &out[collected++];
         snprintf(r->id, sizeof(r->id), "%s", req->id);
         r->matched = req->matched;
+        r->aborted = req->aborted;
         r->data = req->buffer;
         r->data_len = req->buf_len;
         snprintf(r->pattern, sizeof(r->pattern), "%s", req->pattern_str);
         snprintf(r->client_id, sizeof(r->client_id), "%s", req->client_id);
+        snprintf(r->abort_reason, sizeof(r->abort_reason), "%s",
+                 req->abort_reason);
+        snprintf(r->abort_pattern, sizeof(r->abort_pattern), "%s",
+                 req->abort_pattern);
 
         /* Don't free buffer — transferred to result */
         sm_regex_free(req->compiled);
@@ -142,6 +150,25 @@ size_t sm_expect_collect(sm_expect_engine_t *eng, double now,
     }
 
     return collected;
+}
+
+void sm_expect_abort_all(sm_expect_engine_t *eng, const char *reason,
+                         const char *pattern_name)
+{
+    /* Abort all pending expects: the board is not going to produce the
+     * expected output (critical anomaly). Do not touch autoresponders. */
+    if (!eng)
+        return;
+    for (size_t i = 0; i < eng->count; i++) {
+        sm_expect_request_t *req = &eng->requests[i];
+        if (req->matched || req->aborted)
+            continue;
+        req->aborted = 1;
+        snprintf(req->abort_reason, sizeof(req->abort_reason), "%s",
+                 reason ? reason : "anomaly");
+        snprintf(req->abort_pattern, sizeof(req->abort_pattern), "%s",
+                 pattern_name ? pattern_name : "");
+    }
 }
 
 void sm_expect_cancel_id(sm_expect_engine_t *eng, const char *id)

@@ -10,6 +10,7 @@ typedef enum {
     SM_MSG_WELCOME,
     SM_MSG_SEND,
     SM_MSG_SEND_EXPECT,
+    SM_MSG_LISTEN_EXPECT,
     SM_MSG_OUTPUT,
     SM_MSG_INPUT_ECHO,
     SM_MSG_EXPECT_RESULT,
@@ -62,11 +63,18 @@ cJSON *sm_msg_welcome(const char *version, const char *port, int baud, const cha
 cJSON *sm_msg_send(const char *id, const uint8_t *data, size_t len);
 cJSON *sm_msg_send_expect(const char *id, const uint8_t *data, size_t data_len,
                           const char *pattern, int timeout_ms);
+/* Listen-only expect: no TX. Allowed for observers. */
+cJSON *sm_msg_listen_expect(const char *id, const char *pattern, int timeout_ms);
 cJSON *sm_msg_output(const uint8_t *data, size_t len, double timestamp);
 cJSON *sm_msg_output_b64(const char *b64, double timestamp);
 cJSON *sm_msg_input_echo(const uint8_t *data, size_t len, const char *sender, double timestamp);
 cJSON *sm_msg_expect_result(const char *id, int matched, const uint8_t *data,
                             size_t len, const char *pattern);
+/* Same as sm_msg_expect_result, plus optional abort metadata (critical anomaly). */
+cJSON *sm_msg_expect_result_ex(const char *id, int matched, const uint8_t *data,
+                               size_t len, const char *pattern, int aborted,
+                               const char *abort_reason,
+                               const char *abort_pattern);
 cJSON *sm_msg_takeover(const char *id);
 cJSON *sm_msg_release(const char *id);
 cJSON *sm_msg_status(const char *id);
@@ -79,6 +87,9 @@ cJSON *sm_msg_resume(const char *id);
 cJSON *sm_msg_suspended(const char *port, const char *by_client);
 cJSON *sm_msg_resumed(const char *port);
 cJSON *sm_msg_history_request(const char *id, double since_ts, int last_bytes);
+/* Optional since_seq path: set has_since_seq=1. max_bytes 0 = default cap. */
+cJSON *sm_msg_history_request_seq(const char *id, uint64_t since_seq,
+                                  int max_bytes);
 cJSON *sm_msg_history_response(const char *id, cJSON *chunks);
 cJSON *sm_msg_incidents_request(const char *id, double since_ts);
 cJSON *sm_msg_incidents_response(const char *id, cJSON *incidents);

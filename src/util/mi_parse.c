@@ -72,6 +72,11 @@ static cJSON *parse_list(cur_t *c)
         char ch = c->s[c->pos];
         if (ch == ']') { c->pos++; break; }
         if (ch == ',') { c->pos++; continue; }
+        /* '}' is not a list element — it appears when a parent tuple is
+         * malformed or truncated. parse_bare stops *at* '}' without
+         * consuming it, so treating it as a bare value would spin forever. */
+        if (ch == '}')
+            break;
 
         /* A list may hold plain values ([0,1,2]) or "result" entries
          * (frame={...},frame={...}); represent the latter as one-key objects,
@@ -96,7 +101,12 @@ static cJSON *parse_list(cur_t *c)
                 continue;
             }
         }
+        size_t before = c->pos;
         cJSON_AddItemToArray(arr, parse_value(c));
+        /* Guard: if a value parse made no progress, skip one char so a
+         * future malformed shape cannot hang the MCP process. */
+        if (c->pos == before)
+            c->pos++;
     }
     return arr;
 }

@@ -21,6 +21,7 @@
 #define WS_GUID "258EAFA5-E914-47DA-95CA-5AB5443F11F3"
 
 /* WebSocket opcodes */
+#define WS_OP_CONT  0x0
 #define WS_OP_TEXT  0x1
 #define WS_OP_CLOSE 0x8
 #define WS_OP_PING  0x9
@@ -64,6 +65,21 @@ static ssize_t ws_decode_frame(uint8_t *buf, size_t len,
     int masked = (buf[1] >> 7) & 1;
     uint64_t plen = buf[1] & 0x7F;
     size_t hdr = 2;
+
+    /* RFC 6455 5.1: a server MUST close the connection on an unmasked client
+     * frame. Accepting them was a spec deviation with no security impact on a
+     * loopback listener, but it also meant a hand-rolled client could talk to
+     * the sink without implementing masking — and one did: the auth-bypass PoC
+     * for SM-01 sent plain unmasked frames. Nothing first-party speaks WS
+     * (browsers and websocat both mask correctly), so enforcing costs nothing.
+     * -1 is the error path the caller already answers with a close frame. */
+    if (!masked)
+        return -1;
+
+    /* Continuation frames are not reassembled. Dropping them silently lost
+     * the message; refuse instead, so a fragmenting client gets told. */
+    if (*opcode == WS_OP_CONT)
+        return -1;
 
     if (plen == 126) {
         if (len < 4) return 0;
@@ -382,8 +398,12 @@ static void *ws_thread(void *arg)
                          * only touches pair[1] (bridge_fd). If the WS client
                          * disconnects before the broker reads pair[0] from the pipe,
                          * closing pair[1] causes EPOLLHUP on pair[0] which the
-                         * broker handles via normal client removal. */
-                        sm_broker_register_client_async(ws->broker, pair[0]);
+                         * broker handles via normal client removal.
+                         * requires_auth=1: a WS peer is network-origin like a
+                         * TCP one. Loopback is not a UID boundary, so without
+                         * this any local process would bypass --auth-token and
+                         * the Unix socket's 0700 mode. */
+                        sm_broker_register_client_async(ws->broker, pair[0], 1);
 
                         /* Set bridge_fd non-blocking */
                         int fl = fcntl(pair[1], F_GETFL, 0);
@@ -407,124 +427,150 @@ static void *ws_thread(void *arg)
             }
         }
 
-        /* Process client fds (indices 2..nfds in pairs of ws_fd, bridge_fd) */
+        /* Process client fds (indices 2..nfds in pairs of ws_fd, bridge_fd).
+         * On any removal: remove once and break so the outer while rebuilds
+         * the poll set. ws_remove_client swap-compacts; i--/fi+=2 desyncs
+         * slots (double close / silent output loss). */
         int fi = 2;
         for (int i = 0; i < poll_client_count; i++) {
+            if (i >= ws->client_count)
+                break;
             sm_ws_client_t *c = &ws->clients[i];
             int removed = 0;
 
             /* ws_fd readable: decode WS frame → write JSON to bridge_fd */
             if (fds[fi].revents & (POLLIN | POLLHUP | POLLERR)) {
                 if (fds[fi].revents & POLLIN) {
-                    ssize_t n = read(c->ws_fd, c->ws_buf + c->ws_buf_len,
-                                     sizeof(c->ws_buf) - c->ws_buf_len);
-                    if (n <= 0) {
-                        ws_remove_client(ws, i);
-                        i--; fi += 2; continue;
-                    }
-                    c->ws_buf_len += (size_t)n;
-
-                    /* Process all complete frames */
-                    size_t off = 0;
-                    while (off < c->ws_buf_len) {
-                        int op;
-                        const uint8_t *payload;
-                        size_t plen;
-                        ssize_t consumed = ws_decode_frame(c->ws_buf + off,
-                                                    c->ws_buf_len - off,
-                                                    &op, &payload, &plen);
-                        if (consumed == 0) break;
-                        if (consumed < 0) {
-                            /* Oversize frame — send close 1009 and disconnect */
-                            uint8_t close_payload[2] = {0x03, 0xF1}; /* 1009 */
-                            uint8_t frame[128];
-                            size_t flen = ws_encode_frame(frame, sizeof(frame),
-                                                          WS_OP_CLOSE, close_payload, 2);
-                            if (flen > 0)
-                                write_all(c->ws_fd, frame, flen);
+                    size_t space = sizeof(c->ws_buf) - c->ws_buf_len;
+                    if (space == 0) {
+                        removed = 1;
+                    } else {
+                        ssize_t n = read(c->ws_fd, c->ws_buf + c->ws_buf_len,
+                                         space);
+                        if (n <= 0) {
                             removed = 1;
-                            break;
-                        }
+                        } else {
+                            c->ws_buf_len += (size_t)n;
 
-                        if (op == WS_OP_TEXT) {
-                            /* Forward JSON line to bridge (atomic write) */
-                            if (write_line(c->bridge_fd, payload, plen) < 0) {
-                                removed = 1;
-                                break;
+                            size_t off = 0;
+                            while (off < c->ws_buf_len) {
+                                int op;
+                                const uint8_t *payload;
+                                size_t plen;
+                                ssize_t consumed = ws_decode_frame(
+                                    c->ws_buf + off, c->ws_buf_len - off,
+                                    &op, &payload, &plen);
+                                if (consumed == 0) break;
+                                if (consumed < 0) {
+                                    uint8_t close_payload[2] = {0x03, 0xF1};
+                                    uint8_t frame[128];
+                                    size_t flen = ws_encode_frame(
+                                        frame, sizeof(frame), WS_OP_CLOSE,
+                                        close_payload, 2);
+                                    if (flen > 0)
+                                        write_all(c->ws_fd, frame, flen);
+                                    removed = 1;
+                                    break;
+                                }
+
+                                if (op == WS_OP_TEXT) {
+                                    if (write_line(c->bridge_fd, payload,
+                                                   plen) < 0) {
+                                        removed = 1;
+                                        break;
+                                    }
+                                } else if (op == WS_OP_PING) {
+                                    uint8_t frame[SM_WS_READ_BUF_SIZE];
+                                    size_t flen = ws_encode_frame(
+                                        frame, sizeof(frame), WS_OP_PONG,
+                                        payload, plen);
+                                    if (flen > 0)
+                                        write_all(c->ws_fd, frame, flen);
+                                } else if (op == WS_OP_CLOSE) {
+                                    removed = 1;
+                                    break;
+                                }
+                                off += (size_t)consumed;
                             }
-                        } else if (op == WS_OP_PING) {
-                            uint8_t frame[SM_WS_READ_BUF_SIZE];
-                            size_t flen = ws_encode_frame(frame, sizeof(frame),
-                                                          WS_OP_PONG, payload, plen);
-                            if (flen > 0)
-                                write_all(c->ws_fd, frame, flen);
-                        } else if (op == WS_OP_CLOSE) {
-                            removed = 1;
-                            break;
+                            if (off > 0 && off < c->ws_buf_len)
+                                memmove(c->ws_buf, c->ws_buf + off,
+                                        c->ws_buf_len - off);
+                            c->ws_buf_len -= off;
                         }
-                        off += (size_t)consumed;
                     }
-                    /* Shift remaining data */
-                    if (off > 0 && off < c->ws_buf_len) {
-                        memmove(c->ws_buf, c->ws_buf + off, c->ws_buf_len - off);
-                    }
-                    c->ws_buf_len -= off;
                 } else {
-                    /* HUP/ERR on ws_fd */
                     removed = 1;
                 }
             }
 
             if (removed) {
                 ws_remove_client(ws, i);
-                i--; fi += 2; continue;
+                break;
             }
 
-            /* bridge_fd readable: read JSON line → encode as WS frame → write to ws_fd */
+            /* bridge_fd readable: JSON lines → WS text frames */
             if (fds[fi + 1].revents & (POLLIN | POLLHUP | POLLERR)) {
                 if (fds[fi + 1].revents & POLLIN) {
-                    ssize_t n = read(c->bridge_fd, c->br_buf + c->br_buf_len,
-                                     sizeof(c->br_buf) - c->br_buf_len);
-                    if (n <= 0) {
-                        ws_remove_client(ws, i);
-                        i--; fi += 2; continue;
-                    }
-                    c->br_buf_len += (size_t)n;
-
-                    /* Process complete lines */
-                    size_t off = 0;
-                    while (off < c->br_buf_len) {
-                        uint8_t *nl = memchr(c->br_buf + off, '\n',
-                                             c->br_buf_len - off);
-                        if (!nl) break;
-
-                        size_t line_len = (size_t)(nl - (c->br_buf + off));
-                        /* Send JSON (without newline) as WS text frame */
-                        uint8_t frame[SM_WS_READ_BUF_SIZE + 14];
-                        size_t flen = ws_encode_frame(frame, sizeof(frame),
-                                                      WS_OP_TEXT,
-                                                      c->br_buf + off, line_len);
-                        if (flen > 0) {
-                            if (write_all(c->ws_fd, frame, flen) < 0) {
-                                removed = 1;
-                                break;
-                            }
+                    size_t space = sizeof(c->br_buf) - c->br_buf_len;
+                    if (space == 0) {
+                        /* Full buffer with no newline: zero-length read would
+                         * look like EOF. Drop the stalled line and continue. */
+                        SM_LOG_WARN(LOG_TAG,
+                                    "ws bridge line exceeds %zu bytes; dropping",
+                                    sizeof(c->br_buf));
+                        c->br_buf_len = 0;
+                    } else {
+                        ssize_t n = read(c->bridge_fd,
+                                         c->br_buf + c->br_buf_len, space);
+                        if (n <= 0) {
+                            ws_remove_client(ws, i);
+                            break;
                         }
-                        off = (size_t)(nl - c->br_buf) + 1;
-                    }
+                        c->br_buf_len += (size_t)n;
 
-                    if (removed) {
-                        ws_remove_client(ws, i);
-                        i--; fi += 2; continue;
-                    }
+                        size_t off = 0;
+                        while (off < c->br_buf_len) {
+                            uint8_t *nl = memchr(c->br_buf + off, '\n',
+                                                 c->br_buf_len - off);
+                            if (!nl) break;
 
-                    if (off > 0 && off < c->br_buf_len)
-                        memmove(c->br_buf, c->br_buf + off, c->br_buf_len - off);
-                    c->br_buf_len -= off;
+                            size_t line_len =
+                                (size_t)(nl - (c->br_buf + off));
+                            uint8_t frame[SM_WS_READ_BUF_SIZE + 14];
+                            size_t flen = ws_encode_frame(
+                                frame, sizeof(frame), WS_OP_TEXT,
+                                c->br_buf + off, line_len);
+                            if (flen > 0) {
+                                if (write_all(c->ws_fd, frame, flen) < 0) {
+                                    removed = 1;
+                                    break;
+                                }
+                            }
+                            off = (size_t)(nl - c->br_buf) + 1;
+                        }
+
+                        if (removed) {
+                            ws_remove_client(ws, i);
+                            break;
+                        }
+
+                        if (off > 0 && off < c->br_buf_len)
+                            memmove(c->br_buf, c->br_buf + off,
+                                    c->br_buf_len - off);
+                        c->br_buf_len -= off;
+
+                        /* Still full with no newline after read → drop. */
+                        if (c->br_buf_len >= sizeof(c->br_buf)) {
+                            SM_LOG_WARN(LOG_TAG,
+                                        "ws bridge line exceeds %zu bytes; "
+                                        "dropping",
+                                        sizeof(c->br_buf));
+                            c->br_buf_len = 0;
+                        }
+                    }
                 } else {
-                    /* HUP/ERR on bridge_fd */
                     ws_remove_client(ws, i);
-                    i--; fi += 2; continue;
+                    break;
                 }
             }
 

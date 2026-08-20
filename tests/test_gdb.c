@@ -218,6 +218,11 @@ static void test_gdb_shell_blocked(void)
         "pi info registers\n",                          /* pipe abbreviation */
         "make -f /tmp/evil.mk\n",                       /* spawns make -> shell */
         "-interpreter-exec console \"python import os\"\n",
+        /* eval formats its argument and runs the result as a command, so it
+         * reaches a shell without "shell" ever appearing contiguously — a
+         * demonstrated bypass of every entry above. */
+        "eval \"shel%s\", \"l id\"\n",
+        "eval \"%s\", \"shell id\"\n",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
         ASSERT(link->write_data(link, (const uint8_t *)bad[i],

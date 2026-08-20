@@ -44,6 +44,13 @@ void sm_broker_conn_set_output_cb(sm_broker_conn_t *c,
     c->on_output_user = user;
 }
 
+void sm_broker_conn_set_event_cb(sm_broker_conn_t *c,
+                                 sm_broker_event_fn fn, void *user)
+{
+    c->on_event = fn;
+    c->on_event_user = user;
+}
+
 void sm_broker_conn_gen_wire_id(sm_broker_conn_t *c, char *buf, size_t len)
 {
     snprintf(buf, len, "mcp-%08x", c->next_seq++);
@@ -114,6 +121,13 @@ cJSON *sm_broker_conn_read(sm_broker_conn_t *c, const char *wire_id)
             continue;
         }
 
+        if (c->on_event &&
+            (msg.type == SM_MSG_LINK_DOWN || msg.type == SM_MSG_LINK_UP ||
+             msg.type == SM_MSG_SUSPENDED || msg.type == SM_MSG_RESUMED)) {
+            c->on_event(c->on_event_user, sm_msg_type_name(msg.type),
+                        msg.root);
+        }
+
         if (wire_id) {
             const char *id = sm_json_get_string(msg.root, "id");
             if (id && strcmp(id, wire_id) == 0) {
@@ -122,9 +136,13 @@ cJSON *sm_broker_conn_read(sm_broker_conn_t *c, const char *wire_id)
                 sm_msg_free(&msg);
                 break;
             }
-        } else if (msg.type == SM_MSG_WELCOME) {
-            /* wire_id NULL is the startup welcome wait: welcome carries no id,
-             * so match it by type (else the wait always times out). */
+        } else if (msg.type == SM_MSG_WELCOME || msg.type == SM_MSG_ERROR) {
+            /* wire_id NULL is the startup handshake wait. Welcome carries no
+             * id, so it has to match by type. Error matches too: a rejected
+             * hello (bad or missing auth token) is answered with an error and
+             * nothing else, so dropping it as "unmatched" here is what made
+             * authentication failures invisible to the caller. Callers must
+             * check the type of what they get back. */
             result = msg.root;
             msg.root = NULL;
             sm_msg_free(&msg);
@@ -173,13 +191,20 @@ cJSON *sm_broker_conn_wait(sm_broker_conn_t *c, const char *wire_id,
         }
         if (ret == 0) return NULL;
 
-        if (pfd.revents & (POLLHUP | POLLERR)) {
-            c->running = 0;
-            return NULL;
-        }
+        /* Drain readable data BEFORE acting on hangup. A peer that writes a
+         * final message and immediately closes reports POLLIN|POLLHUP in the
+         * same revents, so checking hangup first discards that message
+         * unread. The broker's "authentication failed" reply was lost exactly
+         * that way, leaving the agent with a dead server and no diagnosis.
+         * sm_broker_conn_read() clears c->running at EOF, so the loop still
+         * terminates when there is genuinely nothing left. */
         if (pfd.revents & POLLIN) {
             cJSON *resp = sm_broker_conn_read(c, wire_id);
             if (resp) return resp;
+        }
+        if (pfd.revents & (POLLHUP | POLLERR)) {
+            c->running = 0;
+            return NULL;
         }
     }
     return NULL;

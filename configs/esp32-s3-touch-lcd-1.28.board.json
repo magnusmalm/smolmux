@@ -1,0 +1,12 @@
+{
+    "board": "esp32-s3-touch-lcd-1.28",
+    "wires": [
+        {
+            "role": "console",
+            "link": "uart",
+            "device": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_REPLACE-WITH-YOUR-SERIAL-if00",
+            "baud": 115200,
+            "profile": "esp32-arduino-lvgl"
+        }
+    ]
+}

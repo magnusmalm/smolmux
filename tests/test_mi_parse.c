@@ -235,6 +235,15 @@ static void test_string_with_commas_and_braces(void)
     sm_mi_record_free(&r);
 }
 
+/* Malformed list with '}' in value position used to hang forever. */
+static void test_malformed_list_closing_brace_no_hang(void)
+{
+    sm_mi_record_t r;
+    ASSERT_INT_EQ(parse("12^done,stack=[frame={level=\"0\"}}]", &r), 0);
+    ASSERT(r.results != NULL, "parsed without hang");
+    sm_mi_record_free(&r);
+}
+
 int main(void)
 {
     printf("test_mi_parse\n");
@@ -255,6 +264,7 @@ int main(void)
     RUN_TEST(test_non_mi_returns_error);
     RUN_TEST(test_memory_bytes);
     RUN_TEST(test_string_with_commas_and_braces);
+    RUN_TEST(test_malformed_list_closing_brace_no_hang);
 
     TEST_REPORT();
 }

@@ -13,7 +13,8 @@ typedef struct sm_sink {
     void (*on_readable)(struct sm_sink *self);
     void (*on_expect_result)(struct sm_sink *self, const char *id,
                              int matched, const uint8_t *data, size_t data_len,
-                             const char *pattern);
+                             const char *pattern, int aborted,
+                             const char *abort_pattern);
     void (*destroy)(struct sm_sink *self);
     void *data;
     int fd; /* fd to watch in epoll, -1 = none */

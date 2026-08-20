@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(smolmux VERSION 0.1.2 LANGUAGES C)
+project(smolmux VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -20,6 +20,40 @@ option(SM_STRIP       "Strip binaries" OFF)
 
 if(SM_MUSL_STATIC)
     add_link_options(-static)
+endif()
+
+# ========================================================================
+# Regex backend probe
+# ========================================================================
+# Must run BEFORE the Kconfig include: that is what turns the probe result
+# into an SM_ENABLE_PCRE2 override, and sm_features.h is generated in there.
+#
+# PCRE2 is the default backend because it bounds backtracking internally
+# (match_limit / depth_limit). POSIX regexec cannot be bounded up front, so
+# that path has to rely on a pattern validator plus a measured per-match
+# budget (see src/regex_engine.c) -- safe, but weaker. PCRE2 is still not a
+# hard dependency: a host without libpcre2-8 falls back to POSIX rather than
+# failing to build. An explicit -DSM_ENABLE_PCRE2=ON is a real request, so a
+# missing library is an error in that case rather than a silent downgrade.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PCRE2 QUIET libpcre2-8)
+endif()
+if(NOT PCRE2_FOUND)
+    if(DEFINED SM_ENABLE_PCRE2)
+        if(SM_ENABLE_PCRE2)
+            message(FATAL_ERROR
+                "-DSM_ENABLE_PCRE2=ON was requested but libpcre2-8 was not "
+                "found. Install libpcre2-dev, or drop the flag to build with "
+                "the POSIX ERE backend.")
+        endif()
+        # Explicitly OFF — the fallback notice below would just be noise.
+    else()
+        set(SM_ENABLE_PCRE2 OFF)
+        message(STATUS
+            "libpcre2-8 not found — using the POSIX ERE regex backend. "
+            "Install libpcre2-dev for the stronger engine.")
+    endif()
 endif()
 
 # ========================================================================
@@ -57,6 +91,8 @@ set(SM_SOURCES
     src/autoresponder.c
     src/device_profile.c
     src/mcp_broker_conn.c
+    src/mcp_instructions.c
+    src/mcp_explain.c
     src/broker_info.c
     src/board_manifest.c
     src/client.c
@@ -108,11 +144,10 @@ if(SM_ENABLE_SINK_WS)
 endif()
 
 # ========================================================================
-# Optional: PCRE2
+# PCRE2 (probed above; SM_ENABLE_PCRE2 is already reconciled with what the
+# host actually has, so no second find_package/REQUIRED here)
 # ========================================================================
 if(SM_ENABLE_PCRE2)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(PCRE2 REQUIRED libpcre2-8)
     target_include_directories(smolmux_lib PUBLIC ${PCRE2_INCLUDE_DIRS})
     target_link_libraries(smolmux_lib PUBLIC ${PCRE2_LIBRARIES})
 endif()
@@ -235,6 +270,11 @@ endif()
 # smolmux-cli is always built, so its reader test is unconditional.
 list(APPEND TEST_SOURCES tests/test_cli.c)
 
+# Serial MCP instructions/prompts (Wave 1) — pure unit tests, no broker.
+list(APPEND TEST_SOURCES tests/test_mcp_instructions.c)
+list(APPEND TEST_SOURCES tests/test_mcp_explain.c)
+list(APPEND TEST_SOURCES tests/test_mcp_mutate.c)
+
 foreach(test_src ${TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
@@ -269,6 +309,7 @@ target_compile_definitions(cli_testlib PRIVATE main=cli_main)
 target_sources(test_cli PRIVATE $<TARGET_OBJECTS:cli_testlib>)
 # with-port test drives a broker-in-thread over a PTY (openpty needs libutil)
 target_link_libraries(test_cli PRIVATE pthread util)
+add_dependencies(test_cli smolmux-cli)
 
 # Broker/monitor tests need pthreads and util (openpty)
 if(SM_ENABLE_UART)

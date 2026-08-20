@@ -123,6 +123,32 @@ static void test_bad_regex_rejected(void)
     sm_autoresponder_destroy(&ar);
 }
 
+static void test_no_stale_lookback_refire(void)
+{
+    sm_autoresponder_t ar;
+    sm_autoresponder_init(&ar);
+    ASSERT_INT_EQ(sm_autoresponder_add(&ar, "login", "login:",
+                                       (const uint8_t *)"root\n", 5, 0, 100), 0);
+    sm_ar_fired_t out[4];
+    ASSERT_INT_EQ((int)feed(&ar, "login:\n", 1.0, out, 4), 1);
+    /* New byte after cooldown must not rematch the previous line. */
+    ASSERT_INT_EQ((int)feed(&ar, "x", 3.0, out, 4), 0);
+    sm_autoresponder_destroy(&ar);
+}
+
+static void test_reset_window_forgets_old_prompt(void)
+{
+    sm_autoresponder_t ar;
+    sm_autoresponder_init(&ar);
+    ASSERT_INT_EQ(sm_autoresponder_add(&ar, "login", "login:",
+                                       (const uint8_t *)"root\n", 5, 0, 0), 0);
+    sm_ar_fired_t out[4];
+    ASSERT_INT_EQ((int)feed(&ar, "login:\n", 1.0, out, 4), 1);
+    sm_autoresponder_reset_window(&ar);
+    ASSERT_INT_EQ((int)feed(&ar, "U-Boot\n", 2.0, out, 4), 0);
+    sm_autoresponder_destroy(&ar);
+}
+
 int main(void)
 {
     printf("test_autoresponder\n");
@@ -135,6 +161,8 @@ int main(void)
     RUN_TEST(test_remove);
     RUN_TEST(test_cross_chunk_match);
     RUN_TEST(test_bad_regex_rejected);
+    RUN_TEST(test_no_stale_lookback_refire);
+    RUN_TEST(test_reset_window_forgets_old_prompt);
 
     TEST_REPORT();
 }

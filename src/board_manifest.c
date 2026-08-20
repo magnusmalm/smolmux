@@ -56,7 +56,26 @@ int sm_board_manifest_from_json(const char *json, sm_board_manifest_t *out)
 
         copy_str(wire->role, sizeof(wire->role), w, "role");
         copy_str(wire->link, sizeof(wire->link), w, "link");
-        copy_str(wire->device, sizeof(wire->device), w, "device");
+        {
+            cJSON *dev = cJSON_GetObjectItemCaseSensitive(w, "device");
+            if (cJSON_IsString(dev) && dev->valuestring)
+                snprintf(wire->device, sizeof(wire->device), "%s",
+                         dev->valuestring);
+            else if (cJSON_IsObject(dev)) {
+                copy_str(wire->by_id, sizeof(wire->by_id), dev, "by_id");
+                copy_str(wire->by_path, sizeof(wire->by_path), dev, "by_path");
+                copy_str(wire->policy, sizeof(wire->policy), dev, "policy");
+                if (wire->by_id[0]) {
+                    char tmp[sizeof(wire->device)];
+                    snprintf(tmp, sizeof(tmp), "%s", wire->by_id);
+                    snprintf(wire->device, sizeof(wire->device), "%s", tmp);
+                } else if (wire->by_path[0]) {
+                    char tmp[sizeof(wire->device)];
+                    snprintf(tmp, sizeof(tmp), "%s", wire->by_path);
+                    snprintf(wire->device, sizeof(wire->device), "%s", tmp);
+                }
+            }
+        }
         copy_str(wire->gdb_path, sizeof(wire->gdb_path), w, "gdb_path");
         copy_str(wire->target, sizeof(wire->target), w, "target");
         copy_str(wire->profile, sizeof(wire->profile), w, "profile");
@@ -77,6 +96,13 @@ int sm_board_manifest_from_json(const char *json, sm_board_manifest_t *out)
             SM_LOG_ERROR(LOG_TAG, "wire %s: uart link needs \"device\"",
                          wire->role);
             goto done;
+        }
+        if (strcmp(wire->link, "uart") == 0 && wire->device[0] &&
+            sm_serial_by_id_is_weak(wire->device)) {
+            SM_LOG_WARN(LOG_TAG,
+                        "wire %s: device is a WEAK by-id (class-only); "
+                        "prefer by_path or a unique serial",
+                        wire->role);
         }
         out->wire_count++;
     }

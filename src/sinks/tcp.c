@@ -106,6 +106,24 @@ static void tcp_destroy(sm_sink_t *self)
     free(self);
 }
 
+int sm_tcp_bind_is_loopback(const char *bind_addr)
+{
+    struct in_addr addr;
+    /* Same resolution rule as sm_tcp_sink_new below: no address, or one that
+     * does not parse, means loopback. Keep the two in step. */
+    if (!bind_addr || inet_pton(AF_INET, bind_addr, &addr) != 1)
+        return 1;
+    return (ntohl(addr.s_addr) >> 24) == 127;   /* 127.0.0.0/8 */
+}
+
+int sm_tcp_refuse_unauthenticated(const char *bind_addr, int have_auth_token,
+                                  int allow_insecure)
+{
+    if (have_auth_token) return 0;
+    if (allow_insecure)  return 0;
+    return !sm_tcp_bind_is_loopback(bind_addr);
+}
+
 sm_sink_t *sm_tcp_sink_new(int port, const char *bind_addr)
 {
     sm_tcp_sink_t *tcp = calloc(1, sizeof(*tcp));

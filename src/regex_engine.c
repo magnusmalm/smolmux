@@ -1,9 +1,26 @@
 #include "regex_engine.h"
 #include "sm_features.h"
+#include "logger.h"
+#include "util/timeutil.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define LOG_TAG "regex"
+
+/* Fields every backend's sm_regex must carry so the shared sm_regex_exec()
+ * wrapper below (defined once, after the backend #if) can enforce the match
+ * budget regardless of which engine is compiled in. */
+#define SM_REGEX_COMMON_FIELDS                                          \
+    int disabled;              /* blew the budget; reports no-match */  \
+    double worst_s;            /* slowest observed match, diagnostics */\
+    char pattern[SM_REGEX_LOG_PATTERN_LEN]  /* prefix, for warnings */
+
+static void regex_common_init(char *pattern_out, const char *pattern)
+{
+    snprintf(pattern_out, SM_REGEX_LOG_PATTERN_LEN, "%s", pattern);
+}
 
 /* Reject patterns that exceed length limit */
 static int check_pattern_length(const char *pattern, char *errbuf, size_t errbuf_len)
@@ -26,6 +43,7 @@ struct sm_regex {
     pcre2_code *code;
     pcre2_match_context *mctx;
     pcre2_match_data *mdata;
+    SM_REGEX_COMMON_FIELDS;
 };
 
 sm_regex_t *sm_regex_compile(const char *pattern, char *errbuf, size_t errbuf_len)
@@ -63,12 +81,16 @@ sm_regex_t *sm_regex_compile(const char *pattern, char *errbuf, size_t errbuf_le
     re->code = code;
     re->mctx = mctx;
     re->mdata = mdata;
+    re->disabled = 0;
+    re->worst_s = 0.0;
+    regex_common_init(re->pattern, pattern);
     return re;
 }
 
-int sm_regex_exec(sm_regex_t *re, const char *str, size_t len, size_t *match_off)
+static int regex_exec_impl(sm_regex_t *re, const char *str, size_t len,
+                           size_t *match_off)
 {
-    if (!re || !re->mdata) return 1;
+    if (!re->mdata) return 1;
     int rc = pcre2_match(re->code, (PCRE2_SPTR)str, len,
                          0, 0, re->mdata, re->mctx);
     if (rc < 0) return 1;
@@ -103,7 +125,12 @@ const char *sm_regex_backend(void)
 
 struct sm_regex {
     regex_t compiled;
+    SM_REGEX_COMMON_FIELDS;
 };
+
+/* Nesting levels tracked by the ReDoS check. Deeper than this is rejected
+ * outright — nothing legitimate in a console pattern needs it. */
+#define REDOS_MAX_DEPTH 32
 
 /* --- ReDoS risk detection helpers --- */
 
@@ -148,12 +175,23 @@ static int check_quantified_group(int has_quantifier, int has_alternation,
     return 0;
 }
 
-/* Reject patterns that risk exponential backtracking in POSIX ERE. */
+/* Reject patterns that risk exponential backtracking in POSIX ERE.
+ *
+ * Risk state is tracked per nesting level. The previous version kept a single
+ * pair of flags and cleared them on every '(', so one extra layer of parens
+ * laundered the risk: (a+)+ was caught, but (x(a+))+ and ((a|a))* — the same
+ * nested-quantifier and quantified-alternation shapes — were accepted.
+ * ((a|a))*$ measured 0.41s against 8 KiB and 27.8s against 64 KiB of 'a' on
+ * glibc, inside the broker's event loop. Now each level owns its flags and a
+ * closing group folds its risk into the parent, so wrapping cannot hide it.
+ *
+ * Still a heuristic, and a heuristic can never be complete: the measured
+ * budget in sm_regex_exec() is the backstop for whatever this misses. */
 static int check_redos_risk(const char *pattern, char *errbuf, size_t errbuf_len)
 {
+    int has_quantifier[REDOS_MAX_DEPTH] = {0};
+    int has_alternation[REDOS_MAX_DEPTH] = {0};
     int depth = 0;
-    int group_has_quantifier = 0;
-    int group_has_alternation = 0;
     int consecutive_wildcards = 0;
     int total_quantifiers = 0;
 
@@ -171,35 +209,49 @@ static int check_redos_risk(const char *pattern, char *errbuf, size_t errbuf_len
         }
 
         if (*p == '(') {
+            if (depth + 1 >= REDOS_MAX_DEPTH) {
+                redos_set_error(errbuf, errbuf_len,
+                                "pattern nested too deeply");
+                return -1;
+            }
             depth++;
-            group_has_quantifier = 0;
-            group_has_alternation = 0;
+            has_quantifier[depth] = 0;
+            has_alternation[depth] = 0;
             consecutive_wildcards = 0;
             continue;
         }
 
         if (*p == ')') {
-            depth--;
-            if (is_quantifier(p[1])) {
-                if (check_quantified_group(group_has_quantifier,
-                        group_has_alternation, errbuf, errbuf_len) < 0)
-                    return -1;
-            }
-            group_has_quantifier = 0;
-            group_has_alternation = 0;
             consecutive_wildcards = 0;
+            if (depth == 0)
+                continue;      /* unbalanced — regcomp reports it */
+
+            int quantified = is_quantifier(p[1]);
+            if (quantified &&
+                check_quantified_group(has_quantifier[depth],
+                                       has_alternation[depth],
+                                       errbuf, errbuf_len) < 0)
+                return -1;
+
+            /* Fold this group's risk into its parent. Without this an outer
+             * paren resets the flags and the shape slips through. */
+            int child_quantifier = has_quantifier[depth] || quantified;
+            int child_alternation = has_alternation[depth];
+            depth--;
+            has_quantifier[depth] |= child_quantifier;
+            has_alternation[depth] |= child_alternation;
             continue;
         }
 
         if (*p == '|') {
-            if (depth > 0) group_has_alternation = 1;
+            if (depth > 0) has_alternation[depth] = 1;
             consecutive_wildcards = 0;
             continue;
         }
 
         if (*p == '+' || *p == '*' || *p == '{') {
             total_quantifiers++;
-            if (depth > 0) group_has_quantifier = 1;
+            if (depth > 0) has_quantifier[depth] = 1;
 
             if (p > pattern && p[-1] == '.') {
                 consecutive_wildcards++;
@@ -252,10 +304,14 @@ sm_regex_t *sm_regex_compile(const char *pattern, char *errbuf, size_t errbuf_le
         return NULL;
     }
 
+    re->disabled = 0;
+    re->worst_s = 0.0;
+    regex_common_init(re->pattern, pattern);
     return re;
 }
 
-int sm_regex_exec(sm_regex_t *re, const char *str, size_t len, size_t *match_off)
+static int regex_exec_impl(sm_regex_t *re, const char *str, size_t len,
+                           size_t *match_off)
 {
     /*
      * POSIX ERE has no built-in backtracking limit. The static pattern
@@ -293,3 +349,54 @@ const char *sm_regex_backend(void)
 }
 
 #endif
+
+/* --- Shared across backends --- */
+
+/*
+ * Enforce the per-match time budget.
+ *
+ * Patterns are client-supplied and re-run against every chunk of device
+ * output from inside the broker's single-threaded event loop, so the cost of
+ * one match is the latency of the whole broker. The static validator is a
+ * heuristic and cannot be complete, and POSIX regexec offers no way to bound
+ * backtracking up front, so the only honest guarantee is measured: time each
+ * match, and permanently disable a pattern that blows the budget.
+ *
+ * A disabled pattern reports no-match rather than being deleted, so callers
+ * (expect requests, anomaly rules, autoresponders) degrade to "never fires"
+ * and clean themselves up through their normal timeout paths instead of
+ * needing a new error channel. The cost of a hostile pattern is therefore
+ * bounded to one budget's worth, once, instead of recurring on every chunk.
+ *
+ * PCRE2 also bounds backtracking internally via match_limit/depth_limit, so
+ * there this is a second line of defence rather than the only one.
+ */
+int sm_regex_exec(sm_regex_t *re, const char *str, size_t len, size_t *match_off)
+{
+    if (!re) return 1;
+    if (re->disabled) return 1;
+
+    double t0 = sm_now_monotonic();
+    int rc = regex_exec_impl(re, str, len, match_off);
+    double elapsed = sm_now_monotonic() - t0;
+
+    if (elapsed > re->worst_s)
+        re->worst_s = elapsed;
+
+    if (elapsed > (double)SM_REGEX_MAX_MATCH_MS / 1000.0) {
+        re->disabled = 1;
+        /* Deliberately does not name nested quantifiers or quantified
+         * alternation: check_redos_risk() already rejects those at compile
+         * time, so a pattern that reaches here is a shape the validator does
+         * not model — repeated or overlapping quantifiers over the same
+         * characters, typically. */
+        SM_LOG_WARN(LOG_TAG,
+                    "pattern disabled after %.0fms on %zu bytes (budget %dms): "
+                    "\"%s\" — it will no longer match. Repeated or overlapping "
+                    "quantifiers over the same characters make match cost blow "
+                    "up; simplify the pattern.",
+                    elapsed * 1000.0, len, SM_REGEX_MAX_MATCH_MS, re->pattern);
+    }
+
+    return rc;
+}

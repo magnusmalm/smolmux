@@ -3,7 +3,7 @@
 **Purpose:** what has been proven on **real hardware** vs sim/unit only. Unit
 tests (PTY / fake-gdb) are necessary but not sufficient.
 
-Date: 2026-07-15. Boards referenced below are development kits and lab
+Date: 2026-07-15 (updated 2026-08-19). Boards referenced below are development kits and lab
 setups named in the table keys (e.g. SAM C21 Xplained Pro).
 
 See also: [`board-exploration-workflow.md`](board-exploration-workflow.md),
@@ -25,7 +25,7 @@ See also: [`board-exploration-workflow.md`](board-exploration-workflow.md),
 | Fault-register decode (M3/M33)      | no (b)   |
 | serial-over-TCP / telnet / RFC2217  | yes (c)  |
 | Board lifecycle two real wires      | no (d)   |
-| `with-port` + real flasher          | partial  |
+| `with-port` + real flasher          | yes (f)  |
 | Remote mon over TCP/WS sink         | no (d)   |
 | Zephyr RTOS threads (`gdb_threads`) | no (d)   |
 | Text-log sink (`-t`) live UART      | yes      |
@@ -36,6 +36,8 @@ See also: [`board-exploration-workflow.md`](board-exploration-workflow.md),
 **Keys:** (a) SAM C21 Xplained Pro. (b) needs M3/M33-class (e.g. nRF9151 DK).
 (c) ser2net 4.3.11 lab. (d) PTY / fake-gdb only. (e) documented, not HW-proven.
 partial = CI `/bin/true` or incomplete copper proof.
+(f) Waveshare ESP32-S3-Touch-LCD-1.28: `with-port esptool write-flash`
+for a two-image freestanding layout (app at 0, second image at 0x10000).
 
 **Notes:**
 
@@ -48,8 +50,8 @@ partial = CI `/bin/true` or incomplete copper proof.
   FICR probing - not HW-proven on SWD in this matrix.
 - **serial-over-TCP:** lab validation with ser2net; physical baud/pin effect on
   copper still separate from "link speaks RFC2217."
-- **`with-port`:** exercised with `/bin/true` in CI; a real flasher on hardware
-  is not yet in this matrix.
+- **`with-port`:** CI still uses `/bin/true`. Hardware is Waveshare S3 (f):
+  `with-port esptool write-flash` (app at 0, second image at 0x10000).
 
 ---
 
@@ -58,7 +60,7 @@ partial = CI `/bin/true` or incomplete copper proof.
 Highest-value gaps relative to the matrix above (ordered roughly by impact):
 
 1. **nRF9151 DK (or other M33) SWD** - fault-register decode + FICR identify.
-2. **`with-port` + real flasher** - west/nrfjprog/OpenOCD exclusive ownership.
+2. ~~`with-port` + real flasher~~ — yes on Waveshare S3 (f); other tools still open.
 3. **Two-wire board lifecycle** - console + SWD `board up/down` on hardware.
 4. **YMODEM path** - suspend -> `sb`/`sz` -> resume on a real receiver.
 5. **Watcher on a real panic** - forced crash and incident-file confirmation.

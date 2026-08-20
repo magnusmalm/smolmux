@@ -39,8 +39,14 @@ typedef struct gdb_data {
  * controllers, confine the broker at the OS level (seccomp/namespaces) rather
  * than relying on this. Bypassed by design once set_param("allow_shell","1")
  * opts in. */
+/* "eval" is here because it formats its argument and runs the result as a
+ * command, so eval "shel%s", "l id" reaches a shell without the word "shell"
+ * ever appearing contiguously — a demonstrated bypass of everything below it.
+ * Like the others it is also matched as a substring inside -interpreter-exec,
+ * which can false-positive on an unrelated console command containing "eval";
+ * --gdb-allow-shell is the escape hatch when that bites. */
 static const char *const gdb_code_exec_cmds[] = {
-    "shell", "pipe", "python", "guile", "make",
+    "shell", "pipe", "python", "guile", "make", "eval",
 };
 
 /* GDB resolves unambiguous prefix abbreviations, so "py" runs python, "gu"
@@ -291,23 +297,7 @@ static int gdb_write_data(sm_link_t *self, const uint8_t *data, size_t len)
         return -1;
     }
 
-    size_t written = 0;
-    while (written < len) {
-        ssize_t n = write(gd->stdin_fd, data + written, len - written);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (sm_link_wq_enqueue(&gd->wq, data + written,
-                                       len - written) != 0)
-                    return -1;
-                return 0;
-            }
-            return -1;
-        }
-        if (n == 0)
-            return -1;
-        written += (size_t)n;
-    }
-    return 0;
+    return sm_link_wq_write(gd->stdin_fd, &gd->wq, data, len);
 }
 
 static int gdb_send_break(sm_link_t *self, int duration_ms)

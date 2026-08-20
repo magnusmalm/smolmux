@@ -104,6 +104,29 @@ static void test_encode_decode_expect_result(void)
     sm_msg_t decoded = sm_msg_decode(encoded, len);
     ASSERT_INT_EQ(decoded.type, SM_MSG_EXPECT_RESULT);
     ASSERT_INT_EQ(sm_json_get_bool(decoded.root, "matched", 0), 1);
+    ASSERT_INT_EQ(sm_json_get_bool(decoded.root, "aborted", 0), 0);
+
+    sm_msg_free(&decoded);
+    cJSON_Delete(msg);
+    free(encoded);
+}
+
+static void test_encode_expect_result_aborted(void)
+{
+    const uint8_t data[] = "partial\n";
+    cJSON *msg = sm_msg_expect_result_ex("req-ab", 0, data, sizeof(data) - 1,
+                                         "prompt", 1, "anomaly",
+                                         "guru_meditation");
+    size_t len;
+    char *encoded = sm_msg_encode(msg, &len);
+
+    sm_msg_t decoded = sm_msg_decode(encoded, len);
+    ASSERT_INT_EQ(decoded.type, SM_MSG_EXPECT_RESULT);
+    ASSERT_INT_EQ(sm_json_get_bool(decoded.root, "matched", 1), 0);
+    ASSERT_INT_EQ(sm_json_get_bool(decoded.root, "aborted", 0), 1);
+    ASSERT_STR_EQ(sm_json_get_string(decoded.root, "abort_reason"), "anomaly");
+    ASSERT_STR_EQ(sm_json_get_string(decoded.root, "abort_pattern"),
+                  "guru_meditation");
 
     sm_msg_free(&decoded);
     cJSON_Delete(msg);
@@ -247,6 +270,7 @@ int main(void)
     RUN_TEST(test_encode_decode_send);
     RUN_TEST(test_encode_decode_send_expect);
     RUN_TEST(test_encode_decode_expect_result);
+    RUN_TEST(test_encode_expect_result_aborted);
     RUN_TEST(test_encode_decode_error);
     RUN_TEST(test_encode_decode_takeover_release);
     RUN_TEST(test_encode_decode_status);

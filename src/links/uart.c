@@ -197,24 +197,7 @@ static int uart_write(sm_link_t *self, const uint8_t *data, size_t len)
 {
     uart_data_t *ud = self->data;
     if (ud->fd < 0) return -1;
-
-    size_t written = 0;
-    while (written < len) {
-        ssize_t n = write(ud->fd, data + written, len - written);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (sm_link_wq_enqueue(&ud->wq, data + written,
-                                       len - written) != 0)
-                    return -1;
-                return 0;
-            }
-            return -1;
-        }
-        if (n == 0)
-            return -1;
-        written += (size_t)n;
-    }
-    return 0;
+    return sm_link_wq_write(ud->fd, &ud->wq, data, len);
 }
 
 /* Synchronous break — fallback only; not reachable from sm_broker_run

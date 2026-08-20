@@ -21,6 +21,7 @@ typedef struct sm_client {
     int hello_received;
     int disconnected;
     double connected_at;   /* CLOCK_MONOTONIC, set by broker on register */
+    int peer_pid;          /* SO_PEERCRED; 0 if unknown */
     int requires_auth;     /* set for network-origin clients (TCP) */
 
     uint8_t *read_buf;

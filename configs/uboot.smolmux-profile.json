@@ -2,7 +2,7 @@
     "name": "uboot",
     "device_type": "bootloader",
     "description": "U-Boot bootloader",
-    "prompt_pattern": "=>\\s*$|U-Boot>\\s*$",
+    "prompt_pattern": "=>[[:space:]]*$|U-Boot>[[:space:]]*$",
     "commands": [
         "version",
         "bdinfo",

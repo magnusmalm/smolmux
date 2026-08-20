@@ -11,6 +11,7 @@ static const struct { const char *name; sm_msg_type_t type; } msg_type_map[] = {
     {"welcome",            SM_MSG_WELCOME},
     {"send",               SM_MSG_SEND},
     {"send_expect",        SM_MSG_SEND_EXPECT},
+    {"listen_expect",      SM_MSG_LISTEN_EXPECT},
     {"output",             SM_MSG_OUTPUT},
     {"input_echo",         SM_MSG_INPUT_ECHO},
     {"expect_result",      SM_MSG_EXPECT_RESULT},
@@ -179,6 +180,15 @@ cJSON *sm_msg_send_expect(const char *id, const uint8_t *data, size_t data_len,
     return msg;
 }
 
+cJSON *sm_msg_listen_expect(const char *id, const char *pattern, int timeout_ms)
+{
+    cJSON *msg = make_msg("listen_expect");
+    cJSON_AddStringToObject(msg, "id", id);
+    cJSON_AddStringToObject(msg, "pattern", pattern ? pattern : "");
+    cJSON_AddNumberToObject(msg, "timeout_ms", timeout_ms);
+    return msg;
+}
+
 cJSON *sm_msg_output(const uint8_t *data, size_t len, double timestamp)
 {
     cJSON *msg = make_msg("output");
@@ -207,6 +217,15 @@ cJSON *sm_msg_input_echo(const uint8_t *data, size_t len, const char *sender, do
 cJSON *sm_msg_expect_result(const char *id, int matched, const uint8_t *data,
                             size_t len, const char *pattern)
 {
+    return sm_msg_expect_result_ex(id, matched, data, len, pattern, 0, NULL, NULL);
+}
+
+cJSON *sm_msg_expect_result_ex(const char *id, int matched,
+                               const uint8_t *data, size_t len,
+                               const char *pattern, int aborted,
+                               const char *abort_reason,
+                               const char *abort_pattern)
+{
     int truncated = 0;
     if (len > SM_MAX_EXPECT_RESULT_BYTES) {
         len = SM_MAX_EXPECT_RESULT_BYTES;
@@ -219,6 +238,14 @@ cJSON *sm_msg_expect_result(const char *id, int matched, const uint8_t *data,
     cJSON_AddStringToObject(msg, "pattern", pattern);
     if (truncated)
         cJSON_AddBoolToObject(msg, "truncated", 1);
+    /* Additive fields: old clients ignore them. */
+    if (aborted) {
+        cJSON_AddBoolToObject(msg, "aborted", 1);
+        if (abort_reason && abort_reason[0])
+            cJSON_AddStringToObject(msg, "abort_reason", abort_reason);
+        if (abort_pattern && abort_pattern[0])
+            cJSON_AddStringToObject(msg, "abort_pattern", abort_pattern);
+    }
     return msg;
 }
 
@@ -308,6 +335,17 @@ cJSON *sm_msg_history_request(const char *id, double since_ts, int last_bytes)
     cJSON_AddStringToObject(msg, "id", id);
     cJSON_AddNumberToObject(msg, "since_ts", since_ts);
     cJSON_AddNumberToObject(msg, "last_bytes", last_bytes);
+    return msg;
+}
+
+cJSON *sm_msg_history_request_seq(const char *id, uint64_t since_seq,
+                                  int max_bytes)
+{
+    cJSON *msg = make_msg("history_request");
+    cJSON_AddStringToObject(msg, "id", id);
+    cJSON_AddNumberToObject(msg, "since_seq", (double)since_seq);
+    if (max_bytes > 0)
+        cJSON_AddNumberToObject(msg, "max_bytes", max_bytes);
     return msg;
 }
 

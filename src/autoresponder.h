@@ -27,6 +27,11 @@ typedef struct sm_ar_rule {
     int enabled;
     double cooldown_s;
     double last_fire_time;
+    /* Who installed this rule. Rules deliberately outlive their creator's
+     * session -- `smolmux-cli autorespond add` exits immediately and the rule
+     * must keep firing -- so without attribution a standing "on prompt X send
+     * Y" rule has no traceable origin. Empty for rules added out of band. */
+    char created_by[64];
 } sm_ar_rule_t;
 
 /* One fired rule, returned from feed(). `response` points into the rule and is
@@ -58,6 +63,12 @@ int sm_autoresponder_add(sm_autoresponder_t *ar, const char *name,
                          const char *pattern, const uint8_t *response,
                          size_t response_len, int once, int cooldown_ms);
 
+/* Record who installed a rule (see sm_ar_rule_t.created_by). Separate from
+ * add() so the many callers that do not know an owner stay unchanged.
+ * No-op if the rule is not found. */
+void sm_autoresponder_set_owner(sm_autoresponder_t *ar, const char *name,
+                                const char *owner);
+
 /* Remove a rule by name. Returns 1 if removed, 0 if not found. */
 int sm_autoresponder_remove(sm_autoresponder_t *ar, const char *name);
 
@@ -69,5 +80,9 @@ void sm_autoresponder_clear(sm_autoresponder_t *ar);
 size_t sm_autoresponder_feed(sm_autoresponder_t *ar, const uint8_t *data,
                              size_t len, double ts,
                              sm_ar_fired_t *out, size_t max_out);
+
+/* Drop the sliding window (keep rules). Call on a new link session so a
+ * leftover login: cannot fire into U-Boot. */
+void sm_autoresponder_reset_window(sm_autoresponder_t *ar);
 
 #endif /* SM_AUTORESPONDER_H */

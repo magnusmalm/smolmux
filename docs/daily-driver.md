@@ -227,12 +227,39 @@ is a standing broker rule that keeps answering.
 
 Optional: `--gdb-path /path/to/gdb` if not on `PATH`.
 
-**Security note - GDB shell guard.** GDB's MI passthrough can run host commands
-(`shell`, `python`, `guile`, `make`, ...). smolmux blocks these by default; opt in
-with the link param `allow_shell=1` only if you trust every client. This guard
-is **best-effort, not a security boundary** - a blocklist cannot be complete for
-GDB. If you expose a GDB link to untrusted controllers, confine the broker at
-the OS level (seccomp/namespaces) rather than relying on it.
+**Security note - a GDB controller has host-shell-equivalent access.**
+
+Treat "can drive a GDB link" as "can run code as the broker's user". That is
+the honest summary, and it is the one to design around.
+
+smolmux blocks the obvious verbs (`shell`, `pipe`, `python`, `guile`, `make`,
+`eval`, plus GDB's prefix abbreviations and `-interpreter-exec` smuggling),
+but this guard is **best-effort, not a security boundary** - a blocklist
+cannot be complete for GDB. `source`, `define`, `commands`, `dprintf` and
+future console verbs all reach code execution and are deliberately *not*
+blocked, because they are ordinary debugging tools. The filter is there to
+catch accidents, not attackers.
+
+Opt out with `--gdb-allow-shell` if you trust every client. That is an
+**operator-only** flag: it is set when you start the broker and cannot be
+turned on over the wire. (It used to be reachable through `pin_control`,
+which forwarded any key to the link - fixed; `pin_control` now takes
+`dtr`/`rts`/`break` only.)
+
+If you expose a GDB link to controllers you do not fully trust, confine the
+broker at the OS level rather than relying on the filter:
+
+```ini
+# /etc/systemd/system/smolmux-gdb.service  (excerpt)
+[Service]
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+RestrictSUIDSGID=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @debug
+```
 
 **GDB link behavior notes** (verified against OpenOCD + a Cortex-M target):
 - smolmux enables `mi-async` at gdb spawn so gdb keeps answering MI commands
@@ -325,12 +352,20 @@ smolmux-monitor -L           # human listing (no-arg monitor also lists when >1 
 
 The `smolmux-cli` variants take `--json` for agents.
 
-**Group a board's wires** by tagging each broker at start with `--board`/`--role`:
+**Group a board's wires** by tagging each broker at start with `--board`/`--role`.
+Use the **same board name** as in the manifest (`samc21-bench`, not a short
+alias that will not match `board down`):
 
 ```bash
-smolmux /dev/ttyACM1 --board samc21 --role console -s /tmp/smolmux-samc21-console.sock
-smolmux --gdb --gdb-target localhost:3333 --board samc21 --role swd -s /tmp/smolmux-samc21-gdb.sock
+smolmux /dev/ttyACM1 --board samc21-bench --role console \
+  -s /tmp/smolmux-samc21-bench-console.sock
+smolmux --gdb --gdb-target localhost:3333 --board samc21-bench --role swd \
+  -s /tmp/smolmux-samc21-bench-gdb.sock
 ```
+
+**One USB cable, two services** (FT2232 UART + OpenOCD on the other
+interface): still two brokers — see [dual-service-usb-cable.md](dual-service-usb-cable.md)
+and `configs/ft2232-dual.board.json`. Pin each MCP with an explicit `-s`.
 
 **Or bring up the whole board with one command** from a `*.board.json` manifest
 (the machine-readable wiring table - see `configs/samc21.board.json` and the
@@ -349,6 +384,19 @@ skips wires already up). Use `--foreground` for bounded/CI runs where the wires
 should die when the command exits (Ctrl-C stops them all). `board down` finds a
 board's wires by their `--board` label and their pid via `SO_PEERCRED`, so there
 is no pidfile to go stale.
+
+To stop a **single** broker that isn't part of a board (or to replace the one
+holding a port), use `shutdown` (alias `stop`) - same SIGTERM-by-discovered-pid
+mechanism, scoped to one socket:
+
+```bash
+smolmux-cli -s /run/user/1000/smolmux-ttyUSB0.sock shutdown
+smolmux-cli shutdown        # works unqualified when exactly one broker is up
+```
+
+It waits until the broker's socket disappears, so when it returns the port is
+genuinely free. With several brokers running and no `-s` it refuses and lists
+them rather than guessing a kill target.
 
 ## Linux console login and multi-wire
 
@@ -373,6 +421,13 @@ see a line "#"   →  shell ready; then send --expect '#'
 **Never** send a shell command while the last prompt was `Password:`. Prefer
 raw `write` for the login dance; use `send --expect` only after the shell
 prompt is confirmed. Keep one command per send.
+
+Flags go **before** the command (required on musl/Pro binaries):
+
+```text
+smolmux-cli send --expect '#' --timeout 5000 'uname -a'
+# not: send 'uname -a' --expect '#'
+```
 
 **State machine for agents** (use the **latest** prompt in history, not any
 match earlier in the ring buffer):
@@ -424,14 +479,18 @@ a shell prompt - do not treat it as a critical disconnect by default.
 
 ### Checklist: agent attach to a Linux factory console
 
-1. Identify wires (`smolmux --list-ports`, by-id); note which shows login vs U-Boot.
+1. Identify wires (`smolmux --list-ports`, by-id). Prefer **`[STRONG]`** by-id
+   (USB serial present). Treat **`[WEAK]`** class-only by-id as a seat risk —
+   see `docs/persistent-serial-devices.md`.
+   For late USB/gadget attach: `smolmux … --wait-device 120` (or
+   `SMOLMUX_WAIT_DEVICE_S`). Note which path shows login vs U-Boot.
 2. Start broker: `smolmux <dev> -b 115200 -p <profile>` (socket auto-derived).
 3. `smolmux-cli history` / `read` - classify state (login / password / shell / uboot).
 4. Login state machine above; do not invent passwords.
 5. Only then fingerprint, logs, host-side protocol tests (serial ≠ Ethernet test roles).
 6. U-Boot: broker on early UART;  
    `break-uboot --duration 15000+ --stop '…'`; max ~2 automated tries then human power-cycle.
-7. Human monitor: `smolmux-monitor <socket>` (positional path; no `-s`).
+7. Human monitor: `smolmux-monitor -s <socket>` (or a positional path).
    Add `-c` only if you need controller role (default is observer).
 
 ## Clients
@@ -441,23 +500,24 @@ a shell prompt - do not treat it as a critical disconnect by default.
 Clients talk to the **broker Unix socket**, not the tty (discovery may accept a
 device path as a *hint* to find the matching socket).
 
-| Client                  | Pin a socket      | Notes                             |
-| ----------------------- | ----------------- | --------------------------------- |
-| `smolmux` (broker)      | `-s` / `--socket` | Optional; auto-derived if omitted |
-| `smolmux-cli`           | `-s` / `--socket` | Omit `-s` to auto-discover        |
-| `smolmux-mcp` / gdb-mcp | `-s`              | Same idea as cli                  |
-| `smolmux-watcher`       | `-s`              | Same idea as cli                  |
-| `smolmux-monitor`       | positional only   | No `-s`. `-c` = controller role   |
+| Client                  | Pin a socket       | Notes                          |
+| ----------------------- | ------------------ | ------------------------------ |
+| `smolmux` (broker)      | `-s` / `--socket`  | Optional; auto-derived if omit |
+| `smolmux-cli`           | `-s` / `--socket`  | Omit `-s` to auto-discover     |
+| `smolmux-mcp` / gdb-mcp | `-s`               | Same idea as cli               |
+| `smolmux-watcher`       | `-s`               | Same idea as cli               |
+| `smolmux-monitor`       | `-s` or positional | `-c` is controller role        |
 
 ```bash
 smolmux /dev/ttyUSB0 -b 115200 -p configs/linux-shell.smolmux-profile.json
 # Auto socket: $XDG_RUNTIME_DIR/smolmux-ttyUSB0.sock (or /tmp/…)
 
-smolmux-cli status                          # discovery when unambiguous
+smolmux-cli status                          # discovery when exactly one broker
+smolmux-cli gc --dry-run                    # leftover MCP clients
+smolmux-cli gc --mcp                        # SIGTERM every *-mcp on all brokers
 smolmux-cli -s /run/user/$UID/smolmux-ttyUSB0.sock status
-smolmux-monitor /run/user/$UID/smolmux-ttyUSB0.sock
+smolmux-monitor -s /run/user/$UID/smolmux-ttyUSB0.sock
 smolmux-monitor -c /run/user/$UID/smolmux-ttyUSB0.sock   # controller + path
-# wrong: smolmux-monitor -s …               # unrecognized option: s
 ```
 
 **Socket paths from long by-id devices:** the broker auto-derives a path that
@@ -469,7 +529,7 @@ glob / discovery. Use `-s` only when you want an explicit path.
 ### Monitor (terminal)
 
 ```bash
-./build/smolmux-monitor /tmp/smolmux-ttyUSB0.sock
+./build/smolmux-monitor -s /tmp/smolmux-ttyUSB0.sock
 # or: ./build/smolmux-monitor -c /tmp/smolmux-ttyUSB0.sock  # controller role
 # or if using TCP sink (advanced)
 ./build/smolmux-monitor --tcp 192.168.1.42:5555
@@ -534,7 +594,8 @@ Keep one high-quality profile per major target family:
 - `uboot.smolmux-profile.json` (critical for `bootdelay=0` work)
 - `linux-shell.smolmux-profile.json`
 - `nrf9151-zephyr.smolmux-profile.json` (generic Zephyr/nRF9151-style console)
-- Board manifests: `samc21.board.json`, `newboard.board.json`
+- Board manifests: `samc21.board.json`, `newboard.board.json`,
+  `ft2232-dual.board.json` (one-cable dual service example)
 
 Put target-specific prompt patterns, common commands, and anomaly patterns in the profile so your daily command line stays short.
 

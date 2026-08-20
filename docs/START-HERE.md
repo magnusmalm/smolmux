@@ -24,6 +24,8 @@ One-screen router for smolmux. Find your intent and follow the trail.
 | **What is proven on HW**                  | [hw-validation.md](hw-validation.md)         |
 | **Point an AI agent at a board (MCP)**    | [MCP-SETUP.md](MCP-SETUP.md)                 |
 | **Give serial dongles stable names**      | [serial-names](persistent-serial-devices.md) |
+| **Weak by-id / wrong board**              | [serial-names](persistent-serial-devices.md) |
+| **One USB cable, two services**           | [dual-service](dual-service-usb-cable.md)    |
 | **Linux login / multi-console**          | [daily-driver](daily-driver.md)              |
 | **Demo: SAM C21 unknown-board probe**    | [probe transcript](demo-samc21-probe-transcript.md) |
 

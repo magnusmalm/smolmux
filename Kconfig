@@ -33,11 +33,19 @@ menu "Regex"
 
 config SM_ENABLE_PCRE2
 	bool "PCRE2 regex engine (instead of POSIX ERE)"
-	default n
+	default y
 	help
 	  Use PCRE2 for the expect engine and anomaly detector
-	  instead of POSIX ERE. Adds a dependency on libpcre2-8
-	  but provides full Perl-compatible regex syntax.
+	  instead of POSIX ERE. Provides full Perl-compatible regex
+	  syntax, and bounds backtracking internally via match_limit
+	  and depth_limit -- POSIX regexec cannot do that up front, so
+	  the POSIX path relies on a pattern validator plus a measured
+	  per-match budget instead.
+
+	  Not a hard dependency: if libpcre2-8 is not installed, the
+	  build falls back to POSIX ERE automatically. Pass
+	  -DSM_ENABLE_PCRE2=ON to make a missing library an error
+	  instead, or -DSM_ENABLE_PCRE2=OFF to force POSIX.
 
 endmenu
 

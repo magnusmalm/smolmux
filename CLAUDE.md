@@ -107,6 +107,6 @@ Tests use PTY pairs (`openpty()`) to simulate serial devices - no hardware neede
 
 Newline-delimited JSON over Unix sockets. All binary data base64-encoded.
 
-Client -> Broker: `hello`, `send`, `send_expect`, `takeover`, `release`, `status`, `pin_control`, `set_baud`, `suspend`, `resume`, `history_request`, `incidents_request`, `configure_anomaly`, `interrupt_autoboot`, `configure_autoresponder`, `autoresponders_request`
+Client -> Broker: `hello`, `send`, `send_expect`, `listen_expect`, `takeover`, `release`, `status`, `pin_control`, `set_baud`, `suspend`, `resume`, `history_request` (optional `since_seq`/`max_bytes`), `incidents_request`, `configure_anomaly`, `interrupt_autoboot`, `configure_autoresponder`, `autoresponders_request`
 
 Broker -> Client: `welcome`, `output`, `input_echo`, `expect_result`, `status_response`, `error`, `history_response`, `incidents_response`, `anomaly`, `suspended`, `resumed`, `link_down`, `link_up`, `autoboot_result`, `boot_stage`, `boot_stall`, `autoresponders_response`, `autoresponder_fired`

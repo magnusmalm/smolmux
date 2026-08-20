@@ -26,7 +26,17 @@ Day-to-day serial (multi-client, U-Boot break-in, flasher handoff):
 - **Anomaly detection** - pattern-based crash/error detection with cooldown and incident tracking
 - **Output history** - timestamped ring buffer for replay by late-joining clients
 - **Structured logging** - JSONL I/O log + human-readable text log with rotation
-- **Network sinks** - TCP and WebSocket for remote access (loopback by default)
+  (the I/O log records everything sent to and from the device, including
+  anything typed at a login prompt — it is created `0600` under your private
+  state directory, and smolmux refuses to write it through a symlink or to a
+  file owned by another user)
+- **Network sinks** - TCP and WebSocket for remote access (loopback by default).
+  The wire protocol is cleartext, and any client that completes the handshake
+  gets full control of the device — console writes, pins, BREAK, SysRq, GDB.
+  For remote use, keep the bind on loopback and reach it over an SSH tunnel or
+  WireGuard rather than exposing the port; smolmux refuses to serve a
+  non-loopback TCP bind with no `--auth-token` unless you pass
+  `--insecure-no-auth`.
 - **MCP servers** - standalone `smolmux-mcp` / `smolmux-gdb-mcp` attach to a running broker; optional in-process `--mcp` sink for single-process stdio
 - **Boot tracking & autoresponder** - ordered boot stages, stall events, standing expect->send rules
 - **Autoboot interrupt** - broker-side key flood (and optional DTR/RTS reset) for `bootdelay=0` U-Boot
@@ -100,7 +110,9 @@ smolmux <port> [options]
 Options:
   -b, --baud <rate>           Baud rate (default: 115200)
   -s, --socket <path>         Unix socket path
-  -l, --log-dir <dir>         I/O log directory (default: /tmp)
+  -l, --log-dir <dir>         I/O log directory
+                              (default: $XDG_STATE_HOME/smolmux or
+                               ~/.local/state/smolmux)
   -t, --text-log-dir <dir>    Text log directory
   -p, --profile <path>        Device profile JSON file
   --board <name>              Group this wire under a board (for discovery)
@@ -117,6 +129,8 @@ Options:
   --tcp-bind <addr>           TCP bind address (default: 127.0.0.1)
   --auth-token <token>        Require token in hello from TCP clients
                               (prefer env SMOLMUX_AUTH_TOKEN - hidden from ps)
+  --insecure-no-auth          Allow a non-loopback --tcp-bind with no token.
+                              Refused by default: it is an open console.
   --ws-port <port>            Enable WebSocket sink (default: 5556)
   --no-text-log               Disable text log
   --no-reconnect              Don't auto-reconnect on disconnect
@@ -144,7 +158,7 @@ Example session:
 
 ```json
 -> {"type":"hello","name":"my-tool","role":"controller","protocol_version":1}
-<- {"type":"welcome","broker_version":"0.1.2","protocol_version":1,"port":"/dev/ttyUSB0","baud":115200,"your_role":"controller"}
+<- {"type":"welcome","broker_version":"0.2.0","protocol_version":1,"port":"/dev/ttyUSB0","baud":115200,"your_role":"controller"}
 -> {"type":"send","id":"1","data":"dW5hbWUgLWEK"}
 <- {"type":"output","data":"TGludXggNC4xOS4w...","timestamp":1709654321.123}
 ```
@@ -175,9 +189,13 @@ See [DESIGN.md](DESIGN.md) for full architecture documentation.
 
 **Required:** cJSON (vendored, single file)
 
-**Optional:** PCRE2 (regex engine upgrade from POSIX ERE, feature-gated via `SM_ENABLE_PCRE2`)
+**Auto-detected:** PCRE2 (`libpcre2-8`). Used as the regex engine when
+present, because it bounds backtracking internally; the build falls back to
+POSIX ERE automatically when it is absent, so it is never required. Force
+either way with `-DSM_ENABLE_PCRE2=ON` (error if missing) or
+`-DSM_ENABLE_PCRE2=OFF`.
 
-Core has zero external dependencies beyond POSIX + cJSON.
+Core has zero *required* external dependencies beyond POSIX + cJSON.
 
 ## Companion tools
 

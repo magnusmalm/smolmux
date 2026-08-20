@@ -31,4 +31,8 @@ int sm_link_wq_has_pending(const sm_link_wq_t *wq);
  * is drained, 1 when more data remains (EAGAIN), -1 on hard error. */
 int sm_link_wq_flush(int fd, sm_link_wq_t *wq);
 
+/* If the queue already has a tail, enqueue only (preserve order).
+ * Otherwise write to fd and queue the EAGAIN remainder. */
+int sm_link_wq_write(int fd, sm_link_wq_t *wq, const uint8_t *data, size_t len);
+
 #endif /* SM_LINK_WQ_H */

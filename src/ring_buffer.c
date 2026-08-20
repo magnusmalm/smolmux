@@ -67,6 +67,14 @@ void sm_rb_destroy(sm_ring_buffer_t *rb)
     memset(rb, 0, sizeof(*rb));
 }
 
+static void sync_first_seq(sm_ring_buffer_t *rb)
+{
+    if (rb->count == 0)
+        rb->first_seq = rb->total_seq;
+    else
+        rb->first_seq = rb->chunks[rb->head].seq_start;
+}
+
 static void evict(sm_ring_buffer_t *rb)
 {
     while (rb->count > 0 && rb->total_bytes > rb->max_bytes) {
@@ -83,8 +91,10 @@ static void evict(sm_ring_buffer_t *rb)
         } else {
             memmove(front->data, front->data + excess, front->len - excess);
             front->len -= excess;
+            front->seq_start += (uint64_t)excess;
             rb->total_bytes -= excess;
         }
+        sync_first_seq(rb);
     }
 }
 
@@ -92,7 +102,6 @@ void sm_rb_append(sm_ring_buffer_t *rb, const uint8_t *data, size_t len, double 
 {
     if (len == 0) return;
 
-    /* Coalesce into the last chunk when it shares the timestamp and has room. */
     if (rb->count > 0) {
         sm_rb_chunk_t *last = &rb->chunks[(rb->head + rb->count - 1) % rb->capacity];
         if (last->timestamp == ts && last->len < SM_RB_CHUNK_TARGET &&
@@ -100,6 +109,7 @@ void sm_rb_append(sm_ring_buffer_t *rb, const uint8_t *data, size_t len, double 
             memcpy(last->data + last->len, data, len);
             last->len += len;
             rb->total_bytes += len;
+            rb->total_seq += (uint64_t)len;
             evict(rb);
             return;
         }
@@ -113,6 +123,7 @@ void sm_rb_append(sm_ring_buffer_t *rb, const uint8_t *data, size_t len, double 
                 memcpy(last->data + last->len, data, len);
                 last->len += len;
                 rb->total_bytes += len;
+                rb->total_seq += (uint64_t)len;
                 evict(rb);
                 return;
             }
@@ -138,15 +149,18 @@ void sm_rb_append(sm_ring_buffer_t *rb, const uint8_t *data, size_t len, double 
     if (!c->data) return;
     c->alloc = alloc;
     c->timestamp = ts;
+    c->seq_start = rb->total_seq;
     memcpy(c->data, data, len);
     c->len = len;
     rb->count++;
     rb->total_bytes += len;
+    rb->total_seq += (uint64_t)len;
+    if (rb->count == 1)
+        rb->first_seq = c->seq_start;
 
     evict(rb);
 }
 
-/* Copy a range of logical indices [start, start+n) into a new array */
 static size_t copy_range(sm_ring_buffer_t *rb, size_t start, size_t n,
                           sm_rb_chunk_t **out_chunks)
 {
@@ -197,4 +211,92 @@ size_t sm_rb_get_last_n_bytes(sm_ring_buffer_t *rb, size_t n,
 size_t sm_rb_get_all(sm_ring_buffer_t *rb, sm_rb_chunk_t **out_chunks)
 {
     return copy_range(rb, 0, rb->count, out_chunks);
+}
+
+uint64_t sm_rb_total_seq(const sm_ring_buffer_t *rb)
+{
+    return rb->total_seq;
+}
+
+uint64_t sm_rb_first_seq(const sm_ring_buffer_t *rb)
+{
+    return rb->first_seq;
+}
+
+size_t sm_rb_get_since_seq(sm_ring_buffer_t *rb, uint64_t since_seq,
+                           size_t max_bytes, sm_rb_chunk_t **out_chunks,
+                           size_t *out_first_skip, uint64_t *out_cursor,
+                           uint64_t *out_dropped, int *out_has_more)
+{
+    if (out_first_skip) *out_first_skip = 0;
+    if (out_cursor) *out_cursor = rb->total_seq;
+    if (out_dropped) *out_dropped = 0;
+    if (out_has_more) *out_has_more = 0;
+    *out_chunks = NULL;
+
+    uint64_t want = since_seq;
+    if (want < rb->first_seq) {
+        if (out_dropped)
+            *out_dropped = rb->first_seq - want;
+        want = rb->first_seq;
+    }
+
+    if (rb->count == 0 || want >= rb->total_seq) {
+        if (out_cursor) *out_cursor = rb->total_seq;
+        return 0;
+    }
+
+    size_t start_i = rb->count;
+    size_t first_skip = 0;
+    for (size_t i = 0; i < rb->count; i++) {
+        sm_rb_chunk_t *c = &rb->chunks[RB_IDX(rb, i)];
+        uint64_t end = c->seq_start + (uint64_t)c->len;
+        if (end <= want)
+            continue;
+        start_i = i;
+        if (want > c->seq_start)
+            first_skip = (size_t)(want - c->seq_start);
+        break;
+    }
+    if (start_i >= rb->count)
+        return 0;
+
+    /* Select a page of chunks totaling up to max_bytes of usable data
+     * (0 max_bytes = all remaining). */
+    size_t n = 0;
+    size_t acc = 0;
+    uint64_t cursor = want;
+    for (size_t i = start_i; i < rb->count; i++) {
+        sm_rb_chunk_t *c = &rb->chunks[RB_IDX(rb, i)];
+        size_t off = (i == start_i) ? first_skip : 0;
+        size_t usable = c->len - off;
+        if (usable == 0)
+            continue;
+        if (max_bytes > 0 && acc >= max_bytes)
+            break;
+        n++;
+        if (max_bytes > 0 && acc + usable > max_bytes) {
+            size_t part = max_bytes - acc;
+            cursor = c->seq_start + (uint64_t)off + (uint64_t)part;
+            acc = max_bytes;
+            break;
+        }
+        acc += usable;
+        cursor = c->seq_start + (uint64_t)c->len;
+    }
+
+    if (n == 0)
+        return 0;
+
+    size_t copied = copy_range(rb, start_i, n, out_chunks);
+    if (copied == 0)
+        return 0;
+
+    if (out_first_skip)
+        *out_first_skip = first_skip;
+    if (out_cursor)
+        *out_cursor = cursor;
+    if (out_has_more)
+        *out_has_more = (cursor < rb->total_seq) ? 1 : 0;
+    return copied;
 }

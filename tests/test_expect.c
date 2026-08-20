@@ -202,6 +202,51 @@ static void test_match_spanning_chunks_in_large_buffer(void)
     sm_expect_destroy(&eng);
 }
 
+/* Wave 2: critical anomaly aborts pending expects before timeout. */
+static void test_abort_all_critical(void)
+{
+    sm_expect_engine_t eng;
+    sm_expect_init(&eng);
+
+    double t0 = now_mono();
+    sm_expect_add(&eng, "wait-long", "never_match_xyz", 30.0, "client-1");
+    sm_expect_feed(&eng, (const uint8_t *)"some output\n", 12);
+
+    sm_expect_abort_all(&eng, "anomaly", "guru_meditation");
+
+    sm_expect_result_t results[4];
+    size_t count = sm_expect_collect(&eng, now_mono(), results, 4);
+    double elapsed = now_mono() - t0;
+
+    ASSERT_INT_EQ((int)count, 1);
+    ASSERT_INT_EQ(results[0].matched, 0);
+    ASSERT_INT_EQ(results[0].aborted, 1);
+    ASSERT_STR_EQ(results[0].abort_reason, "anomaly");
+    ASSERT_STR_EQ(results[0].abort_pattern, "guru_meditation");
+    ASSERT(elapsed < 1.0, "abort is immediate, not timeout-wait");
+    free(results[0].data);
+
+    sm_expect_destroy(&eng);
+}
+
+static void test_timeout_not_aborted(void)
+{
+    sm_expect_engine_t eng;
+    sm_expect_init(&eng);
+
+    sm_expect_add(&eng, "req-t", "never_match", 0.01, "client-1");
+    usleep(20000);
+
+    sm_expect_result_t results[4];
+    size_t count = sm_expect_collect(&eng, now_mono(), results, 4);
+    ASSERT_INT_EQ((int)count, 1);
+    ASSERT_INT_EQ(results[0].matched, 0);
+    ASSERT_INT_EQ(results[0].aborted, 0);
+    free(results[0].data);
+
+    sm_expect_destroy(&eng);
+}
+
 int main(void)
 {
     printf("test_expect\n");
@@ -215,6 +260,8 @@ int main(void)
     RUN_TEST(test_invalid_pattern);
     RUN_TEST(test_match_in_large_buffer);
     RUN_TEST(test_match_spanning_chunks_in_large_buffer);
+    RUN_TEST(test_abort_all_critical);
+    RUN_TEST(test_timeout_not_aborted);
 
     TEST_REPORT();
 }

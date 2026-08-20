@@ -37,6 +37,24 @@ static void test_valid_manifest(void)
     ASSERT_STR_EQ(m.wires[1].target, "localhost:3333");
 }
 
+static void test_device_object_dual_key(void)
+{
+    const char *json =
+        "{\"board\":\"cam\",\"wires\":[{"
+        "\"role\":\"console\",\"link\":\"uart\","
+        "\"device\":{\"by_id\":\"/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0\","
+        "\"by_path\":\"/dev/serial/by-path/pci-example-port0\","
+        "\"policy\":\"seat\"}}]}";
+    sm_board_manifest_t m;
+    ASSERT_INT_EQ(sm_board_manifest_from_json(json, &m), 0);
+    ASSERT_STR_EQ(m.wires[0].by_id,
+                  "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0");
+    ASSERT_STR_EQ(m.wires[0].by_path, "/dev/serial/by-path/pci-example-port0");
+    ASSERT_STR_EQ(m.wires[0].policy, "seat");
+    ASSERT_STR_EQ(m.wires[0].device,
+                  "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0");
+}
+
 static void test_defaults(void)
 {
     /* baud defaults to SM_DEFAULT_BAUD; gdb_path defaults to "gdb". */
@@ -124,10 +142,59 @@ static void test_load_from_file(void)
     ASSERT_INT_EQ(sm_board_manifest_load("/nonexistent/x.board.json", &m), -1);
 }
 
+/* Every shipped example manifest must parse (guards configs/ against schema
+ * drift and typos in new board examples). */
+static void test_shipped_manifests_parse(void)
+{
+    const char *names[] = {
+        "esp32-uart.board.json",
+        "newboard.board.json",
+        "samc21.board.json",
+        "esp32-s3-touch-lcd-1.28.board.json",
+        "ft2232-dual.board.json",
+        NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "configs/%s", names[i]);
+        if (access(path, R_OK) != 0)
+            snprintf(path, sizeof(path), "../configs/%s", names[i]);
+        ASSERT(access(path, R_OK) == 0, "shipped manifest found");
+
+        sm_board_manifest_t m;
+        ASSERT_INT_EQ(sm_board_manifest_load(path, &m), 0);
+        ASSERT(m.board[0], "manifest names its board");
+        ASSERT(m.wire_count >= 1, "manifest has at least one wire");
+    }
+}
+
+/* Dual-role wires must get distinct sockets (multi-wire board model). */
+static void test_dual_role_distinct_sockets(void)
+{
+    sm_board_manifest_t m;
+    memset(&m, 0, sizeof(m));
+    snprintf(m.board, sizeof(m.board), "ft-bench");
+    m.wire_count = 2;
+    snprintf(m.wires[0].role, sizeof(m.wires[0].role), "console");
+    snprintf(m.wires[1].role, sizeof(m.wires[1].role), "swd");
+
+    setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
+    char s0[SM_SOCK_PATH_MAX], s1[SM_SOCK_PATH_MAX];
+    ASSERT_INT_EQ(sm_board_wire_socket(&m, &m.wires[0], s0, sizeof(s0)), 0);
+    ASSERT_INT_EQ(sm_board_wire_socket(&m, &m.wires[1], s1, sizeof(s1)), 0);
+    ASSERT(strcmp(s0, s1) != 0, "console and swd sockets differ");
+    ASSERT(strstr(s0, "console") != NULL, "console role in path");
+    ASSERT(strstr(s1, "swd") != NULL, "swd role in path");
+    unsetenv("XDG_RUNTIME_DIR");
+}
+
 int main(void)
 {
     printf("test_board_manifest\n");
     RUN_TEST(test_valid_manifest);
+    RUN_TEST(test_device_object_dual_key);
+    RUN_TEST(test_shipped_manifests_parse);
+    RUN_TEST(test_dual_role_distinct_sockets);
     RUN_TEST(test_defaults);
     RUN_TEST(test_rejects);
     RUN_TEST(test_socket_derivation);

@@ -54,7 +54,16 @@ Kconfig, tests).
 (A terminal is a Unix-socket client - `smolmux-monitor` - not a sink; logging
 is handled by core modules `io_log.c`/`text_log.c`, not a sink.)
 
-Links are **exclusive** - exactly one link is active at a time. The core doesn't multiplex between different device types simultaneously (you don't talk UART and GDB to the same target). Which link is compiled in is a build-time choice.
+Links are **exclusive per process** — exactly one link is active in one
+broker process at a time. The core does not multiplex UART and GDB inside
+the same process (you do not talk both to the same target through one
+`sm_broker_t`). Which link **types** are compiled in is a build-time choice;
+which type a running broker uses is argv (uart XOR gdb XOR serial-tcp).
+
+**Multi-service hardware (one USB cable, two interfaces)** is **N brokers**
+(N processes), typically started from a `*.board.json` and tagged with the
+same `--board` / different `--role`. See `docs/dual-service-usb-cable.md`.
+That is not multi-link-in-one-process.
 
 Sinks are **concurrent** - multiple sinks can consume the same data stream. A terminal sink, log sink, and MCP sink can all be active simultaneously (this is the whole point of the multiplexer).
 
@@ -171,7 +180,8 @@ typedef struct sm_sink {
     void (*on_readable)(struct sm_sink *self);
     void (*on_expect_result)(struct sm_sink *self, const char *id,
                              int matched, const uint8_t *data, size_t data_len,
-                             const char *pattern);
+                             const char *pattern, int aborted,
+                             const char *abort_pattern);
 
     void (*destroy)(struct sm_sink *self);
 

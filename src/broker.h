@@ -3,6 +3,7 @@
 
 #include <signal.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include "links/link.h"
 #include "expect.h"
 #include "ring_buffer.h"
@@ -94,6 +95,14 @@ typedef struct sm_broker {
     int baudrate;
     char board[64];   /* board this wire belongs to (--board); "" if unset */
     char role[32];    /* this wire's role on the board (--role): console/swd/... */
+    /* Serial identity (D1/D3): last by-path / by-id seen for this open path. */
+    int  identity_weak_by_id;
+    char identity_by_path[256];
+    char identity_by_id[256];
+    /* Session ages (I1 C): wall-clock of last successful open, RX byte
+     * count since then. last_link_rx_time (monotonic) already exists. */
+    double link_up_ts;
+    uint64_t bytes_rx_since_link_up;
     char log_dir[256];
     char text_log_dir[256];
     int no_text_log;
@@ -113,6 +122,14 @@ typedef struct sm_broker {
         size_t encode_index;
         cJSON *response_arr;
         int truncated;
+        /* Cursor path (since_seq): metadata on history_response. */
+        int has_cursor;
+        double cursor;     /* JSON number; seq fits in double for practical sizes */
+        double dropped;
+        int has_more;
+        size_t first_skip; /* skip bytes in chunks[0] when encoding */
+        size_t page_bytes; /* stop encoding after this many raw bytes (0=all) */
+        size_t bytes_encoded;
     } history_pending;
 } sm_broker_t;
 
@@ -123,7 +140,14 @@ void sm_broker_destroy(sm_broker_t *b);
 void sm_broker_add_sink(sm_broker_t *b, sm_sink_t *sink);
 void sm_broker_broadcast_msg(sm_broker_t *b, cJSON *msg);
 sm_client_t *sm_broker_register_client(sm_broker_t *b, int fd);
-void sm_broker_register_client_async(sm_broker_t *b, int fd);
+/* Hand an already-accepted fd to the broker thread (thread-safe; used by sinks
+ * that accept on their own thread). requires_auth must be 1 for any
+ * network-origin transport, so the hello token gate applies exactly as it does
+ * for a directly-accepted TCP client — passing 0 grants unauthenticated
+ * access even when --auth-token is set.
+ * Takes ownership of fd: the broker closes it on client teardown, or
+ * immediately if the handover itself fails. Callers must not close it. */
+void sm_broker_register_client_async(sm_broker_t *b, int fd, int requires_auth);
 
 /* Broker operations — safe to call from handlers or sinks.
  * Return 0 on success, negative on error. */

@@ -1,0 +1,17 @@
+{
+    "board": "ft2232-dual-example",
+    "wires": [
+        {
+            "role": "console",
+            "link": "uart",
+            "device": "/dev/serial/by-id/usb-FTDI_FT2232H_Dual_EXAMPLESERIAL-if01-port0",
+            "baud": 115200
+        },
+        {
+            "role": "swd",
+            "link": "gdb",
+            "gdb_path": "gdb-multiarch",
+            "target": "localhost:3333"
+        }
+    ]
+}

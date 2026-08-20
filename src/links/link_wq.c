@@ -58,6 +58,27 @@ int sm_link_wq_enqueue(sm_link_wq_t *wq, const uint8_t *data, size_t len)
     return 0;
 }
 
+int sm_link_wq_write(int fd, sm_link_wq_t *wq, const uint8_t *data, size_t len)
+{
+    if (len == 0) return 0;
+    if (sm_link_wq_has_pending(wq))
+        return sm_link_wq_enqueue(wq, data, len);
+
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, data + written, len - written);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return sm_link_wq_enqueue(wq, data + written, len - written);
+            return -1;
+        }
+        if (n == 0)
+            return -1;
+        written += (size_t)n;
+    }
+    return 0;
+}
+
 int sm_link_wq_flush(int fd, sm_link_wq_t *wq)
 {
     while (wq->count > 0) {

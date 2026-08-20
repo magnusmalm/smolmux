@@ -1,10 +1,13 @@
 #include "constants.h"
 #include "broker.h"
+#include "broker_info.h"
+#include "cJSON.h"
 #include "device_profile.h"
 #include "links/uart.h"
 #include "logger.h"
 #include "util/sock_util.h"
 #include "util/profile_resolve.h"
+#include "util/timeutil.h"
 #include "sm_features.h"
 
 #if SM_ENABLE_GDB
@@ -31,8 +34,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <glob.h>
 #include <unistd.h>
@@ -43,6 +49,37 @@ static void signal_handler(int sig)
 {
     (void)sig;
     sm_broker_stop(&broker);
+}
+
+/* After a startup failure on a UART port, say WHO holds it instead of leaving
+ * the operator to fuser/lsof archaeology. Re-opens the port briefly to get a
+ * fresh errno; only speaks when that confirms a busy/permission failure. */
+static void diagnose_busy_port(const char *port)
+{
+    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        return;                     /* port opens fine — failure was elsewhere */
+    }
+    if (errno != EBUSY && errno != EACCES && errno != EPERM)
+        return;
+    int open_errno = errno;
+
+    sm_broker_info_t holder;
+    if (sm_find_broker_for_endpoint(port, &holder, 800) == 0) {
+        fprintf(stderr,
+                "port %s is held by smolmux pid=%d socket=%s%s%s%s\n"
+                "  stop it with: %s-cli -s %s shutdown\n",
+                port, holder.pid, holder.socket,
+                holder.board[0] ? " board=" : "",
+                holder.board[0] ? holder.board : "",
+                holder.suspended ? " (suspended)" : "",
+                SM_NAME, holder.socket);
+    } else if (open_errno == EBUSY) {
+        fprintf(stderr,
+                "port %s is held by another process (try: fuser -v %s)\n",
+                port, port);
+    }
 }
 
 #if SM_ENABLE_GDB
@@ -57,6 +94,45 @@ static void sigchld_handler(int sig)
     errno = saved_errno;
 }
 #endif
+
+/* Read an auth token from a file, so it appears in neither argv (world-
+ * readable via /proc/<pid>/cmdline) nor the environment. Trailing newline is
+ * stripped so `echo tok > file` does the obvious thing. Returns 0 on success;
+ * on failure prints why and returns -1 — a token the operator asked for but
+ * that did not load must never silently degrade into "no auth". */
+static int read_auth_token_file(const char *path, char *out, size_t out_len)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "Error: cannot read --auth-token-file %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fileno(f), &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)))
+        fprintf(stderr,
+                "Warning: %s is readable by other users (mode %03o); "
+                "chmod 600 it.\n",
+                path, (unsigned)(st.st_mode & 07777));
+
+    char buf[256];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fprintf(stderr, "Error: --auth-token-file %s is empty\n", path);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    buf[strcspn(buf, "\r\n")] = '\0';
+    if (!buf[0]) {
+        fprintf(stderr, "Error: --auth-token-file %s is empty\n", path);
+        return -1;
+    }
+
+    snprintf(out, out_len, "%s", buf);
+    return 0;
+}
 
 static void usage(const char *prog)
 {
@@ -75,7 +151,10 @@ static void usage(const char *prog)
         "OPTIONS:\n"
         "  -b, --baud <rate>           Baud rate (default: %d)\n"
         "  -s, --socket <path>         Unix socket path\n"
-        "  -l, --log-dir <dir>         I/O log directory (default: %s)\n"
+        "  -l, --log-dir <dir>         I/O log directory\n"
+        "                              (default: $XDG_STATE_HOME/smolmux or\n"
+        "                               ~/.local/state/smolmux; holds console\n"
+        "                               traffic, created 0600)\n"
         "  -t, --text-log-dir <dir>    Text log directory\n"
         "  -p, --profile <path>        Device profile JSON file\n"
         "  --board <name>              Group this wire under a board (for discovery)\n"
@@ -84,6 +163,10 @@ static void usage(const char *prog)
         "  --gdb                       Use GDB MI link instead of UART\n"
         "  --gdb-path <path>           Path to gdb binary (default: gdb)\n"
         "  --gdb-target <spec>         GDB target (e.g., localhost:3333)\n"
+        "  --gdb-allow-shell           Permit shell/python/eval GDB commands.\n"
+        "                              Off by default; a GDB console is host\n"
+        "                              shell access. Operator-only — clients\n"
+        "                              cannot turn it on over the wire.\n"
 #endif
 #if SM_ENABLE_LINK_SERIAL_TCP
         "  --serial-tcp <host:port>    Connect to a serial-over-TCP device server\n"
@@ -97,12 +180,18 @@ static void usage(const char *prog)
         "  --tcp-bind <addr>           TCP bind address (default: 127.0.0.1)\n"
         "  --auth-token <token>        Require this token in hello from TCP clients\n"
         "                              (prefer env SMOLMUX_AUTH_TOKEN — hidden from ps)\n"
+        "  --auth-token-file <path>    Read the token from a file (keeps it out of\n"
+        "                              argv and the environment; systemd LoadCredential)\n"
+        "  --insecure-no-auth          Allow a non-loopback --tcp-bind with no token.\n"
+        "                              Refused by default: it is an open console.\n"
 #endif
 #if SM_ENABLE_SINK_WS
         "  --ws-port <port>            Enable WebSocket sink on port (default: %d)\n"
 #endif
         "  --no-text-log               Disable text log\n"
         "  --no-reconnect              Don't auto-reconnect on disconnect\n"
+        "  --wait-device <seconds>     Wait for the device path to appear before\n"
+        "                              open (late USB/gadget attach). 0 = off.\n"
         "  --list-ports                List available serial ports and exit\n"
         "  --list-profiles             List available device profiles and exit\n"
         "  --help-protocol             Show wire protocol documentation\n"
@@ -129,13 +218,11 @@ static void usage(const char *prog)
         "ENVIRONMENT:\n"
         "  SMOLMUX_SOCKET           Override socket path for clients\n"
         "  SMOLMUX_DEVICE_PROFILE   Path to device profile JSON\n"
+        "  SMOLMUX_WAIT_DEVICE_S    Default --wait-device seconds if flag omitted\n"
         "  XDG_RUNTIME_DIR          Preferred directory for socket files\n"
-        "\n"
-        "COMPANION TOOLS:\n"
-        "  smolmux-cli              Command-line client (send commands, read output)\n"
-        "  smolmux-monitor          Interactive terminal client (Ctrl-] to escape)\n"
-        "  smolmux-watcher          Daemon that saves anomaly incident reports\n",
-        prog, prog, prog, prog, prog, SM_DEFAULT_BAUD, SM_LOG_DIR
+        "  XDG_STATE_HOME           Preferred directory for the I/O log\n"
+        ,
+        prog, prog, prog, prog, prog, SM_DEFAULT_BAUD
 #if SM_ENABLE_SINK_TCP
         , SM_TCP_DEFAULT_PORT
 #endif
@@ -144,6 +231,11 @@ static void usage(const char *prog)
 #endif
         , prog, prog, prog, prog, prog
     );
+    fprintf(stderr,
+        "\nCOMPANION TOOLS:\n"
+        "  smolmux-cli              Command-line client (send, read)\n"
+        "  smolmux-monitor          Interactive terminal (Ctrl-] escape)\n"
+        "  smolmux-watcher          Anomaly incident daemon\n");
 }
 
 static void print_protocol_help(void)
@@ -163,7 +255,7 @@ static void print_protocol_help(void)
         "  TCP clients may require token when --auth-token / SMOLMUX_AUTH_TOKEN is set.\n"
         "\n"
         "  -> {\"type\":\"hello\",\"name\":\"my-tool\",\"role\":\"controller\",\"protocol_version\":1}\n"
-        "  <- {\"type\":\"welcome\",\"broker_version\":\"0.1.0\",\"protocol_version\":1,\n"
+        "  <- {\"type\":\"welcome\",\"broker_version\":\"0.2.0\",\"protocol_version\":1,\n"
         "      \"port\":\"/dev/ttyUSB0\",\"baud\":115200,\"your_role\":\"controller\"}\n"
         "\n"
         "ROLES:\n"
@@ -185,6 +277,10 @@ static void print_protocol_help(void)
         "  send_expect       Write data + wait for regex match with timeout.\n"
         "    {\"type\":\"send_expect\",\"id\":\"<id>\",\"data\":\"<base64>\",\n"
         "     \"pattern\":\"<regex>\",\"timeout_ms\":<int>}\n"
+        "\n"
+        "  listen_expect     Wait for regex only (no TX; observers OK).\n"
+        "    {\"type\":\"listen_expect\",\"id\":\"<id>\",\"pattern\":\"<regex>\",\n"
+        "     \"timeout_ms\":<int>}\n"
         "\n"
         "  takeover          Request exclusive send access.\n"
         "    {\"type\":\"takeover\",\"id\":\"<id>\"}\n"
@@ -209,9 +305,11 @@ static void print_protocol_help(void)
         "    {\"type\":\"resume\",\"id\":\"<id>\"}\n"
         "\n"    );
     printf(
-        "  history_request   Retrieve output history.\n"
+        "  history_request   Retrieve output history (time/bytes or since_seq).\n"
         "    {\"type\":\"history_request\",\"id\":\"<id>\",\"since_ts\":<double>,\n"
         "     \"last_bytes\":<int>}\n"
+        "    or {\"type\":\"history_request\",\"id\":\"<id>\",\"since_seq\":<n>,\n"
+        "     \"max_bytes\":<int>}  -> response has cursor/dropped/has_more\n"
         "\n"
         "  incidents_request Retrieve anomaly incidents.\n"
         "    {\"type\":\"incidents_request\",\"id\":\"<id>\",\"since_ts\":<double>}\n"
@@ -239,7 +337,8 @@ static void print_protocol_help(void)
         "  welcome           Handshake response (after hello).\n"
         "  output            Device data (base64-encoded, with timestamp).\n"
         "  input_echo        Echo of data sent by another client.\n"
-        "  expect_result     Result of send_expect (matched bool + captured data).\n"
+        "  expect_result     Result of send_expect (matched bool + data; optional\n"
+        "                    aborted/abort_reason/abort_pattern on critical anomaly).\n"
         "  status_response   Response to status request.\n"
         "  history_response  Response with output history chunks.\n"
         "  incidents_response Response with anomaly incidents.\n"
@@ -261,7 +360,7 @@ static void print_protocol_help(void)
         "  {\"type\":\"hello\",\"name\":\"test\",\"role\":\"controller\",\"protocol_version\":1}\n"
         "  # broker responds with welcome\n"
         "  {\"type\":\"send_expect\",\"id\":\"1\",\"data\":\"dW5hbWUgLWEK\",\n"
-        "   \"pattern\":\"\\\\$\\\\s*$\",\"timeout_ms\":5000}\n"
+        "   \"pattern\":\"\\\\$[[:space:]]*$\",\"timeout_ms\":5000}\n"
         "  # broker sends output messages, then expect_result\n"
         "\n"
         "  Data encoding: echo -n 'uname -a\\n' | base64  ->  dW5hbWUgLWEK\n"    );
@@ -269,15 +368,11 @@ static void print_protocol_help(void)
 
 static void do_list_ports(void)
 {
-    glob_t g;
-    size_t total = sm_glob_serial_ports(&g);
-    if (total == 0) {
-        printf("No serial ports found.\n");
-    } else {
-        for (size_t i = 0; i < total; i++)
-            printf("%s\n", g.gl_pathv[i]);
+    char *text = sm_format_serial_ports_text();
+    if (text) {
+        printf("%s\n", text);
+        free(text);
     }
-    globfree(&g);
 }
 
 static void do_list_profiles(void)
@@ -396,7 +491,7 @@ int main(int argc, char *argv[])
     int baud = SM_DEFAULT_BAUD;
     const char *port = NULL;
     char socket_path[108] = {0};
-    char log_dir[256] = SM_LOG_DIR;
+    char log_dir[256] = {0};   /* default computed below (private state dir) */
     char text_log_dir[256] = {0};
     const char *profile_path = NULL;
     int no_text_log = 0;
@@ -406,21 +501,50 @@ int main(int argc, char *argv[])
     int enable_gdb = 0;
     const char *gdb_path = NULL;
     const char *gdb_target = NULL;
+    int gdb_allow_shell = 0;
     const char *serial_tcp_target = NULL;
     int tcp_port = 0;
     const char *tcp_bind = NULL;
     const char *auth_token = getenv("SMOLMUX_AUTH_TOKEN");
+    const char *auth_token_file = NULL;
+    int insecure_no_auth = 0;
     const char *board = NULL;
     const char *role = NULL;
     int ws_port = 0;
+    int wait_device_s = 0;
+    int wait_device_set = 0;
     int do_list_ports_flag = 0;
     int do_list_profiles_flag = 0;
     int do_help_protocol = 0;
+
+    {
+        const char *w = getenv("SMOLMUX_WAIT_DEVICE_S");
+        if (w && w[0]) {
+            char *endp;
+            long v = strtol(w, &endp, 10);
+            if (*endp == '\0' && v >= 0 && v <= 86400) {
+                wait_device_s = (int)v;
+                wait_device_set = 1;
+            }
+        }
+    }
 
     /* Default text log dir: ~/.local/share/smolmux/logs */
     const char *home = getenv("HOME");
     if (home)
         snprintf(text_log_dir, sizeof(text_log_dir), SM_TEXT_LOG_DIR_FMT, home);
+
+    /* Default I/O log dir: the user's private state dir, never a shared one.
+     * This log captures console credentials, so /tmp is only the last resort
+     * for an environment that names no home (and sm_io_log_open still refuses
+     * an unsafe file there). */
+    const char *xdg_state = getenv("XDG_STATE_HOME");
+    if (xdg_state && xdg_state[0])
+        snprintf(log_dir, sizeof(log_dir), SM_IO_LOG_DIR_XDG_FMT, xdg_state);
+    else if (home && home[0])
+        snprintf(log_dir, sizeof(log_dir), SM_IO_LOG_DIR_HOME_FMT, home);
+    else
+        snprintf(log_dir, sizeof(log_dir), "%s", SM_LOG_DIR);
 
     enum {
         OPT_LIST_PORTS = 256,
@@ -430,6 +554,10 @@ int main(int argc, char *argv[])
         OPT_BOARD,
         OPT_ROLE,
         OPT_SERIAL_TCP,
+        OPT_INSECURE_NO_AUTH,
+        OPT_GDB_ALLOW_SHELL,
+        OPT_AUTH_TOKEN_FILE,
+        OPT_WAIT_DEVICE,
     };
 
     static const struct option long_opts[] = {
@@ -441,16 +569,20 @@ int main(int argc, char *argv[])
         {"gdb",            no_argument,       NULL, 'G'},
         {"gdb-path",       required_argument, NULL, 'g'},
         {"gdb-target",     required_argument, NULL, 'r'},
+        {"gdb-allow-shell", no_argument,      NULL, OPT_GDB_ALLOW_SHELL},
         {"serial-tcp",     required_argument, NULL, OPT_SERIAL_TCP},
         {"mcp",            no_argument,       NULL, 'M'},
         {"tcp-port",       required_argument, NULL, 'T'},
         {"tcp-bind",       required_argument, NULL, 'B'},
         {"auth-token",     required_argument, NULL, OPT_AUTH_TOKEN},
+        {"auth-token-file", required_argument, NULL, OPT_AUTH_TOKEN_FILE},
+        {"insecure-no-auth", no_argument,     NULL, OPT_INSECURE_NO_AUTH},
         {"board",          required_argument, NULL, OPT_BOARD},
         {"role",           required_argument, NULL, OPT_ROLE},
         {"ws-port",        required_argument, NULL, 'W'},
         {"no-text-log",    no_argument,       NULL, 'N'},
         {"no-reconnect",   no_argument,       NULL, 'R'},
+        {"wait-device",    required_argument, NULL, OPT_WAIT_DEVICE},
         {"list-ports",     no_argument,       NULL, OPT_LIST_PORTS},
         {"list-profiles",  no_argument,       NULL, OPT_LIST_PROFILES},
         {"help-protocol",  no_argument,       NULL, OPT_HELP_PROTOCOL},
@@ -511,6 +643,20 @@ int main(int argc, char *argv[])
         case OPT_LIST_PROFILES: do_list_profiles_flag = 1; break;
         case OPT_HELP_PROTOCOL: do_help_protocol = 1; break;
         case OPT_AUTH_TOKEN: auth_token = optarg; break;
+        case OPT_AUTH_TOKEN_FILE: auth_token_file = optarg; break;
+        case OPT_INSECURE_NO_AUTH: insecure_no_auth = 1; break;
+        case OPT_GDB_ALLOW_SHELL: gdb_allow_shell = 1; break;
+        case OPT_WAIT_DEVICE: {
+            char *endp;
+            long v = strtol(optarg, &endp, 10);
+            if (*endp || v < 0 || v > 86400) {
+                fprintf(stderr, "Error: invalid --wait-device '%s'\n", optarg);
+                return 1;
+            }
+            wait_device_s = (int)v;
+            wait_device_set = 1;
+            break;
+        }
         case 'v': verbose = 1; break;
         case 'V':
             printf("%s %s\n", SM_NAME, SM_VERSION);
@@ -577,11 +723,22 @@ int main(int argc, char *argv[])
         SM_LOG_INFO("main", "gdb=%s target=%s socket=%s",
                     gdb_path ? gdb_path : "gdb",
                     gdb_target ? gdb_target : "(none)", socket_path);
+        /* Operator-only opt-in. This used to be reachable by any controller
+         * through pin_control, which made the code-exec guard switchable off
+         * over the wire; pin_control now takes line controls only. */
+        if (gdb_allow_shell) {
+            link->set_param(link, "allow_shell", "1");
+            SM_LOG_WARN("main",
+                        "--gdb-allow-shell: shell/python/eval GDB commands are "
+                        "PERMITTED. Any controller on this broker can now run "
+                        "code on this host.");
+        }
     }
 #else
     (void)enable_gdb;
     (void)gdb_path;
     (void)gdb_target;
+    (void)gdb_allow_shell;
 #endif
 
 #if SM_ENABLE_LINK_SERIAL_TCP
@@ -619,6 +776,44 @@ int main(int argc, char *argv[])
                     socket_path);
     }
 
+    /* Wait for late-attached device nodes (OTG gadget, cold USB). */
+    if (wait_device_s > 0 && port) {
+        SM_LOG_INFO("main", "waiting up to %ds for device %s", wait_device_s,
+                    port);
+        if (sm_wait_path_exists(port, (double)wait_device_s, 250000) != 0) {
+            fprintf(stderr,
+                    "Error: device path not present after %ds: %s\n"
+                    "  Is the cable attached? Gadget userspace up?\n"
+                    "  Use serial_list_ports / --list-ports to confirm.\n",
+                    wait_device_s, port);
+            return 1;
+        }
+        SM_LOG_INFO("main", "device path present: %s", port);
+    }
+    (void)wait_device_set;
+
+    /* Named board + weak by-id: never auto-bind (D3). Override:
+     * SMOLMUX_IDENTITY_OK=1 or a dual-key seat pin checked at board up. */
+    if (board && board[0] && port && sm_serial_by_id_is_weak(port)) {
+        const char *ok = getenv("SMOLMUX_IDENTITY_OK");
+        int identity_ok = ok && ok[0] && strcmp(ok, "0") != 0;
+        char now[256];
+        now[0] = '\0';
+        (void)sm_serial_resolve_by_path(port, now, sizeof(now));
+        if (sm_identity_named_board_is_ambiguous(1, 1, NULL, NULL, now,
+                                                 identity_ok)) {
+            cJSON *err = sm_identity_ambiguous_json(board, port,
+                "named board + weak by-id; pin by_path (policy=seat) "
+                "or set SMOLMUX_IDENTITY_OK=1");
+            char *s = cJSON_PrintUnformatted(err);
+            fprintf(stderr, "%s\n",
+                    s ? s : "{\"error\":\"identity_ambiguous\"}");
+            free(s);
+            cJSON_Delete(err);
+            return 1;
+        }
+    }
+
     /* Initialize broker */
     sm_broker_init(&broker, link, socket_path);
     snprintf(broker.port, sizeof(broker.port), "%s",
@@ -626,12 +821,28 @@ int main(int argc, char *argv[])
     broker.baudrate = baud;
     if (board) snprintf(broker.board, sizeof(broker.board), "%s", board);
     if (role)  snprintf(broker.role, sizeof(broker.role), "%s", role);
+    if (port && sm_serial_by_id_is_weak(port)) {
+        broker.identity_weak_by_id = 1;
+        SM_LOG_WARN("main",
+                    "device path looks like a WEAK by-id (class-only, no USB "
+                    "serial). Reconnect will refuse if the physical seat "
+                    "changes. Prefer a board with USB serial or a by-path "
+                    "seat key. See issue-serial-identity-collision-by-id.");
+    }
     snprintf(broker.log_dir, sizeof(broker.log_dir), "%s", log_dir);
     snprintf(broker.text_log_dir, sizeof(broker.text_log_dir), "%s", text_log_dir);
     broker.no_text_log = no_text_log;
     broker.reconnect = !no_reconnect;
-    if (auth_token)
+    /* --auth-token-file wins over both the flag and the environment: it is
+     * the only input that leaves the token out of world-readable
+     * /proc/<pid>/cmdline and out of the process environment. */
+    if (auth_token_file) {
+        if (read_auth_token_file(auth_token_file, broker.auth_token,
+                                 sizeof(broker.auth_token)) != 0)
+            return 1;
+    } else if (auth_token) {
         snprintf(broker.auth_token, sizeof(broker.auth_token), "%s", auth_token);
+    }
 
     /* Load device profile */
     if (discover_profile(&broker.profile, profile_path) != 0)
@@ -659,18 +870,55 @@ int main(int argc, char *argv[])
 
 #if SM_ENABLE_SINK_TCP
     if (tcp_port > 0) {
+        int loopback_only = sm_tcp_bind_is_loopback(tcp_bind);
+
+        /* A tokenless TCP sink hands every reachable peer a full controller
+         * session: console writes, DTR/RTS, BREAK, SysRq, suspend, and GDB on
+         * a GDB link. On loopback that is a local-trust decision and a warning
+         * is proportionate. Bound anywhere else it is an open console on the
+         * network, so require the operator to say so in as many words rather
+         * than log a line they will never see — brokers started by
+         * `smolmux-cli board up` are detached, and the warning scrolls past
+         * even when they are not. */
+        if (sm_tcp_refuse_unauthenticated(tcp_bind, broker.auth_token[0] != 0,
+                                          insecure_no_auth)) {
+            fprintf(stderr,
+                "Error: refusing to serve TCP on %s without authentication.\n"
+                "  Any host that can reach port %d would get full control of "
+                "the device\n"
+                "  (console writes, pins, BREAK, SysRq, suspend, GDB).\n\n"
+                "  Fix one of:\n"
+                "    --auth-token <tok>   (or export SMOLMUX_AUTH_TOKEN)\n"
+                "    --tcp-bind 127.0.0.1 then reach it over an SSH tunnel\n"
+                "    --insecure-no-auth   to accept the risk deliberately\n\n"
+                "  Note the wire protocol is cleartext either way: the token "
+                "and\n"
+                "  everything typed at the console cross the network "
+                "unencrypted.\n",
+                tcp_bind ? tcp_bind : "0.0.0.0", tcp_port);
+            return 1;
+        }
+
         sm_sink_t *tcp = sm_tcp_sink_new(tcp_port, tcp_bind);
         sm_broker_add_sink(&broker, tcp);
         SM_LOG_INFO("main", "TCP sink enabled on port %d", tcp_port);
+
         if (!broker.auth_token[0])
             SM_LOG_WARN("main",
                         "TCP sink has no auth token — any peer that can "
                         "reach the port gets full access. Set "
                         "SMOLMUX_AUTH_TOKEN or --auth-token.");
+        if (!loopback_only)
+            SM_LOG_WARN("main",
+                        "TCP sink is bound to %s, not loopback: the token and "
+                        "all console traffic cross the network in cleartext. "
+                        "Prefer --tcp-bind 127.0.0.1 plus an SSH tunnel.",
+                        tcp_bind ? tcp_bind : "0.0.0.0");
     }
 #else
     (void)tcp_port;
     (void)tcp_bind;
+    (void)insecure_no_auth;
 #endif
 
 #if SM_ENABLE_SINK_WS
@@ -678,6 +926,12 @@ int main(int argc, char *argv[])
         sm_sink_t *wss = sm_ws_sink_new(ws_port);
         sm_broker_add_sink(&broker, wss);
         SM_LOG_INFO("main", "WebSocket sink enabled on port %d", ws_port);
+        if (!broker.auth_token[0])
+            SM_LOG_WARN("main",
+                        "WebSocket sink has no auth token — the listener is "
+                        "loopback-only, but any local user (not just yours) "
+                        "gets full access. Set SMOLMUX_AUTH_TOKEN or "
+                        "--auth-token.");
     }
 #else
     (void)ws_port;
@@ -705,6 +959,9 @@ int main(int argc, char *argv[])
 
     /* Run */
     int rc = sm_broker_run(&broker);
+    /* Setup failures (rc<0) on a UART port: name the holder if one exists. */
+    if (rc < 0 && port && !enable_gdb && !serial_tcp_target)
+        diagnose_busy_port(port);
     sm_broker_destroy(&broker);
 
     SM_LOG_INFO("main", "exiting (rc=%d)", rc);

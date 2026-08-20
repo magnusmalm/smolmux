@@ -3,6 +3,8 @@
 
 #include <stdio.h>
 #include <sys/stat.h>
+#include <glob.h>
+#include <unistd.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -224,10 +226,47 @@ static void test_flush_visible_without_close(void)
     unlink(path);
 }
 
+/* The text log is a console transcript, so it carries whatever was typed at a
+ * login prompt. It was created 0644 in a 0755 directory, leaving every session
+ * readable by any local user who could reach the home directory. */
+static void test_text_log_is_private(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char dir[256];
+    snprintf(dir, sizeof(dir), "%s/smolmux-tl-perm", tmp && tmp[0] ? tmp : ".");
+
+    mode_t old = umask(022);   /* the umask that produced 0644 */
+    sm_text_log_t *log = sm_text_log_open(dir, "/dev/ttyPERM");
+    umask(old);
+    ASSERT_NOT_NULL(log);
+    if (!log) return;
+    sm_text_log_write(log, (const uint8_t *)"secret\n", 7, 1700000000.0);
+    sm_text_log_close(log);
+
+    struct stat dst;
+    ASSERT_INT_EQ(stat(dir, &dst), 0);
+    ASSERT_INT_EQ((int)(dst.st_mode & 07777), 0700);
+
+    glob_t g;
+    char pat[512];
+    snprintf(pat, sizeof(pat), "%s/ttyPERM-*.log", dir);
+    memset(&g, 0, sizeof(g));
+    ASSERT_INT_EQ(glob(pat, 0, NULL, &g), 0);
+    if (g.gl_pathc > 0) {
+        struct stat fst;
+        ASSERT_INT_EQ(stat(g.gl_pathv[0], &fst), 0);
+        ASSERT_INT_EQ((int)(fst.st_mode & 07777), 0600);
+        unlink(g.gl_pathv[0]);
+    }
+    globfree(&g);
+    rmdir(dir);
+}
+
 int main(void)
 {
     printf("test_text_log\n");
 
+    RUN_TEST(test_text_log_is_private);
     RUN_TEST(test_filename_and_line_format);
     RUN_TEST(test_slash_replacement_in_port_name);
     RUN_TEST(test_day_rotation);

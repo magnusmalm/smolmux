@@ -447,6 +447,7 @@ static void usage(const char *prog)
         "  -e, --escape <key>      Prefix key: caret notation (^], ^A, ^?) or\n"
         "                          'esc' (default: ^] = Ctrl-])\n"
         "  -L, --list              List active brokers and what each holds, then exit\n"
+        "  -s, --socket <path>     Broker socket (same as smolmux-cli -s)\n"
         "  --tcp <host:port>       Connect via TCP instead of Unix socket\n"
         "  -V, --version           Show version\n"
         "  -h, --help              Show help\n"
@@ -470,7 +471,7 @@ static void usage(const char *prog)
         "  Z    resume (re-acquire port)\n"
         "\n"
         "SOCKET DISCOVERY:\n"
-        "  1. Positional argument\n"
+        "  1. -s / --socket or positional argument\n"
         "  2. $SMOLMUX_SOCKET environment variable\n"
         "  3. Glob $XDG_RUNTIME_DIR/smolmux-*.sock\n"
         "  4. Glob /tmp/smolmux-*.sock\n"
@@ -492,7 +493,7 @@ static size_t list_brokers(void)
     size_t shown = n < 64 ? n : 64;
     fprintf(stderr, "Active smolmux brokers (%zu):\n", n);
     for (size_t i = 0; i < shown; i++) {
-        char line[320];
+        char line[480];
         sm_broker_info_format(&infos[i], line, sizeof(line));
         fprintf(stderr, "  %s\n", line);
     }
@@ -519,6 +520,7 @@ int main(int argc, char *argv[])
         {"controller", no_argument,       NULL, 'c'},
         {"name",       required_argument, NULL, 'n'},
         {"escape",     required_argument, NULL, 'e'},
+        {"socket",     required_argument, NULL, 's'},
         {"tcp",        required_argument, NULL, 'T'},
         {"list",       no_argument,       NULL, 'L'},
         {"version",    no_argument,       NULL, 'V'},
@@ -527,10 +529,13 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "cn:e:LVh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "cn:e:s:LVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'c':
             controller = 1;
+            break;
+        case 's':
+            socket_path = optarg;
             break;
         case 'L':
             do_list = 1;
@@ -590,7 +595,9 @@ int main(int argc, char *argv[])
          * attaching to an arbitrary one (todo #1). */
         char discovered_path[SM_SOCK_PATH_MAX];
         const char *env = getenv(SM_SOCKET_ENV);
-        if (optind < argc) {
+        if (socket_path) {
+            /* -s / --socket already set */
+        } else if (optind < argc) {
             socket_path = argv[optind];
         } else if (env && env[0]) {
             socket_path = env;

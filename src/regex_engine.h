@@ -6,6 +6,18 @@
 /* Maximum allowed pattern length to reject overly complex regexes */
 #define SM_REGEX_MAX_PATTERN_LEN 1024
 
+/* Wall-clock budget for a single match. Patterns come from clients, run
+ * inside the broker's single-threaded event loop, and are re-run against
+ * every chunk of device output, so one slow match stalls everything. A
+ * pattern that exceeds this once is disabled and reports no-match from then
+ * on: the static checks in check_redos_risk() are a heuristic and cannot be
+ * complete, so this measured bound is what actually caps the damage.
+ * Legitimate patterns finish in microseconds; this leaves ~1000x headroom. */
+#define SM_REGEX_MAX_MATCH_MS 50
+
+/* Pattern prefix kept for diagnostics, so a disable warning can name it. */
+#define SM_REGEX_LOG_PATTERN_LEN 96
+
 typedef struct sm_regex sm_regex_t;
 
 sm_regex_t *sm_regex_compile(const char *pattern, char *errbuf, size_t errbuf_len);

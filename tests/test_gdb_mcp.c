@@ -15,6 +15,7 @@
 
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
@@ -366,18 +367,20 @@ static void test_gdb_mcp_e2e(void)
     }
 
     /* gdb_generate_profile (with path): writes the file; the parent reads it
-     * back and confirms it is a valid, loadable profile. */
+     * back and confirms it is a valid, loadable profile. The child's HOME is
+     * $TMPDIR (see spawn), so the profile directory it may write to is
+     * $TMPDIR/.config/smolmux — a bare filename lands there. */
     const char *tmp = getenv("TMPDIR");
-    char gen_path[256];
-    snprintf(gen_path, sizeof(gen_path), "%s/smolmux-gen.gdb-profile.json",
-             tmp && tmp[0] ? tmp : "/tmp");
+    if (!tmp || !tmp[0]) tmp = "/tmp";
+    char gen_path[400];
+    snprintf(gen_path, sizeof(gen_path),
+             "%s/.config/smolmux/smolmux-gen.gdb-profile.json", tmp);
     unlink(gen_path);
     char gen_req[512];
     snprintf(gen_req, sizeof(gen_req),
         "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":"
         "{\"name\":\"gdb_generate_profile\",\"arguments\":"
-        "{\"path\":\"%s\",\"rtos\":\"zephyr\"}}}",
-        gen_path);
+        "{\"path\":\"smolmux-gen.gdb-profile.json\",\"rtos\":\"zephyr\"}}}");
     resp = rpc_call(&fx, 20, gen_req, 500);
     ASSERT_NOT_NULL(resp);
     if (resp) {
@@ -403,6 +406,81 @@ static void test_gdb_mcp_e2e(void)
                        "rtos arg stamped rtos_commands");
                 cJSON_Delete(disk);
             }
+        }
+    }
+
+    /* The tool's "path" argument comes from an AI agent, so it is untrusted
+     * input. It used to be expanded and handed to a truncating fopen after
+     * mkdir -p'ing every parent, which let a confused or prompt-injected
+     * agent overwrite any file the user could write. Each refusal below must
+     * still return the profile inline so the work is not lost. */
+    {
+        char victim[400];
+        snprintf(victim, sizeof(victim), "%s/sm04-victim.txt", tmp);
+        FILE *vf = fopen(victim, "w");
+        if (vf) { fputs("ORIGINAL\n", vf); fclose(vf); }
+
+        struct { int id; const char *arg; const char *what; } refuse[] = {
+            { 21, "../../../sm04-escape.gdb-profile.json", "traversal" },
+            { 22, "/etc/sm04-absolute.gdb-profile.json",   "outside the dir" },
+            { 23, "notaprofile.txt",                       "wrong suffix" },
+            { 24, "sub/dir/x.gdb-profile.json",            "subdirectory" },
+        };
+        for (size_t i = 0; i < sizeof(refuse) / sizeof(refuse[0]); i++) {
+            char req[640];
+            snprintf(req, sizeof(req),
+                "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+                "\"params\":{\"name\":\"gdb_generate_profile\",\"arguments\":"
+                "{\"path\":\"%s\"}}}", refuse[i].id, refuse[i].arg);
+            cJSON *r = rpc_call(&fx, refuse[i].id, req, 500);
+            ASSERT_NOT_NULL(r);
+            if (r) {
+                const char *t = tool_text(r);
+                ASSERT(t && strstr(t, "refused to write") != NULL,
+                       refuse[i].what);
+                ASSERT(t && strstr(t, "\"arch\"") != NULL,
+                       "profile still returned inline on refusal");
+                cJSON_Delete(r);
+            }
+        }
+
+        /* Nothing escaped into $TMPDIR, and the victim file is untouched. */
+        char escaped[400];
+        snprintf(escaped, sizeof(escaped), "%s/sm04-escape.gdb-profile.json", tmp);
+        ASSERT(access(escaped, F_OK) != 0, "traversal wrote nothing");
+        struct stat vst;
+        ASSERT_INT_EQ(stat(victim, &vst), 0);
+        ASSERT_INT_EQ((int)vst.st_size, 9);   /* still "ORIGINAL\n" */
+        unlink(victim);
+
+        /* An existing profile is not silently replaced... (same arguments as
+         * the successful save above, but its own JSON-RPC id) */
+        char again_req[512];
+        snprintf(again_req, sizeof(again_req),
+            "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\","
+            "\"params\":{\"name\":\"gdb_generate_profile\",\"arguments\":"
+            "{\"path\":\"smolmux-gen.gdb-profile.json\",\"rtos\":\"zephyr\"}}}");
+        cJSON *again = rpc_call(&fx, 25, again_req, 500);
+        ASSERT_NOT_NULL(again);
+        if (again) {
+            const char *t = tool_text(again);
+            ASSERT(t && strstr(t, "already exists") != NULL,
+                   "no silent clobber");
+            cJSON_Delete(again);
+        }
+
+        /* ...unless the caller says so explicitly. */
+        char ow_req[512];
+        snprintf(ow_req, sizeof(ow_req),
+            "{\"jsonrpc\":\"2.0\",\"id\":26,\"method\":\"tools/call\","
+            "\"params\":{\"name\":\"gdb_generate_profile\",\"arguments\":"
+            "{\"path\":\"smolmux-gen.gdb-profile.json\",\"overwrite\":true}}}");
+        cJSON *ow = rpc_call(&fx, 26, ow_req, 500);
+        ASSERT_NOT_NULL(ow);
+        if (ow) {
+            const char *t = tool_text(ow);
+            ASSERT(t && strstr(t, "Saved") != NULL, "overwrite:true replaces");
+            cJSON_Delete(ow);
         }
         unlink(gen_path);
     }
@@ -531,6 +609,44 @@ static void test_gdb_mcp_e2e(void)
     teardown(&fx);
 }
 
+/* Long condition used to overflow cmd[640] via snprintf return accumulation
+ * and SIGSEGV the mcp process. Process must stay up and answer. */
+static void test_gdb_breakpoint_long_condition(void)
+{
+    fixture_t fx;
+    setup(&fx);
+
+    char cond[900];
+    memset(cond, 'A', sizeof(cond) - 1);
+    cond[sizeof(cond) - 1] = '\0';
+
+    char req[1200];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"gdb_breakpoint\",\"arguments\":{"
+             "\"location\":\"main\",\"temporary\":true,"
+             "\"condition\":\"%s\"}}}",
+             cond);
+
+    cJSON *resp = rpc_call(&fx, 50, req, 800);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        /* Either a tool result or a structured error is fine — not a hang/segfault. */
+        ASSERT(cJSON_GetObjectItem(resp, "result") != NULL ||
+               cJSON_GetObjectItem(resp, "error") != NULL,
+               "answered without crashing");
+        cJSON_Delete(resp);
+    }
+
+    /* Still alive for a second call. */
+    resp = rpc_call(&fx, 51,
+        "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/list\"}", 500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) cJSON_Delete(resp);
+
+    teardown(&fx);
+}
+
 int main(int argc, char *argv[])
 {
     printf("test_gdb_mcp\n");
@@ -545,5 +661,6 @@ int main(int argc, char *argv[])
     g_fake_gdb = argv[2];
 
     RUN_TEST(test_gdb_mcp_e2e);
+    RUN_TEST(test_gdb_breakpoint_long_condition);
     TEST_REPORT();
 }

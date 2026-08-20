@@ -4,6 +4,7 @@
 #include "util/base64.h"
 #include "util/json_helpers.h"
 #include "util/shared_line.h"
+#include "util/sock_util.h"
 #include "util/timeutil.h"
 
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/timerfd.h>
+#include <signal.h>
 
 #define LOG_TAG "broker"
 
@@ -34,6 +36,14 @@
 #define EPOLL_TAG_FLOODTIMER ((void *)(uintptr_t)7)
 #define EPOLL_TAG_STALLTIMER ((void *)(uintptr_t)8)
 #define EPOLL_TAG_SINK_ID  6u
+
+/* One registration handed over reg_pipe by a sink thread. Written and read
+ * whole: a write this far under PIPE_BUF is atomic, so a partial record can
+ * never interleave with another thread's. */
+typedef struct sm_reg_req {
+    int fd;
+    int requires_auth;
+} sm_reg_req_t;
 
 static void *epoll_sink_ptr(size_t idx)
 {
@@ -632,6 +642,10 @@ int sm_broker_do_resume(sm_broker_t *b, const char *by_name)
     if (rc != 0) return -2;
 
     b->suspended = 0;
+    /* A prior disconnect may have left link_disconnected set; open succeeded
+     * so clear it (otherwise health/reconnect paths stay confused). */
+    b->link_disconnected = 0;
+    b->link_connecting = 0;
 
     /* Reset health state after resume (we don't know yet if data will flow).
      * last_link_rx_time is monotonic — it drives only the idle-duration health
@@ -776,6 +790,21 @@ static void handle_hello(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
 
     c->hello_received = 1;
 
+    /* Same hello name replaces older connections (MCP default is always
+     * claude-mcp — without this, every agent session stacks a controller). */
+    if (c->name[0]) {
+        for (size_t i = b->client_count; i-- > 0; ) {
+            sm_client_t *old = b->clients[i];
+            if (old != c && old->hello_received && old->name[0] &&
+                strcmp(old->name, c->name) == 0) {
+                SM_LOG_INFO(LOG_TAG,
+                            "replacing client %s (%s) with %s",
+                            old->id, old->name, c->id);
+                remove_client(b, old);
+            }
+        }
+    }
+
     SM_LOG_INFO(LOG_TAG, "client %s hello: name=%s role=%s", c->id, c->name, c->role);
 
     cJSON *welcome = sm_msg_welcome(SM_VERSION, b->port, b->baudrate, c->role);
@@ -889,6 +918,38 @@ static void handle_send_expect(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     }
 }
 
+/* Listen-only expect: no TX. Observers allowed (unlike send_expect). */
+static void handle_listen_expect(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
+{
+    const char *id = sm_json_get_string(msg->root, "id");
+    if (b->suspended) {
+        send_to_client(c, sm_msg_error(id, "serial port is suspended"));
+        return;
+    }
+    if (b->link_disconnected) {
+        send_to_client(c, sm_msg_error(id, "serial port disconnected"));
+        return;
+    }
+
+    const char *pattern = sm_json_get_string(msg->root, "pattern");
+    int timeout_ms = sm_json_get_int(msg->root, "timeout_ms",
+                                     SM_DEFAULT_EXPECT_TIMEOUT_MS);
+    if (!pattern || !pattern[0] || !id) {
+        send_to_client(c, sm_msg_error(id, "missing id or pattern"));
+        return;
+    }
+    if (timeout_ms < 100) timeout_ms = 100;
+    if (timeout_ms > SM_MAX_EXPECT_TIMEOUT_MS)
+        timeout_ms = SM_MAX_EXPECT_TIMEOUT_MS;
+
+    double timeout_s = (double)timeout_ms / 1000.0;
+    if (sm_expect_add(&b->expect, id, pattern, timeout_s, c->id) != 0) {
+        send_to_client(c, sm_msg_error(id, "invalid regex pattern"));
+        return;
+    }
+    /* No write — that is the whole point of listen_expect. */
+}
+
 static void handle_takeover(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
 {
     const char *id = sm_json_get_string(msg->root, "id");
@@ -932,6 +993,8 @@ static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
         cJSON_AddStringToObject(ci, "id", cl->id);
         cJSON_AddStringToObject(ci, "name", cl->name);
         cJSON_AddStringToObject(ci, "role", cl->role);
+        if (cl->peer_pid > 0)
+            cJSON_AddNumberToObject(ci, "pid", (double)cl->peer_pid);
         cJSON_AddNumberToObject(ci, "wq_drops", (double)cl->wq_drops);
         cJSON_AddNumberToObject(ci, "wq_count", (double)cl->wq_count);
         cJSON_AddItemToArray(clients, ci);
@@ -947,6 +1010,29 @@ static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     /* Board grouping labels (empty string when unset) */
     cJSON_AddStringToObject(resp, "board", b->board);
     cJSON_AddStringToObject(resp, "role", b->role);
+
+    /* I1 C: session identity, not just Connected: yes. */
+    cJSON_AddNumberToObject(resp, "link_up_ts", b->link_up_ts);
+    {
+        double age_ms = (sm_now_monotonic() - b->last_link_rx_time) * 1000.0;
+        if (age_ms < 0)
+            age_ms = 0;
+        cJSON_AddNumberToObject(resp, "last_rx_age_ms", age_ms);
+    }
+    cJSON_AddNumberToObject(resp, "bytes_rx_since_link_up",
+                            (double)b->bytes_rx_since_link_up);
+    cJSON_AddBoolToObject(resp, "identity_weak", b->identity_weak_by_id);
+    {
+        const char *id = b->identity_by_id[0] ? b->identity_by_id : b->port;
+        const char *strength = "n/a";
+        if (b->identity_weak_by_id || sm_serial_by_id_is_weak(id))
+            strength = "WEAK";
+        else if (strstr(id, "by-id") || strncmp(id, "usb-", 4) == 0)
+            strength = "STRONG";
+        cJSON_AddStringToObject(resp, "identity_strength", strength);
+    }
+    cJSON_AddStringToObject(resp, "identity_by_id", b->identity_by_id);
+    cJSON_AddStringToObject(resp, "identity_by_path", b->identity_by_path);
 
     /* Add pin states via link */
     b->link->get_status(b->link, resp);
@@ -1063,6 +1149,19 @@ static void handle_interrupt_autoboot(sm_broker_t *b, sm_client_t *c, sm_msg_t *
     /* On success the autoboot_result is broadcast later by flood_finish. */
 }
 
+/* The wire protocol has always documented pin as <dtr|rts|break>, but the
+ * handler forwarded whatever string arrived straight to link->set_param(),
+ * which reaches every parameter a link implements. On a GDB link that
+ * included allow_shell, so any controller could switch the code-exec guard
+ * off with a pin_control message — the opt-in was meant to be the operator's
+ * call (now --gdb-allow-shell), not a client's. Enforce the documented set. */
+static int pin_is_line_control(const char *pin)
+{
+    return strcmp(pin, "dtr") == 0 ||
+           strcmp(pin, "rts") == 0 ||
+           strcmp(pin, "break") == 0;
+}
+
 static void handle_pin_control(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
 {
     const char *id = sm_json_get_string(msg->root, "id");
@@ -1077,6 +1176,10 @@ static void handle_pin_control(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
 
     if (!pin || !action) {
         send_to_client(c, sm_msg_error(id, "missing pin or action"));
+        return;
+    }
+    if (!pin_is_line_control(pin)) {
+        send_to_client(c, sm_msg_error(id, "unknown pin (expected dtr, rts, or break)"));
         return;
     }
 
@@ -1184,17 +1287,47 @@ static void process_history_pending(sm_broker_t *b)
     while (b->history_pending.encode_index < b->history_pending.chunk_count &&
            chunks_done < SM_HISTORY_ENCODE_MAX_CHUNKS &&
            bytes_done < SM_HISTORY_ENCODE_MAX_BYTES) {
-        sm_rb_chunk_t *ch =
-            &b->history_pending.chunks[b->history_pending.encode_index];
+        size_t idx = b->history_pending.encode_index;
+        sm_rb_chunk_t *ch = &b->history_pending.chunks[idx];
+
+        size_t off = 0;
+        size_t len = ch->len;
+        if (idx == 0 && b->history_pending.first_skip > 0) {
+            off = b->history_pending.first_skip;
+            if (off > len) off = len;
+            len -= off;
+        }
+
+        /* Cursor page cap: stop after page_bytes of raw payload. */
+        if (b->history_pending.page_bytes > 0) {
+            size_t remain = b->history_pending.page_bytes -
+                            b->history_pending.bytes_encoded;
+            if (remain == 0)
+                break;
+            if (len > remain)
+                len = remain;
+        }
+
         cJSON *chunk = cJSON_CreateObject();
-        char *b64 = sm_base64_encode(ch->data, ch->len);
+        char *b64 = sm_base64_encode(ch->data + off, len);
         cJSON_AddStringToObject(chunk, "data", b64 ? b64 : "");
         cJSON_AddNumberToObject(chunk, "timestamp", ch->timestamp);
+        if (b->history_pending.has_cursor)
+            cJSON_AddNumberToObject(chunk, "seq_start",
+                                    (double)(ch->seq_start + (uint64_t)off));
         cJSON_AddItemToArray(b->history_pending.response_arr, chunk);
         free(b64);
-        bytes_done += ch->len;
+        bytes_done += len;
+        b->history_pending.bytes_encoded += len;
         chunks_done++;
         b->history_pending.encode_index++;
+
+        if (b->history_pending.page_bytes > 0 &&
+            b->history_pending.bytes_encoded >= b->history_pending.page_bytes) {
+            /* Done with this page even if more chunks remain. */
+            b->history_pending.encode_index = b->history_pending.chunk_count;
+            break;
+        }
     }
 
     if (b->history_pending.encode_index < b->history_pending.chunk_count)
@@ -1214,6 +1347,12 @@ static void process_history_pending(sm_broker_t *b)
         b->history_pending.response_arr = NULL;
         if (b->history_pending.truncated)
             cJSON_AddBoolToObject(resp, "truncated", 1);
+        if (b->history_pending.has_cursor) {
+            cJSON_AddNumberToObject(resp, "cursor", b->history_pending.cursor);
+            cJSON_AddNumberToObject(resp, "dropped", b->history_pending.dropped);
+            cJSON_AddBoolToObject(resp, "has_more",
+                                  b->history_pending.has_more ? 1 : 0);
+        }
         send_to_client(target, resp);
     }
 
@@ -1226,6 +1365,84 @@ static void handle_history_request(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg
 
     if (b->history_pending.active) {
         send_to_client(c, sm_msg_error(id, "history request already in progress"));
+        return;
+    }
+
+    /* Cursor path takes precedence when since_seq is present. */
+    cJSON *since_seq_item =
+        cJSON_GetObjectItemCaseSensitive(msg->root, "since_seq");
+    if (cJSON_IsNumber(since_seq_item)) {
+        double seq_d = since_seq_item->valuedouble;
+        if (seq_d < 0)
+            seq_d = 0;
+        uint64_t since_seq = (uint64_t)seq_d;
+        int max_bytes = sm_json_get_int(msg->root, "max_bytes", 0);
+        if (max_bytes <= 0)
+            max_bytes = (int)SM_MAX_HISTORY_RESPONSE_BYTES;
+        if (max_bytes > (int)SM_MAX_HISTORY_RESPONSE_BYTES)
+            max_bytes = (int)SM_MAX_HISTORY_RESPONSE_BYTES;
+
+        sm_rb_chunk_t *chunks = NULL;
+        size_t first_skip = 0;
+        uint64_t cursor = 0, dropped = 0;
+        int has_more = 0;
+        size_t count = sm_rb_get_since_seq(&b->history, since_seq,
+                                           (size_t)max_bytes, &chunks,
+                                           &first_skip, &cursor, &dropped,
+                                           &has_more);
+        if (count == 0) {
+            free(chunks);
+            cJSON *resp = sm_msg_history_response(id ? id : "",
+                                                  cJSON_CreateArray());
+            cJSON_AddNumberToObject(resp, "cursor", (double)cursor);
+            cJSON_AddNumberToObject(resp, "dropped", (double)dropped);
+            cJSON_AddBoolToObject(resp, "has_more", has_more ? 1 : 0);
+            send_to_client(c, resp);
+            return;
+        }
+
+        sm_rb_chunk_t *owned = calloc(count, sizeof(*owned));
+        if (!owned) {
+            free(chunks);
+            send_to_client(c, sm_msg_error(id, "out of memory"));
+            return;
+        }
+        for (size_t i = 0; i < count; i++) {
+            sm_rb_chunk_t *src = &chunks[i];
+            owned[i].timestamp = src->timestamp;
+            owned[i].seq_start = src->seq_start;
+            owned[i].len = src->len;
+            owned[i].alloc = src->len;
+            owned[i].data = malloc(src->len);
+            if (!owned[i].data) {
+                for (size_t j = 0; j < i; j++)
+                    free(owned[j].data);
+                free(owned);
+                free(chunks);
+                send_to_client(c, sm_msg_error(id, "out of memory"));
+                return;
+            }
+            memcpy(owned[i].data, src->data, src->len);
+        }
+        free(chunks);
+
+        snprintf(b->history_pending.client_id,
+                 sizeof(b->history_pending.client_id), "%s", c->id);
+        snprintf(b->history_pending.msg_id, sizeof(b->history_pending.msg_id),
+                 "%s", id ? id : "");
+        b->history_pending.chunks = owned;
+        b->history_pending.chunk_count = count;
+        b->history_pending.encode_index = 0;
+        b->history_pending.response_arr = cJSON_CreateArray();
+        b->history_pending.truncated = 0;
+        b->history_pending.has_cursor = 1;
+        b->history_pending.cursor = (double)cursor;
+        b->history_pending.dropped = (double)dropped;
+        b->history_pending.has_more = has_more;
+        b->history_pending.first_skip = first_skip;
+        b->history_pending.page_bytes = (size_t)max_bytes;
+        b->history_pending.bytes_encoded = 0;
+        b->history_pending.active = 1;
         return;
     }
 
@@ -1274,6 +1491,7 @@ static void handle_history_request(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg
     for (size_t i = 0; i < sel_count; i++) {
         sm_rb_chunk_t *src = &chunks[start + i];
         owned[i].timestamp = src->timestamp;
+        owned[i].seq_start = src->seq_start;
         owned[i].len = src->len;
         owned[i].alloc = src->len;
         owned[i].data = malloc(src->len);
@@ -1298,6 +1516,10 @@ static void handle_history_request(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg
     b->history_pending.encode_index = 0;
     b->history_pending.response_arr = cJSON_CreateArray();
     b->history_pending.truncated = truncated;
+    b->history_pending.has_cursor = 0;
+    b->history_pending.first_skip = 0;
+    b->history_pending.page_bytes = 0;
+    b->history_pending.bytes_encoded = 0;
     b->history_pending.active = 1;
 }
 
@@ -1428,6 +1650,14 @@ static void handle_configure_autoresponder(sm_broker_t *b, sm_client_t *c,
         return;
     }
 
+    /* Attribute the rule. It will outlive this client's session by design, so
+     * status readers should be able to see who left it behind. */
+    sm_autoresponder_set_owner(&b->autoresponder, name,
+                               c->name[0] ? c->name : c->id);
+    SM_LOG_INFO(LOG_TAG,
+                "autoresponder '%s' installed by %s (persists after "
+                "disconnect)", name, c->name[0] ? c->name : c->id);
+
     cJSON *ack = sm_msg_ack("configure_autoresponder", id);
     cJSON_AddStringToObject(ack, "name", name);
     send_to_client(c, ack);
@@ -1444,9 +1674,18 @@ static void handle_autoresponders_request(sm_broker_t *b, sm_client_t *c,
         cJSON *ro = cJSON_CreateObject();
         cJSON_AddStringToObject(ro, "name", r->name);
         cJSON_AddStringToObject(ro, "pattern", r->pattern);
-        char *rb64 = sm_base64_encode(r->response, r->response_len);
-        cJSON_AddStringToObject(ro, "response_b64", rb64 ? rb64 : "");
-        free(rb64);
+        /* The response bytes are where credentials live — answering a login
+         * prompt is an advertised use (docs/daily-driver.md). Installing a
+         * rule needs controller rights, so reading one back should too;
+         * observers get the length instead of the secret. */
+        if (can_send(b, c)) {
+            char *rb64 = sm_base64_encode(r->response, r->response_len);
+            cJSON_AddStringToObject(ro, "response_b64", rb64 ? rb64 : "");
+            free(rb64);
+        } else {
+            cJSON_AddNumberToObject(ro, "response_len", (double)r->response_len);
+        }
+        cJSON_AddStringToObject(ro, "created_by", r->created_by);
         cJSON_AddBoolToObject(ro, "once", r->once);
         cJSON_AddBoolToObject(ro, "enabled", r->enabled);
         cJSON_AddNumberToObject(ro, "cooldown_ms", (int)(r->cooldown_s * 1000.0));
@@ -1468,6 +1707,7 @@ static void handle_client_message(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     case SM_MSG_HELLO:              handle_hello(b, c, msg); break;
     case SM_MSG_SEND:               handle_send(b, c, msg); break;
     case SM_MSG_SEND_EXPECT:        handle_send_expect(b, c, msg); break;
+    case SM_MSG_LISTEN_EXPECT:      handle_listen_expect(b, c, msg); break;
     case SM_MSG_TAKEOVER:           handle_takeover(b, c, msg); break;
     case SM_MSG_RELEASE:            handle_release(b, c, msg); break;
     case SM_MSG_STATUS:             handle_status(b, c, msg); break;
@@ -1640,6 +1880,12 @@ sm_client_t *sm_broker_register_client(sm_broker_t *b, int fd)
         return NULL;
     }
     c->connected_at = sm_now_monotonic();
+    {
+        struct ucred cred;
+        socklen_t clen = sizeof(cred);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0)
+            c->peer_pid = (int)cred.pid;
+    }
     b->clients[b->client_count++] = c;
 
     struct epoll_event ev = {.events = EPOLLIN | EPOLLHUP | EPOLLERR, .data.ptr = c};
@@ -1732,11 +1978,25 @@ int sm_broker_test_drain_link_fd(int fd, int max_reads,
     return drain_link_fd(fd, max_reads, chunk_cb, ctx);
 }
 
+static void process_expect_results(sm_broker_t *b);
+
+static void history_fence(sm_broker_t *b, const char *line)
+{
+    if (!b || !line || !line[0])
+        return;
+    double ts = sm_now_realtime();
+    size_t n = strlen(line);
+    sm_rb_append(&b->history, (const uint8_t *)line, n, ts);
+    if (b->text_log)
+        sm_text_log_write(b->text_log, (const uint8_t *)line, n, ts);
+}
+
 static void process_link_chunk(sm_broker_t *b, const uint8_t *buf, size_t n, double ts)
 {
     sm_expect_feed(&b->expect, buf, n);
     flood_feed(b, buf, n);   /* stop an active autoboot flood on prompt match */
     sm_rb_append(&b->history, buf, n, ts);
+    b->bytes_rx_since_link_up += n;
 
     char *b64 = sm_base64_encode(buf, n);
 
@@ -1750,6 +2010,9 @@ static void process_link_chunk(sm_broker_t *b, const uint8_t *buf, size_t n, dou
     if (new_incidents > 0) {
         size_t count;
         const sm_anomaly_incident_t *incidents = sm_anomaly_get_incidents(&b->anomaly, &count);
+        /* Critical-only: abort all pending expects (board just died). Warning
+         * incidents (e.g. esp_reset on a normal boot) do not abort. */
+        const char *abort_pattern = NULL;
         for (size_t i = count - new_incidents; i < count; i++) {
             cJSON *amsg = sm_msg_anomaly(incidents[i].id, incidents[i].pattern_name,
                                           incidents[i].severity, incidents[i].timestamp,
@@ -1767,6 +2030,15 @@ static void process_link_chunk(sm_broker_t *b, const uint8_t *buf, size_t n, dou
                     b->sinks[s]->on_event(b->sinks[s], "anomaly",
                                            incidents[i].pattern_name);
             }
+
+            if (strcmp(incidents[i].severity, "critical") == 0)
+                abort_pattern = incidents[i].pattern_name;
+        }
+        if (abort_pattern) {
+            sm_expect_abort_all(&b->expect, "anomaly", abort_pattern);
+            /* Deliver aborted expects in this tick (do not wait for the next
+             * epoll timeout — agents should see ABORTED immediately). */
+            process_expect_results(b);
         }
     }
 
@@ -1876,6 +2148,10 @@ static void handle_link_disconnect(sm_broker_t *b)
     b->reconnect_delay_s = SM_RECONNECT_BASE_S;
     b->reconnect_next = sm_now_monotonic() + b->reconnect_delay_s;
 
+    history_fence(b, SM_HISTORY_FENCE_DOWN);
+    sm_expect_abort_all(&b->expect, "link_down", "link_down");
+    process_expect_results(b);
+
     /* Notify clients */
     cJSON *msg = sm_msg_link_down(b->port, "device disconnected");
     broadcast(b, msg, NULL);
@@ -1897,7 +2173,8 @@ static void process_expect_results(sm_broker_t *b)
             if (b->sinks[s]->on_expect_result &&
                 strcmp(r->client_id, SM_MCP_CLIENT_ID) == 0) {
                 b->sinks[s]->on_expect_result(b->sinks[s], r->id, r->matched,
-                                               r->data, r->data_len, r->pattern);
+                                               r->data, r->data_len, r->pattern,
+                                               r->aborted, r->abort_pattern);
                 routed_to_sink = 1;
                 break;
             }
@@ -1908,9 +2185,11 @@ static void process_expect_results(sm_broker_t *b)
             for (size_t j = 0; j < b->client_count; j++) {
                 sm_client_t *c = b->clients[j];
                 if (strcmp(c->id, r->client_id) == 0) {
-                    cJSON *msg = sm_msg_expect_result(r->id, r->matched,
-                                                       r->data, r->data_len,
-                                                       r->pattern);
+                    cJSON *msg = sm_msg_expect_result_ex(
+                        r->id, r->matched, r->data, r->data_len, r->pattern,
+                        r->aborted,
+                        r->aborted ? r->abort_reason : NULL,
+                        r->aborted ? r->abort_pattern : NULL);
                     send_to_client(c, msg);
                     break;
                 }
@@ -1922,6 +2201,33 @@ static void process_expect_results(sm_broker_t *b)
 
 /* --- Extracted helpers for sm_broker_run --- */
 
+/* Filename component identifying the port: strip /dev/ and flatten remaining
+ * slashes, so /dev/serial/by-id/usb-X becomes serial-by-id-usb-X. Same shape
+ * as the text log's naming (text_log.c), kept local because the two logs
+ * compose their paths in different places. */
+static void broker_record_identity(sm_broker_t *b)
+{
+    if (!b->port[0])
+        return;
+    char bp[256], bid[256];
+    if (sm_serial_resolve_by_path(b->port, bp, sizeof(bp)) == 0)
+        snprintf(b->identity_by_path, sizeof(b->identity_by_path), "%s", bp);
+    if (strstr(b->port, "by-id"))
+        snprintf(b->identity_by_id, sizeof(b->identity_by_id), "%s", b->port);
+    else if (sm_serial_resolve_by_id(b->port, bid, sizeof(bid)) == 0)
+        snprintf(b->identity_by_id, sizeof(b->identity_by_id), "%s", bid);
+}
+
+static void io_log_tag_from_port(const char *port, char *out, size_t out_len)
+{
+    const char *p = (port && port[0]) ? port : "unknown";
+    if (strncmp(p, "/dev/", 5) == 0)
+        p += 5;
+    snprintf(out, out_len, "%s", p);
+    for (char *q = out; *q; q++)
+        if (*q == '/') *q = '-';
+}
+
 static int broker_setup(sm_broker_t *b)
 {
     if (b->link->open(b->link) != 0) {
@@ -1932,11 +2238,21 @@ static int broker_setup(sm_broker_t *b)
     /* Initial health state after successful link open */
     b->last_link_rx_time = sm_now_monotonic();
     b->link_healthy = 1;
+    b->link_up_ts = sm_now_realtime();
+    b->bytes_rx_since_link_up = 0;
+
+    broker_record_identity(b);
 
     if (b->log_dir[0]) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/smolmux-io.jsonl", b->log_dir);
+        char tag[128], path[512];
+        io_log_tag_from_port(b->port, tag, sizeof(tag));
+        snprintf(path, sizeof(path), SM_IO_LOG_FILE_FMT, b->log_dir, tag);
         b->io_log = sm_io_log_open(path);
+        /* sm_io_log_open fails closed (and logs why) on a symlinked or
+         * foreign-owned path. Say plainly that logging is off, so a refusal
+         * is never mistaken for a quiet success. */
+        if (!b->io_log)
+            SM_LOG_WARN(LOG_TAG, "I/O logging disabled: %s unavailable", path);
     }
 
     if (!b->no_text_log && b->text_log_dir[0])
@@ -2036,11 +2352,19 @@ static void link_bring_up(sm_broker_t *b, int broadcast_up)
      * reconnected link as degraded until data next flows. */
     b->last_link_rx_time = sm_now_monotonic();
     b->link_healthy = 0;
+    b->link_up_ts = sm_now_realtime();
+    b->bytes_rx_since_link_up = 0;
 
     /* A reconnect usually means the device was reset/replugged: start boot
      * progress over so stages re-detect from the new boot. */
     sm_boot_reset(&b->boot);
     stall_disarm(b);   /* fresh boot; the stall timer re-arms when stage 0 hits */
+    sm_autoresponder_reset_window(&b->autoresponder);
+    sm_anomaly_reset_window(&b->anomaly);
+    history_fence(b, SM_HISTORY_FENCE_UP);
+
+    /* Record seat after a successful open (D1 reconnect + DF-FS-1 listing). */
+    broker_record_identity(b);
 
     SM_LOG_INFO(LOG_TAG, "link reconnected");
 
@@ -2089,6 +2413,9 @@ static void handle_link_connecting(sm_broker_t *b, uint32_t ev)
 
 static void attempt_reconnect(sm_broker_t *b)
 {
+    /* Suspend owns the wire (external flash, with-port). Reconnecting while
+     * suspended re-seizes TIOCEXCL and can brick resume / the flasher. */
+    if (b->suspended) return;
     if (b->link_connecting) return;   /* an async connect is already in flight */
     if (!b->link_disconnected || !b->reconnect) return;
     if (sm_now_monotonic() < b->reconnect_next) return;
@@ -2101,6 +2428,27 @@ static void attempt_reconnect(sm_broker_t *b)
         else if (rc == 1)  link_watch_connecting(b);  /* completes async */
         else               link_schedule_retry(b);    /* immediate failure */
         return;
+    }
+
+    /* Weak by-id: refuse silent rebind if last or now seat is unknown or
+     * the physical seat changed. Do not skip this when last seat is empty. */
+    if (b->identity_weak_by_id && b->port[0]) {
+        char now_path[256];
+        now_path[0] = '\0';
+        (void)sm_serial_resolve_by_path(b->port, now_path, sizeof(now_path));
+        if (sm_identity_refuse_weak_seat_change(1, b->identity_by_path,
+                                                now_path)) {
+            SM_LOG_ERROR(LOG_TAG,
+                "refusing reconnect: weak by-id path %s moved seats "
+                "(was %s, now %s). Stop the broker or rebind deliberately "
+                "(see docs/persistent-serial-devices.md)",
+                b->port,
+                b->identity_by_path[0] ? b->identity_by_path : "(unset)",
+                now_path[0] ? now_path : "(unresolved)");
+            /* Back off hard so we do not thrash; operator must intervene. */
+            b->reconnect_next = sm_now_monotonic() + 30.0;
+            return;
+        }
     }
 
     /* Blocking fallback (uart/gdb): open() at startup/reconnect is quick. */
@@ -2124,18 +2472,21 @@ static void process_client_event(sm_broker_t *b, sm_client_t *c, uint32_t ev)
      * EPOLLIN|EPOLLHUP together when the peer sent a final command then
      * closed, so handling HUP first would silently drop that command. */
     if (ev & EPOLLIN) {
-        sm_msg_t msgs[16];
-        size_t count = sm_client_feed(c, msgs, 16);
-        for (size_t m = 0; m < count; m++) {
-            /* A handler may disconnect the client; drop queued messages */
-            if (!c->disconnected)
-                handle_client_message(b, c, &msgs[m]);
-            sm_msg_free(&msgs[m]);
-        }
-        if (c->disconnected) {
-            remove_client(b, c);
-            return;
-        }
+        int loops = 0;
+        size_t count;
+        do {
+            sm_msg_t msgs[16];
+            count = sm_client_feed(c, msgs, 16);
+            for (size_t m = 0; m < count; m++) {
+                if (!c->disconnected)
+                    handle_client_message(b, c, &msgs[m]);
+                sm_msg_free(&msgs[m]);
+            }
+            if (c->disconnected) {
+                remove_client(b, c);
+                return;
+            }
+        } while (count == 16 && ++loops < 64);
     }
 
     if (ev & (EPOLLHUP | EPOLLERR)) {
@@ -2227,9 +2578,12 @@ int sm_broker_run(sm_broker_t *b)
                 continue;
             }
             if (ptr == EPOLL_TAG_PIPE) {
-                int client_fd;
-                while (read(b->reg_pipe[0], &client_fd, sizeof(client_fd)) == sizeof(client_fd))
-                    sm_broker_register_client(b, client_fd);
+                sm_reg_req_t req;
+                while (read(b->reg_pipe[0], &req, sizeof(req)) == (ssize_t)sizeof(req)) {
+                    sm_client_t *rc = sm_broker_register_client(b, req.fd);
+                    if (rc)
+                        rc->requires_auth = req.requires_auth;
+                }
                 continue;
             }
             if (ptr == EPOLL_TAG_BRKTIMER) {
@@ -2311,6 +2665,19 @@ int sm_broker_run(sm_broker_t *b)
                                 "client %s: no hello within %ds, dropping",
                                 cl->id, SM_HELLO_TIMEOUT_S);
                     remove_client(b, cl);
+                    continue;
+                }
+                /* Unix HUP can be missed if the peer is already a zombie
+                 * we never waited on; drop when SO_PEERCRED pid is gone. */
+                struct ucred cred;
+                socklen_t clen = sizeof(cred);
+                if (getsockopt(cl->fd, SOL_SOCKET, SO_PEERCRED, &cred,
+                               &clen) == 0 && cred.pid > 0 &&
+                    kill((pid_t)cred.pid, 0) != 0 && errno == ESRCH) {
+                    SM_LOG_WARN(LOG_TAG,
+                                "client %s (%s): peer pid %d gone, dropping",
+                                cl->id, cl->name, (int)cred.pid);
+                    remove_client(b, cl);
                 }
             }
 
@@ -2371,10 +2738,22 @@ int sm_broker_run(sm_broker_t *b)
     return 0;
 }
 
-void sm_broker_register_client_async(sm_broker_t *b, int fd)
+void sm_broker_register_client_async(sm_broker_t *b, int fd, int requires_auth)
 {
-    if (write(b->reg_pipe[1], &fd, sizeof(fd)) != sizeof(fd))
-        SM_LOG_WARN(LOG_TAG, "reg_pipe write failed: %s", strerror(errno));
+    sm_reg_req_t req = {.fd = fd, .requires_auth = requires_auth ? 1 : 0};
+    if (write(b->reg_pipe[1], &req, sizeof(req)) != (ssize_t)sizeof(req)) {
+        /* The caller transferred ownership of fd to us, so a failed handover
+         * must close it or the descriptor leaks for the broker's lifetime.
+         * Safe because a record this far under PIPE_BUF is written all-or-
+         * nothing (O_NONBLOCK short-circuits to EAGAIN rather than writing a
+         * partial record), so a short return means the broker never learned
+         * the fd — it cannot already be registered, and this cannot double
+         * close. The sink's own end of the pair then sees EOF and its normal
+         * teardown reclaims the rest. */
+        SM_LOG_WARN(LOG_TAG, "reg_pipe write failed, dropping client fd=%d: %s",
+                    fd, strerror(errno));
+        close(fd);
+    }
 }
 
 /* Called from signal handlers — must stay a single atomic store; no

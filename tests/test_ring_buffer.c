@@ -109,6 +109,64 @@ static void test_empty_buffer(void)
     sm_rb_destroy(&rb);
 }
 
+/* Wave 3: monotonic seq cursor + dropped on eviction. */
+static void test_since_seq_two_page(void)
+{
+    sm_ring_buffer_t rb;
+    sm_rb_init(&rb, 1024);
+
+    sm_rb_append(&rb, (const uint8_t *)"AAAA", 4, 1.0);
+    sm_rb_append(&rb, (const uint8_t *)"BBBB", 4, 2.0);
+    sm_rb_append(&rb, (const uint8_t *)"CCCC", 4, 3.0);
+    ASSERT_INT_EQ((int)sm_rb_total_seq(&rb), 12);
+
+    sm_rb_chunk_t *chunks = NULL;
+    size_t skip = 0;
+    uint64_t cursor = 0, dropped = 0;
+    int has_more = 0;
+    size_t n = sm_rb_get_since_seq(&rb, 0, 6, &chunks, &skip, &cursor,
+                                   &dropped, &has_more);
+    ASSERT(n >= 1, "page1 has chunks");
+    ASSERT_INT_EQ((int)dropped, 0);
+    ASSERT_INT_EQ((int)skip, 0);
+    ASSERT(has_more == 1, "more after 6-byte page");
+    ASSERT_INT_EQ((int)cursor, 6);
+    free(chunks);
+
+    n = sm_rb_get_since_seq(&rb, cursor, 0, &chunks, &skip, &cursor,
+                            &dropped, &has_more);
+    ASSERT(n >= 1, "page2 has chunks");
+    ASSERT_INT_EQ((int)dropped, 0);
+    ASSERT(has_more == 0, "no more after rest");
+    ASSERT_INT_EQ((int)cursor, 12);
+
+    /* Reconstruct from both pages' usable bytes */
+    free(chunks);
+    sm_rb_destroy(&rb);
+}
+
+static void test_since_seq_dropped(void)
+{
+    sm_ring_buffer_t rb;
+    sm_rb_init(&rb, 10);
+
+    sm_rb_append(&rb, (const uint8_t *)"0123456789", 10, 1.0);
+    sm_rb_append(&rb, (const uint8_t *)"ABCDEF", 6, 2.0);
+    /* Eviction should drop some early bytes */
+    ASSERT(sm_rb_first_seq(&rb) > 0, "first_seq advanced after eviction");
+
+    sm_rb_chunk_t *chunks = NULL;
+    size_t skip = 0;
+    uint64_t cursor = 0, dropped = 0;
+    int has_more = 0;
+    size_t n = sm_rb_get_since_seq(&rb, 0, 0, &chunks, &skip, &cursor,
+                                   &dropped, &has_more);
+    ASSERT(dropped > 0, "stale since_seq reports dropped");
+    ASSERT(n >= 1 || cursor == sm_rb_total_seq(&rb), "query completes");
+    free(chunks);
+    sm_rb_destroy(&rb);
+}
+
 int main(void)
 {
     printf("test_ring_buffer\n");
@@ -118,6 +176,8 @@ int main(void)
     RUN_TEST(test_get_since);
     RUN_TEST(test_get_last_n_bytes);
     RUN_TEST(test_empty_buffer);
+    RUN_TEST(test_since_seq_two_page);
+    RUN_TEST(test_since_seq_dropped);
 
     TEST_REPORT();
 }

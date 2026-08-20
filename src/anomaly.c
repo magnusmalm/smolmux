@@ -9,8 +9,11 @@
 
 #define LOG_TAG "anomaly"
 
-/* Return 1 if region contains any semicolon-separated literal needle. */
-static int region_has_literal(const char *region, const char *literal)
+/* Return 1 if region contains any semicolon-separated literal needle.
+ * Uses memmem over an explicit length — device output is untrusted raw
+ * bytes and may embed NULs; strstr would stop early and miss panics. */
+static int region_has_literal(const char *region, size_t region_len,
+                              const char *literal)
 {
     if (!literal[0])
         return 1;
@@ -25,7 +28,8 @@ static int region_has_literal(const char *region, const char *literal)
                 len = sizeof(tmp) - 1;
             memcpy(tmp, p, len);
             tmp[len] = '\0';
-            if (strstr(region, tmp) != NULL)
+            if (region_len >= len &&
+                memmem(region, region_len, tmp, len) != NULL)
                 return 1;
         }
         if (!sep)
@@ -71,6 +75,15 @@ void sm_anomaly_init(sm_anomaly_detector_t *det)
     if (!det->window) det->window_cap = 0;
 }
 
+void sm_anomaly_reset_window(sm_anomaly_detector_t *det)
+{
+    if (!det) return;
+    det->window_len = 0;
+    det->search_offset = 0;
+    if (det->window && det->window_cap)
+        det->window[0] = '\0';
+}
+
 void sm_anomaly_destroy(sm_anomaly_detector_t *det)
 {
     for (size_t i = 0; i < det->pattern_count; i++)
@@ -84,24 +97,54 @@ void sm_anomaly_destroy(sm_anomaly_detector_t *det)
 int sm_anomaly_add_pattern(sm_anomaly_detector_t *det,
                            const char *name, const char *pattern, const char *severity)
 {
-    if (det->pattern_count >= SM_MAX_ANOMALY_PATTERNS) return -1;
+    if (!name || !name[0] || !pattern)
+        return -1;
+
+    /* Policy A: same name replaces (profiles override builtins; no double-fire). */
+    sm_anomaly_pattern_t *p = NULL;
+    for (size_t i = 0; i < det->pattern_count; i++) {
+        if (strcmp(det->patterns[i].name, name) == 0) {
+            p = &det->patterns[i];
+            break;
+        }
+    }
+
+    sm_regex_t *compiled = sm_regex_compile(pattern, NULL, 0);
+    if (!compiled)
+        return -1;
+
+    if (p) {
+        sm_regex_free(p->compiled);
+        p->compiled = compiled;
+        snprintf(p->severity, sizeof(p->severity), "%s",
+                 severity ? severity : "warning");
+        extract_literal_prefix(pattern, p->literal, sizeof(p->literal));
+        p->last_fire_time = 0;
+        return 0;
+    }
+
+    if (det->pattern_count >= SM_MAX_ANOMALY_PATTERNS) {
+        sm_regex_free(compiled);
+        return -1;
+    }
 
     if (det->pattern_count >= det->pattern_cap) {
         size_t new_cap = det->pattern_cap ? det->pattern_cap * 2 : 16;
         void *tmp = realloc(det->patterns, new_cap * sizeof(sm_anomaly_pattern_t));
-        if (!tmp) return -1;
+        if (!tmp) {
+            sm_regex_free(compiled);
+            return -1;
+        }
         det->patterns = tmp;
         det->pattern_cap = new_cap;
     }
 
-    sm_anomaly_pattern_t *p = &det->patterns[det->pattern_count];
+    p = &det->patterns[det->pattern_count];
     memset(p, 0, sizeof(*p));
     snprintf(p->name, sizeof(p->name), "%s", name);
-    snprintf(p->severity, sizeof(p->severity), "%s", severity);
-
-    p->compiled = sm_regex_compile(pattern, NULL, 0);
-    if (!p->compiled) return -1;
-
+    snprintf(p->severity, sizeof(p->severity), "%s",
+             severity ? severity : "warning");
+    p->compiled = compiled;
     extract_literal_prefix(pattern, p->literal, sizeof(p->literal));
 
     det->pattern_count++;
@@ -121,6 +164,7 @@ static int add_builtin(sm_anomaly_detector_t *det,
 
 void sm_anomaly_add_builtins(sm_anomaly_detector_t *det)
 {
+    /* Linux / general */
     add_builtin(det, "kernel_panic", "Kernel panic", "critical", "Kernel panic");
     add_builtin(det, "oops", "Oops:", "critical", "Oops:");
     add_builtin(det, "hard_fault", "HardFault", "critical", "HardFault");
@@ -132,6 +176,20 @@ void sm_anomaly_add_builtins(sm_anomaly_detector_t *det)
                 "watchdog;wdt");
     add_builtin(det, "assert_fail", "Assertion.*failed|BUG_ON|BUG:", "warning",
                 "Assertion;BUG_ON;BUG:");
+
+    /* ESP32 / MCU serial (always on so agents without a profile still see
+     * panics). Critical severities abort pending expects in the broker. */
+    add_builtin(det, "guru_meditation", "Guru Meditation Error", "critical",
+                "Guru Meditation");
+    add_builtin(det, "brownout", "Brownout detector was triggered", "critical",
+                "Brownout");
+    add_builtin(det, "panic_abort", "abort\\(\\) was called", "critical",
+                "abort()");
+    add_builtin(det, "stack_smashing", "Stack smashing protect", "critical",
+                "Stack smashing");
+    add_builtin(det, "task_wdt", "Task watchdog got triggered", "warning",
+                "Task watchdog");
+    add_builtin(det, "esp_reset", "rst:0x[0-9a-fA-F]+", "warning", "rst:0x");
 }
 
 size_t sm_anomaly_feed(sm_anomaly_detector_t *det,
@@ -232,13 +290,22 @@ size_t sm_anomaly_feed(sm_anomaly_detector_t *det,
         if (p->last_fire_time > 0 && (ts - p->last_fire_time) < det->cooldown_s)
             continue;
 
-        /* Literal prefilter: skip regex when no needle present in search region */
-        if (!region_has_literal(search_str, p->literal))
-            continue;
-
         size_t search_len = det->window_len - search_start;
+
+        /* Literal prefilter: skip regex when no needle present in search region */
+        if (!region_has_literal(search_str, search_len, p->literal))
+            continue;
+        /* POSIX (and C-string regex) stop at NUL. Search a copy. */
+        char scratch[4096 + 1];
+        size_t ncopy = search_len < sizeof(scratch) - 1
+                           ? search_len : sizeof(scratch) - 1;
+        memcpy(scratch, search_str, ncopy);
+        for (size_t j = 0; j < ncopy; j++)
+            if (scratch[j] == '\0')
+                scratch[j] = ' ';
+        scratch[ncopy] = '\0';
         size_t match_off = 0;
-        if (sm_regex_exec(p->compiled, search_str, search_len, &match_off) == 0) {
+        if (sm_regex_exec(p->compiled, scratch, ncopy, &match_off) == 0) {
             p->last_fire_time = ts;
 
             /* Record incident — batch-evict the oldest quarter at cap so
@@ -283,6 +350,45 @@ size_t sm_anomaly_feed(sm_anomaly_detector_t *det,
                             ? avail : sizeof(inc->match_text) - 1;
             memcpy(inc->match_text, det->window + line_start, mt_len);
             inc->match_text[mt_len] = '\0';
+
+            /* After guru/abort, append a following Backtrace: line into the
+             * remaining match_text space (256-byte cap truncates honestly). */
+            if (strcmp(p->name, "guru_meditation") == 0 ||
+                strcmp(p->name, "panic_abort") == 0) {
+                const char *win = (const char *)det->window;
+                const char *from = win + win_match;
+                size_t from_len = det->window_len - win_match;
+                const char *bt = NULL;
+                for (size_t o = 0; o + 10 < from_len; o++) {
+                    if (memcmp(from + o, "Backtrace:", 10) == 0) {
+                        bt = from + o;
+                        break;
+                    }
+                }
+                if (bt) {
+                    size_t used = strlen(inc->match_text);
+                    size_t room = sizeof(inc->match_text) - 1 - used;
+                    if (room > 4) {
+                        size_t bt_off = (size_t)(bt - win);
+                        size_t bt_avail = det->window_len - bt_off;
+                        /* one line of backtrace */
+                        size_t line_len = 0;
+                        while (line_len < bt_avail &&
+                               bt[line_len] != '\n' && bt[line_len] != '\r')
+                            line_len++;
+                        const char *sep = " | ";
+                        size_t sep_len = 3;
+                        if (room > sep_len) {
+                            size_t copy = line_len;
+                            if (copy > room - sep_len)
+                                copy = room - sep_len;
+                            memcpy(inc->match_text + used, sep, sep_len);
+                            memcpy(inc->match_text + used + sep_len, bt, copy);
+                            inc->match_text[used + sep_len + copy] = '\0';
+                        }
+                    }
+                }
+            }
 
             /* Pre-context */
             size_t ctx_len = det->context_len < sizeof(inc->pre_context) - 1

@@ -16,7 +16,9 @@ it in as you work through the steps below.
   <label>` (e.g. `--board samc21-bench --role console`) so discovery can present
   them as one board: `smolmux-cli boards` groups the wires, and `--json` gives an
   agent the board -> wires structure. Still name sockets sensibly and keep the
-  template's wiring table as the canonical record.
+  template's wiring table as the canonical record. **One USB dual-interface
+  cable is still two wires** (by-id pair + OpenOCD ownership per interface) —
+  see `docs/dual-service-usb-cable.md`.
 - **Read facts, don't guess them.** Confirm the silicon from the chip itself
   (CPUID, vendor ID registers, boot banner) before trusting the datasheet, and
   note any discrepancy. Guessed peripheral addresses waste time.

@@ -11,6 +11,12 @@ to smolmux to identify the part.
 Verified against OpenOCD `0.12.0`. Scripts live in
 `/usr/(local/)share/openocd/scripts` (`interface/`, `target/swj-dp.tcl`).
 
+**Dual FTDI / one cable:** OpenOCD must claim only the **JTAG interface**
+(channel / ifNN from the board docs). Leave the UART interface to the kernel
+(`ftdi_sio`) for a smolmux console broker. Pair the two services with a board
+manifest — `docs/dual-service-usb-cable.md`. Do not start OpenOCD on the same
+interface smolmux holds as a tty.
+
 ## What you must know vs. what you can discover
 
 You cannot avoid knowing two things; everything else is discoverable:

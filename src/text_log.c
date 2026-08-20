@@ -4,7 +4,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+
+/* Same reasoning as the JSONL log (src/io_log.c): this file is a transcript
+ * of the console, so it carries whatever was typed at a login prompt. It was
+ * created by fopen(path,"a") => 0644 under the usual umask, in a directory
+ * made 0755, which left every session readable by any local user whose home
+ * permissions allowed a look. Not as exposed as the JSONL log was — this
+ * directory is not world-writable, so the symlink and planted-file attacks do
+ * not apply — but the mode was wrong all the same. */
+static FILE *open_append_private(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) return NULL;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
+        close(fd);
+        return NULL;
+    }
+    /* Tighten a log left behind by an older build. */
+    if (st.st_mode & (S_IRWXG | S_IRWXO))
+        (void)fchmod(fd, S_IRUSR | S_IWUSR);
+
+    FILE *fp = fdopen(fd, "a");
+    if (!fp) close(fd);
+    return fp;
+}
 
 static void open_file(sm_text_log_t *log, time_t now)
 {
@@ -19,7 +50,7 @@ static void open_file(sm_text_log_t *log, time_t now)
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 
     if (log->fp) fclose(log->fp);
-    log->fp = fopen(path, "a");
+    log->fp = open_append_private(path);
 }
 
 sm_text_log_t *sm_text_log_open(const char *dir, const char *port_name)
@@ -45,7 +76,7 @@ sm_text_log_t *sm_text_log_open(const char *dir, const char *port_name)
     for (char *p = log->port_name; *p; p++)
         if (*p == '/') *p = '-';
 
-    mkdir(dir, 0755);
+    mkdir(dir, 0700);   /* console transcripts are not world-readable */
     open_file(log, time(NULL));
     return log;
 }

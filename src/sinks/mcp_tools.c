@@ -1,7 +1,9 @@
 #include "sinks/mcp.h"
 #include "sinks/mcp_internal.h"
+#include "sinks/mcp_schemas.h"
 #include "broker.h"
 #include "logger.h"
+#include "mcp_explain.h"
 #include "util/base64.h"
 #include "util/json_helpers.h"
 #include "util/str.h"
@@ -32,11 +34,14 @@ static char *tool_serial_send_command(sm_mcp_sink_t *mcp, cJSON *args,
 
     /* Apply profile */
     char cmd_buf[4096];
-    if (b->profile.command_prefix[0]) {
-        snprintf(cmd_buf, sizeof(cmd_buf), "%s%s", b->profile.command_prefix, command);
-    } else {
-        snprintf(cmd_buf, sizeof(cmd_buf), "%s", command);
-    }
+    int nw;
+    if (b->profile.command_prefix[0])
+        nw = snprintf(cmd_buf, sizeof(cmd_buf), "%s%s",
+                      b->profile.command_prefix, command);
+    else
+        nw = snprintf(cmd_buf, sizeof(cmd_buf), "%s", command);
+    if (nw < 0 || (size_t)nw >= sizeof(cmd_buf))
+        return strdup("[ERROR] command too long");
 
     /* Resolve timeout */
     if (timeout_ms <= 0)
@@ -54,15 +59,28 @@ static char *tool_serial_send_command(sm_mcp_sink_t *mcp, cJSON *args,
         pattern = b->profile.prompt_pattern;
     }
 
-    /* Append newline if missing */
-    size_t cmd_len = strlen(cmd_buf);
-    if (cmd_len == 0 || cmd_buf[cmd_len - 1] != '\n') {
-        if (cmd_len + 1 < sizeof(cmd_buf)) {
-            cmd_buf[cmd_len] = '\n';
-            cmd_buf[cmd_len + 1] = '\0';
-            cmd_len++;
-        }
+    const char *eol = sm_json_get_string(args, "eol");
+    const char *ending = "\n";
+    size_t ending_len = 1;
+    if (eol && strcmp(eol, "cr") == 0) {
+        ending = "\r";
+        ending_len = 1;
+    } else if (eol && strcmp(eol, "crlf") == 0) {
+        ending = "\r\n";
+        ending_len = 2;
+    } else if (eol && eol[0] && strcmp(eol, "lf") != 0) {
+        return strdup("[ERROR] eol must be lf, cr, or crlf");
     }
+
+    size_t cmd_len = strlen(cmd_buf);
+    while (cmd_len > 0 &&
+           (cmd_buf[cmd_len - 1] == '\n' || cmd_buf[cmd_len - 1] == '\r'))
+        cmd_buf[--cmd_len] = '\0';
+    if (cmd_len + ending_len >= sizeof(cmd_buf))
+        return strdup("[ERROR] command too long");
+    memcpy(cmd_buf + cmd_len, ending, ending_len);
+    cmd_buf[cmd_len + ending_len] = '\0';
+    cmd_len += ending_len;
 
     /* Check link status */
     if (b->suspended) return strdup("[ERROR] serial port is suspended");
@@ -105,7 +123,11 @@ static char *tool_serial_send_command(sm_mcp_sink_t *mcp, cJSON *args,
 
 static char *tool_serial_read(sm_mcp_sink_t *mcp)
 {
-    return mcp_drain_output(mcp);
+    char *text = mcp_drain_output(mcp);
+    size_t n;
+    const sm_anomaly_incident_t *incs =
+        sm_anomaly_get_incidents(&mcp->broker->anomaly, &n);
+    return sm_mcp_append_recent_incidents(text, incs, n, 5);
 }
 
 static char *tool_serial_write(sm_mcp_sink_t *mcp, cJSON *args)
@@ -116,9 +138,9 @@ static char *tool_serial_write(sm_mcp_sink_t *mcp, cJSON *args)
 
     size_t len = strlen(data_str);
     int rc = sm_broker_do_write(b, (const uint8_t *)data_str, len, "mcp");
-    if (rc == -1) return strdup("[ERROR] serial port is suspended");
-    if (rc == -2) return strdup("[ERROR] serial port disconnected");
-    if (rc == -3) return strdup("[ERROR] write failed");
+    if (rc == -1) return sm_mcp_error_with_hint("[ERROR] serial port is suspended");
+    if (rc == -2) return sm_mcp_error_with_hint("[ERROR] serial port disconnected");
+    if (rc == -3) return sm_mcp_error_with_hint("[ERROR] write failed");
 
     double ts = sm_now_realtime();
     cJSON *echo = sm_msg_input_echo((const uint8_t *)data_str, len, "mcp", ts);
@@ -262,6 +284,16 @@ static void mcp_break_done(sm_broker_t *b, void *ctx_, int rc)
     free(ctx);
 }
 
+/* Same allowlist as handle_pin_control (broker.c): wire docs say dtr|rts|break.
+ * Without this, serial_pin_control on the in-process MCP sink re-opens SM-15
+ * (agent can set_param("allow_shell","1") on a GDB link). */
+static int mcp_pin_is_line_control(const char *pin)
+{
+    return strcmp(pin, "dtr") == 0 ||
+           strcmp(pin, "rts") == 0 ||
+           strcmp(pin, "break") == 0;
+}
+
 static char *tool_serial_pin_control(sm_mcp_sink_t *mcp, cJSON *args,
                                       cJSON *jsonrpc_id)
 {
@@ -272,6 +304,9 @@ static char *tool_serial_pin_control(sm_mcp_sink_t *mcp, cJSON *args,
 
     if (!pin || !action)
         return strdup("[ERROR] missing pin or action");
+
+    if (!mcp_pin_is_line_control(pin))
+        return strdup("[ERROR] unknown pin (expected dtr, rts, or break)");
 
     if (strcmp(pin, "break") == 0) {
         mcp_break_ctx_t *ctx = calloc(1, sizeof(*ctx));
@@ -320,7 +355,8 @@ static char *tool_serial_suspend(sm_mcp_sink_t *mcp)
     sm_broker_t *b = mcp->broker;
 
     int rc = sm_broker_do_suspend(b, "mcp");
-    if (rc < 0) return strdup("[ERROR] already suspended");
+    if (rc < 0)
+        return sm_mcp_error_with_hint("[ERROR] already suspended");
 
     char result[512];
     snprintf(result, sizeof(result),
@@ -333,15 +369,120 @@ static char *tool_serial_resume(sm_mcp_sink_t *mcp)
     sm_broker_t *b = mcp->broker;
 
     int rc = sm_broker_do_resume(b, "mcp");
-    if (rc == -1) return strdup("[ERROR] not suspended");
-    if (rc == -2) return strdup("[ERROR] failed to reopen serial port");
+    if (rc == -1)
+        return sm_mcp_error_with_hint("[ERROR] not suspended");
+    if (rc == -2)
+        return sm_mcp_error_with_hint("[ERROR] failed to reopen serial port");
 
     return strdup("OK - serial port re-acquired.");
+}
+
+static char *tool_serial_wait_for(sm_mcp_sink_t *mcp, cJSON *args,
+                                    cJSON *jsonrpc_id)
+{
+    sm_broker_t *b = mcp->broker;
+    const char *pattern = sm_json_get_string(args, "pattern");
+    if (!pattern || !pattern[0])
+        return strdup("[ERROR] missing 'pattern' argument");
+
+    int timeout_ms = sm_json_get_int(args, "timeout_ms", 30000);
+    if (timeout_ms < 100) timeout_ms = 100;
+    if (timeout_ms > SM_MAX_EXPECT_TIMEOUT_MS)
+        timeout_ms = SM_MAX_EXPECT_TIMEOUT_MS;
+
+    if (b->suspended) return strdup("[ERROR] serial port is suspended");
+    if (b->link->read_fd(b->link) < 0)
+        return strdup("[ERROR] serial port not connected");
+
+    char expect_id[16];
+    mcp_gen_expect_id(mcp, expect_id, sizeof(expect_id));
+
+    double timeout_s = (double)timeout_ms / 1000.0;
+    if (sm_expect_add(&b->expect, expect_id, pattern, timeout_s,
+                       SM_MCP_CLIENT_ID) != 0) {
+        return strdup("[ERROR] invalid regex pattern");
+    }
+
+    sm_mcp_pending_t *p = mcp_alloc_pending(mcp, jsonrpc_id, expect_id);
+    if (!p) {
+        sm_expect_cancel_id(&b->expect, expect_id);
+        return strdup("[ERROR] too many pending calls");
+    }
+    /* No TX — listen only. */
+    return NULL;
+}
+
+static char *history_json_page(sm_broker_t *b, uint64_t since_seq, int max_bytes)
+{
+    if (max_bytes <= 0)
+        max_bytes = (int)SM_MAX_HISTORY_RESPONSE_BYTES;
+    if (max_bytes > (int)SM_MAX_HISTORY_RESPONSE_BYTES)
+        max_bytes = (int)SM_MAX_HISTORY_RESPONSE_BYTES;
+
+    sm_rb_chunk_t *chunks = NULL;
+    size_t first_skip = 0;
+    uint64_t cursor = 0, dropped = 0;
+    int has_more = 0;
+    size_t count = sm_rb_get_since_seq(&b->history, since_seq, (size_t)max_bytes,
+                                       &chunks, &first_skip, &cursor, &dropped,
+                                       &has_more);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "cursor", (double)cursor);
+    cJSON_AddNumberToObject(root, "dropped", (double)dropped);
+    cJSON_AddBoolToObject(root, "has_more", has_more ? 1 : 0);
+    cJSON *arr = cJSON_AddArrayToObject(root, "chunks");
+
+    size_t encoded = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t off = (i == 0) ? first_skip : 0;
+        size_t len = chunks[i].len - off;
+        if (encoded + len > (size_t)max_bytes)
+            len = (size_t)max_bytes - encoded;
+        if (len == 0)
+            break;
+        cJSON *ch = cJSON_CreateObject();
+        /* Prefer UTF-8 text; base64 only if needed — keep simple: raw as string
+         * with NULs stripped for MCP JSON. */
+        char *txt = malloc(len + 1);
+        size_t t = 0;
+        if (txt) {
+            for (size_t j = 0; j < len; j++) {
+                uint8_t c = chunks[i].data[off + j];
+                if (c != 0) txt[t++] = (char)c;
+            }
+            txt[t] = '\0';
+            cJSON_AddStringToObject(ch, "text", txt);
+            free(txt);
+        }
+        cJSON_AddNumberToObject(ch, "timestamp", chunks[i].timestamp);
+        cJSON_AddNumberToObject(ch, "seq_start",
+                                (double)(chunks[i].seq_start + (uint64_t)off));
+        cJSON_AddItemToArray(arr, ch);
+        encoded += len;
+        if (encoded >= (size_t)max_bytes)
+            break;
+    }
+    free(chunks);
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out)
+        return strdup("(allocation failed)");
+    return out;
 }
 
 static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
 {
     sm_broker_t *b = mcp->broker;
+
+    cJSON *since_item = cJSON_GetObjectItemCaseSensitive(args, "since_seq");
+    if (cJSON_IsNumber(since_item)) {
+        uint64_t since_seq = (uint64_t)since_item->valuedouble;
+        int max_bytes = sm_json_get_int(args, "max_bytes", 0);
+        return history_json_page(b, since_seq, max_bytes);
+    }
+
     double seconds = sm_json_get_double(args, "seconds", 0.0);
     int last_bytes = sm_json_get_int(args, "last_bytes", 0);
 
@@ -562,23 +703,7 @@ static char *tool_serial_generate_report(sm_mcp_sink_t *mcp)
 
 static char *tool_serial_list_ports(void)
 {
-    glob_t g;
-    size_t total = sm_glob_serial_ports(&g);
-    if (total == 0) {
-        globfree(&g);
-        return strdup("No serial ports found.");
-    }
-
-    sm_strbuf_t sb;
-    sm_strbuf_init(&sb);
-    for (size_t i = 0; i < total; i++) {
-        if (i) sm_strbuf_append_str(&sb, "\n");
-        sm_strbuf_append_str(&sb, g.gl_pathv[i]);
-    }
-    globfree(&g);
-
-    char *out = sm_strbuf_steal(&sb);
-    return out ? out : strdup("(allocation failed)");
+    return sm_format_serial_ports_text();
 }
 
 /* --- Tool dispatcher --- */
@@ -586,40 +711,49 @@ static char *tool_serial_list_ports(void)
 char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
                          cJSON *jsonrpc_id)
 {
+    char *result = NULL;
+    if (sm_mcp_tool_is_mutate(name) && !sm_mcp_mutate_enabled())
+        return strdup("[ERROR] mutate tools disabled (set SMOLMUX_MCP_MUTATE=1)");
     if (strcmp(name, "serial_send_command") == 0)
-        return tool_serial_send_command(mcp, args, jsonrpc_id);
-    if (strcmp(name, "serial_read") == 0)
-        return tool_serial_read(mcp);
-    if (strcmp(name, "serial_write") == 0)
-        return tool_serial_write(mcp, args);
-    if (strcmp(name, "serial_port_status") == 0)
-        return tool_serial_port_status(mcp);
-    if (strcmp(name, "serial_boot_status") == 0)
-        return tool_serial_boot_status(mcp);
-    if (strcmp(name, "serial_add_autoresponder") == 0)
-        return tool_serial_add_autoresponder(mcp, args);
-    if (strcmp(name, "serial_pin_control") == 0)
-        return tool_serial_pin_control(mcp, args, jsonrpc_id);
-    if (strcmp(name, "serial_sysrq") == 0)
-        return tool_serial_sysrq(mcp, args, jsonrpc_id);
-    if (strcmp(name, "serial_suspend") == 0)
-        return tool_serial_suspend(mcp);
-    if (strcmp(name, "serial_resume") == 0)
-        return tool_serial_resume(mcp);
-    if (strcmp(name, "serial_output_history") == 0)
-        return tool_serial_output_history(mcp, args);
-    if (strcmp(name, "serial_get_incidents") == 0)
-        return tool_serial_get_incidents(mcp, args);
-    if (strcmp(name, "serial_add_watchdog") == 0)
-        return tool_serial_add_watchdog(mcp, args);
-    if (strcmp(name, "serial_monitor") == 0)
-        return tool_serial_monitor(mcp, args, jsonrpc_id);
-    if (strcmp(name, "serial_generate_report") == 0)
-        return tool_serial_generate_report(mcp);
-    if (strcmp(name, "serial_list_ports") == 0)
-        return tool_serial_list_ports();
-
-    char err[256];
-    snprintf(err, sizeof(err), "[ERROR] unknown tool: %s", name);
-    return strdup(err);
+        result = tool_serial_send_command(mcp, args, jsonrpc_id);
+    else if (strcmp(name, "serial_read") == 0)
+        result = tool_serial_read(mcp);
+    else if (strcmp(name, "serial_write") == 0)
+        result = tool_serial_write(mcp, args);
+    else if (strcmp(name, "serial_port_status") == 0)
+        result = tool_serial_port_status(mcp);
+    else if (strcmp(name, "serial_boot_status") == 0)
+        result = tool_serial_boot_status(mcp);
+    else if (strcmp(name, "serial_add_autoresponder") == 0)
+        result = tool_serial_add_autoresponder(mcp, args);
+    else if (strcmp(name, "serial_pin_control") == 0)
+        result = tool_serial_pin_control(mcp, args, jsonrpc_id);
+    else if (strcmp(name, "serial_sysrq") == 0)
+        result = tool_serial_sysrq(mcp, args, jsonrpc_id);
+    else if (strcmp(name, "serial_suspend") == 0)
+        result = tool_serial_suspend(mcp);
+    else if (strcmp(name, "serial_resume") == 0)
+        result = tool_serial_resume(mcp);
+    else if (strcmp(name, "serial_wait_for") == 0)
+        result = tool_serial_wait_for(mcp, args, jsonrpc_id);
+    else if (strcmp(name, "serial_output_history") == 0)
+        result = tool_serial_output_history(mcp, args);
+    else if (strcmp(name, "serial_get_incidents") == 0)
+        result = tool_serial_get_incidents(mcp, args);
+    else if (strcmp(name, "serial_add_watchdog") == 0)
+        result = tool_serial_add_watchdog(mcp, args);
+    else if (strcmp(name, "serial_monitor") == 0)
+        result = tool_serial_monitor(mcp, args, jsonrpc_id);
+    else if (strcmp(name, "serial_generate_report") == 0)
+        result = tool_serial_generate_report(mcp);
+    else if (strcmp(name, "serial_list_ports") == 0)
+        result = tool_serial_list_ports();
+    else {
+        char err[256];
+        snprintf(err, sizeof(err), "[ERROR] unknown tool: %s", name);
+        result = sm_mcp_error_with_hint(err);
+    }
+    if (result)
+        result = sm_mcp_maybe_explain_result(result);
+    return result;
 }

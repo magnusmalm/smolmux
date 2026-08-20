@@ -2,7 +2,7 @@
 #define SM_CONSTANTS_H
 
 #define SM_NAME "smolmux"
-#define SM_VERSION "0.1.2"
+#define SM_VERSION "0.2.0"
 #define SM_PROTOCOL_VERSION 1
 
 /* Limits */
@@ -27,6 +27,11 @@
 #define SM_AR_WINDOW_BYTES          8192  /* fixed sliding window, drops oldest */
 #define SM_AR_DEFAULT_COOLDOWN_MS   1000  /* re-fire guard on still-visible text */
 #define SM_AR_MAX_FIRED_PER_FEED    8
+
+/* Synthetic history lines so agents can tell sessions apart after USB drop.
+ * Default on: identity of the ring is not the same as "Connected: yes". */
+#define SM_HISTORY_FENCE_DOWN "*** smolmux: link down ***\n"
+#define SM_HISTORY_FENCE_UP   "*** smolmux: link up ***\n"
 
 #define SM_MAX_BREAK_DURATION_MS 2000
 #define SM_DEFAULT_BREAK_DURATION_MS 250
@@ -102,7 +107,20 @@
 /* Defaults */
 #define SM_DEFAULT_BAUD 115200
 #define SM_SOCKET_PATH_FMT "/tmp/smolmux-%s.sock"
+/* I/O log (JSONL) location. This log records every byte in both directions,
+ * so on a serial console it routinely captures bootloader and login
+ * credentials — it must not default into a world-writable directory where
+ * another local user can pre-create or symlink the path. Preference order is
+ * $XDG_STATE_HOME/smolmux, then ~/.local/state/smolmux, and only then
+ * SM_LOG_DIR as a last resort when the environment names no home.
+ * sm_io_log_open() independently refuses symlinks and files owned by anyone
+ * else, so even the last resort cannot be hijacked. */
 #define SM_LOG_DIR "/tmp"
+#define SM_IO_LOG_DIR_XDG_FMT  "%s/smolmux"
+#define SM_IO_LOG_DIR_HOME_FMT "%s/.local/state/smolmux"
+/* One file per port: a single shared name let every broker on the host
+ * interleave into one predictable path. */
+#define SM_IO_LOG_FILE_FMT "%s/smolmux-%s-io.jsonl"
 #define SM_TEXT_LOG_DIR_FMT "%s/.local/share/smolmux/logs"
 
 /* Epoll */
@@ -114,7 +132,7 @@
 #define SM_PROFILE_FILE_SUFFIX ".smolmux-profile.json"
 #define SM_GDB_PROFILE_ENV "SMOLMUX_GDB_PROFILE"
 #define SM_GDB_PROFILE_FILE_SUFFIX ".gdb-profile.json"
-#define SM_PROFILE_DEFAULT_PROMPT "\\$\\s*$|\\#\\s*$|>\\s*$"
+#define SM_PROFILE_DEFAULT_PROMPT "\\$[[:space:]]*$|#[[:space:]]*$|>[[:space:]]*$"
 #define SM_PROFILE_DEFAULT_TIMEOUT 5000
 
 /* Monitor */

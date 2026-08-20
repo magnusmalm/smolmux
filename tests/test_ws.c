@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <string.h>
 
 #define TEST_SOCK "/tmp/smolmux-test-ws.sock"
 #define TEST_WS_PORT 15556
@@ -215,7 +216,9 @@ typedef struct test_ctx {
     pthread_t tid;
 } test_ctx_t;
 
-static void setup(test_ctx_t *ctx)
+/* token != NULL arms the broker's auth gate before the thread starts, so the
+ * test never writes auth_token while the broker thread is reading it. */
+static void setup_auth(test_ctx_t *ctx, const char *token)
 {
     openpty(&ctx->master, &ctx->slave, NULL, NULL, NULL);
     char *slave_name = ttyname(ctx->slave);
@@ -224,12 +227,20 @@ static void setup(test_ctx_t *ctx)
     sm_broker_init(&ctx->broker, ctx->link, TEST_SOCK);
     snprintf(ctx->broker.port, sizeof(ctx->broker.port), "%s", slave_name);
     ctx->broker.baudrate = 115200;
+    if (token)
+        snprintf(ctx->broker.auth_token, sizeof(ctx->broker.auth_token),
+                 "%s", token);
 
     ctx->ws_sink = sm_ws_sink_new(TEST_WS_PORT);
     sm_broker_add_sink(&ctx->broker, ctx->ws_sink);
 
     pthread_create(&ctx->tid, NULL, broker_thread, &ctx->broker);
     usleep(STARTUP_DELAY);
+}
+
+static void setup(test_ctx_t *ctx)
+{
+    setup_auth(ctx, NULL);
 }
 
 static void teardown(test_ctx_t *ctx)
@@ -423,6 +434,204 @@ static void test_ws_oversized_frame_rejected(void)
     teardown(&ctx);
 }
 
+/* A WS peer is network-origin, so --auth-token must gate it exactly as it
+ * gates TCP. Pre-fix the WS sink registered clients through
+ * sm_broker_register_client_async() without setting requires_auth, so a
+ * tokenless hello got a welcome with role "controller" — any local UID could
+ * drive the console past both the token and the Unix socket's 0700 mode. */
+static void test_ws_auth_token(void)
+{
+    test_ctx_t ctx;
+    setup_auth(&ctx, "sekrit");
+
+    /* Missing token → error, and specifically NOT a welcome. */
+    unsetenv("SMOLMUX_AUTH_TOKEN");
+    int fd = connect_tcp(TEST_WS_PORT);
+    ASSERT(fd >= 0, "connected");
+    ASSERT_INT_EQ(ws_handshake(fd), 0);
+    ws_send_json(fd, sm_msg_hello("ws-intruder", "controller"));
+    sm_msg_t resp = ws_recv_json(fd);
+    ASSERT_NOT_NULL(resp.root);
+    ASSERT_INT_EQ(resp.type, SM_MSG_ERROR);
+    ASSERT_STR_EQ(sm_json_get_string(resp.root, "message"),
+                  "authentication failed");
+    sm_msg_free(&resp);
+    close(fd);
+
+    /* Correct token (picked up from env by sm_msg_hello) → welcome. */
+    setenv("SMOLMUX_AUTH_TOKEN", "sekrit", 1);
+    int fd2 = connect_tcp(TEST_WS_PORT);
+    ASSERT(fd2 >= 0, "connected");
+    ASSERT_INT_EQ(ws_handshake(fd2), 0);
+    ws_send_json(fd2, sm_msg_hello("ws-friend", "controller"));
+    unsetenv("SMOLMUX_AUTH_TOKEN");
+    sm_msg_t resp2 = ws_recv_json(fd2);
+    ASSERT_NOT_NULL(resp2.root);
+    ASSERT_INT_EQ(resp2.type, SM_MSG_WELCOME);
+    ASSERT_STR_EQ(sm_json_get_string(resp2.root, "your_role"), "controller");
+    sm_msg_free(&resp2);
+    close(fd2);
+
+    teardown(&ctx);
+}
+
+/* With no token configured the WS sink stays open (unchanged behaviour) —
+ * requires_auth alone must not lock out the default loopback workflow. */
+static void test_ws_no_token_still_allowed(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    unsetenv("SMOLMUX_AUTH_TOKEN");
+    int fd = connect_tcp(TEST_WS_PORT);
+    ASSERT(fd >= 0, "connected");
+    ASSERT_INT_EQ(ws_handshake(fd), 0);
+    ws_send_json(fd, sm_msg_hello("ws-plain", "controller"));
+    sm_msg_t resp = ws_recv_json(fd);
+    ASSERT_NOT_NULL(resp.root);
+    ASSERT_INT_EQ(resp.type, SM_MSG_WELCOME);
+    sm_msg_free(&resp);
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* RFC 6455 5.1: a server must close the connection on an unmasked client
+ * frame. smolmux accepted them, which is how the SM-01 auth-bypass PoC could
+ * talk to the sink with hand-rolled plain frames. No first-party client speaks
+ * WS and both browsers and websocat mask correctly, so enforcing costs
+ * nothing. Must be a close frame, not a silent drop. */
+static void test_ws_unmasked_frame_rejected(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_tcp(TEST_WS_PORT);
+    ASSERT(fd >= 0, "connected");
+    ASSERT_INT_EQ(ws_handshake(fd), 0);
+
+    /* FIN|TEXT with the MASK bit clear — what the PoC sent. */
+    const char *payload = "{\"type\":\"hello\"}";
+    size_t plen = strlen(payload);
+    uint8_t frame[64];
+    frame[0] = 0x81;
+    frame[1] = (uint8_t)plen;          /* no 0x80 mask bit */
+    memcpy(frame + 2, payload, plen);
+    ASSERT_INT_EQ(write_all(fd, frame, plen + 2), 0);
+
+    uint8_t rbuf[64];
+    size_t total = 0;
+    int got_close = 0;
+    for (int i = 0; i < 50 && !got_close; i++) {
+        ssize_t n = read_timeout(fd, rbuf + total, sizeof(rbuf) - total, 100);
+        if (n > 0) {
+            total += (size_t)n;
+            int op; const uint8_t *pl; size_t pn;
+            if (ws_decode_server(rbuf, total, &op, &pl, &pn) > 0) {
+                got_close = (op == 0x8);
+                break;
+            }
+        } else if (n == 0) {
+            break;
+        }
+    }
+    ASSERT(got_close, "unmasked frame answered with a WS close");
+
+    /* Broker survives; a correctly-masked client still works. */
+    int fd2 = connect_tcp(TEST_WS_PORT);
+    ASSERT(fd2 >= 0, "broker alive");
+    ASSERT_INT_EQ(ws_handshake(fd2), 0);
+    ws_send_json(fd2, sm_msg_hello("ws-masked", "observer"));
+    sm_msg_t w = ws_recv_json(fd2);
+    ASSERT_NOT_NULL(w.root);
+    ASSERT_INT_EQ(w.type, SM_MSG_WELCOME);
+    sm_msg_free(&w);
+
+    close(fd);
+    close(fd2);
+    teardown(&ctx);
+}
+
+/* A JSON line bigger than br_buf with no newline in the first 8k used to
+ * read(0) and drop the client. Drop the stalled line; keep the session. */
+static void test_ws_bridge_oversize_line_keeps_client(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_tcp(TEST_WS_PORT);
+    ASSERT(fd >= 0, "connected");
+    ASSERT_INT_EQ(ws_handshake(fd), 0);
+    ws_send_json(fd, sm_msg_hello("ws-big", "observer"));
+    sm_msg_t welcome = ws_recv_json(fd);
+    ASSERT_NOT_NULL(welcome.root);
+    ASSERT_INT_EQ(welcome.type, SM_MSG_WELCOME);
+    sm_msg_free(&welcome);
+
+    /* ~7k raw → JSON line well over SM_WS_READ_BUF_SIZE before '\n'. */
+    char blob[7000];
+    memset(blob, 'X', sizeof(blob));
+    ASSERT(write(ctx.master, blob, sizeof(blob)) == (ssize_t)sizeof(blob),
+           "wrote oversized device chunk");
+    usleep(300000);
+
+    /* Session must survive the drop (not a silent EOF / client remove). */
+    {
+        struct pollfd p = { .fd = fd, .events = POLLIN | POLLHUP };
+        int pr = poll(&p, 1, 50);
+        ASSERT(!(pr > 0 && (p.revents & POLLHUP) && !(p.revents & POLLIN)),
+               "oversize drop must not hang up the WS client");
+    }
+
+    ASSERT_INT_EQ((int)write(ctx.master, "tail-ok\n", 8), 8);
+
+    /* Leftover JSON after the drop can be a large/partial frame; drain
+     * with a buffer bigger than 8k and look for the later tail line. */
+    uint8_t acc[65536];
+    size_t total = 0;
+    int saw_tail = 0;
+    for (int i = 0; i < 40 && !saw_tail && total < sizeof(acc) - 1; i++) {
+        ssize_t n = read_timeout(fd, acc + total, sizeof(acc) - total, 100);
+        if (n <= 0)
+            continue;
+        total += (size_t)n;
+        size_t off = 0;
+        while (off < total) {
+            int op;
+            const uint8_t *pl;
+            size_t pn;
+            size_t used = ws_decode_server(acc + off, total - off, &op, &pl, &pn);
+            if (used == 0)
+                break;
+            if (op == 0x1 && pl && pn > 0) {
+                sm_msg_t m = sm_msg_decode((const char *)pl, pn);
+                if (m.root && m.type == SM_MSG_OUTPUT) {
+                    cJSON *d = cJSON_GetObjectItemCaseSensitive(m.root, "data");
+                    if (cJSON_IsString(d) && d->valuestring) {
+                        size_t rn = 0;
+                        uint8_t *raw = sm_base64_decode(d->valuestring,
+                                                        strlen(d->valuestring),
+                                                        &rn);
+                        if (raw && rn >= 7 && memmem(raw, rn, "tail-ok", 7))
+                            saw_tail = 1;
+                        free(raw);
+                    }
+                }
+                sm_msg_free(&m);
+            }
+            off += used;
+        }
+        if (off > 0 && off < total)
+            memmove(acc, acc + off, total - off);
+        if (off > 0)
+            total -= off;
+    }
+    ASSERT(saw_tail, "client stayed up and received a later output line");
+
+    close(fd);
+    teardown(&ctx);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -433,6 +642,10 @@ int main(void)
     RUN_TEST(test_ws_output_broadcast);
     RUN_TEST(test_ws_close_frame);
     RUN_TEST(test_ws_oversized_frame_rejected);
+    RUN_TEST(test_ws_unmasked_frame_rejected);
+    RUN_TEST(test_ws_bridge_oversize_line_keeps_client);
+    RUN_TEST(test_ws_auth_token);
+    RUN_TEST(test_ws_no_token_still_allowed);
 
     TEST_REPORT();
 }

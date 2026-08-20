@@ -330,6 +330,24 @@ static int connect_and_hello(const char *socket_path, const char *role)
 
 /* --- Subcommand implementations --- */
 
+/* 1 if any argv after the first operand looks like -x / --foo (not "--"). */
+static int cli_trailing_option_after(int argc, char **argv, int first)
+{
+    if (first < 0 || !argv)
+        return 0;
+    for (int i = first + 1; i < argc; i++) {
+        if (argv[i] && argv[i][0] == '-' && argv[i][1] != '\0' &&
+            strcmp(argv[i], "--") != 0)
+            return 1;
+    }
+    return 0;
+}
+
+int cli_test_trailing_option_after(int argc, char **argv, int first)
+{
+    return cli_trailing_option_after(argc, argv, first);
+}
+
 static int cmd_send(int argc, char **argv)
 {
     const char *expect_pattern = NULL;
@@ -343,7 +361,8 @@ static int cmd_send(int argc, char **argv)
 
     int opt;
     optind = 1;
-    while ((opt = getopt_long(argc, argv, "e:t:", opts, NULL)) != -1) {
+    /* '+' = POSIX: stop at first operand so musl and glibc agree. */
+    while ((opt = getopt_long(argc, argv, "+e:t:", opts, NULL)) != -1) {
         switch (opt) {
         case 'e': expect_pattern = optarg; break;
         case 't': timeout = atoi(optarg); break;
@@ -354,6 +373,16 @@ static int cmd_send(int argc, char **argv)
     if (optind >= argc) {
         fprintf(stderr, "error: missing command argument\n"
                 "usage: smolmux-cli send [--expect <pattern>] [--timeout <ms>] <command>\n");
+        return 1;
+    }
+
+    /* Flags after the command used to be concatenated onto the UART
+     * (musl/POSIX getopt). Refuse rather than send --expect to the board. */
+    if (cli_trailing_option_after(argc, argv, optind)) {
+        fprintf(stderr,
+                "error: options after the command are not sent to the device\n"
+                "usage: smolmux-cli send [--expect <pattern>] [--timeout <ms>] <command>\n"
+                "  Put flags before the command, or use -- to send a leading '-'.\n");
         return 1;
     }
 
@@ -368,7 +397,7 @@ static int cmd_send(int argc, char **argv)
 
     /* Build pattern — default to common shell prompts if not specified */
     if (!expect_pattern)
-        expect_pattern = "\\$\\s*$|\\#\\s*$|>\\s*$";
+        expect_pattern = SM_PROFILE_DEFAULT_PROMPT;
 
     /* Send send_expect */
     cJSON *msg = sm_msg_send_expect("cli-send",
@@ -574,6 +603,10 @@ static int cmd_status(int argc, char **argv)
         printf("Connected: %s\n", connected ? "yes" : "no");
         printf("Suspended: %s\n", suspended ? "yes" : "no");
         printf("Takeover:  %s\n", takeover ? takeover : "none");
+        printf("Link up:   %.3f\n", sm_json_get_double(result, "link_up_ts", 0));
+        printf("RX age ms: %d\n", sm_json_get_int(result, "last_rx_age_ms", 0));
+        printf("RX since up: %.0f\n",
+               sm_json_get_double(result, "bytes_rx_since_link_up", 0));
 
         cJSON *clients = cJSON_GetObjectItem(result, "clients");
         if (clients && cJSON_GetArraySize(clients) > 0) {
@@ -775,26 +808,34 @@ static int cmd_list_ports(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    glob_t g;
-    size_t total = sm_glob_serial_ports(&g);
-
     if (cli.json_output) {
+        sm_serial_port_info_t infos[SM_SERIAL_PORT_INFO_MAX];
+        size_t n = sm_list_serial_ports_info(infos, SM_SERIAL_PORT_INFO_MAX);
         cJSON *arr = cJSON_CreateArray();
-        for (size_t i = 0; i < total; i++)
-            cJSON_AddItemToArray(arr, cJSON_CreateString(g.gl_pathv[i]));
+        for (size_t i = 0; i < n; i++) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "path", infos[i].path);
+            if (infos[i].by_id[0])
+                cJSON_AddStringToObject(o, "by_id", infos[i].by_id);
+            if (infos[i].by_path[0])
+                cJSON_AddStringToObject(o, "by_path", infos[i].by_path);
+            const char *id = infos[i].by_id[0] ? infos[i].by_id
+                                               : infos[i].path;
+            const char *st = sm_serial_by_id_is_weak(id) ? "WEAK"
+                             : (strstr(id, "by-id") ? "STRONG" : "n/a");
+            cJSON_AddStringToObject(o, "identity", st);
+            cJSON_AddItemToArray(arr, o);
+        }
         char *s = cJSON_PrintUnformatted(arr);
         if (s) { printf("%s\n", s); free(s); }
         cJSON_Delete(arr);
     } else {
-        if (total == 0) {
-            printf("No serial ports found.\n");
-        } else {
-            for (size_t i = 0; i < total; i++)
-                printf("%s\n", g.gl_pathv[i]);
+        char *text = sm_format_serial_ports_text();
+        if (text) {
+            printf("%s\n", text);
+            free(text);
         }
     }
-
-    globfree(&g);
     return 0;
 }
 
@@ -1536,8 +1577,14 @@ static void usage(const char *prog)
         "                          (no broker needed; use --json for agents)\n"
         "\n"
         "  board up <manifest>     Start every wire in a *.board.json manifest\n"
+        "                          (--identity-ok: bind a WEAK by-id name)\n"
         "    --foreground, -F      Tie the wires' lifetime to this run (Ctrl-C stops all)\n"
         "  board down <name>       Stop all running wires of a board (SIGTERM)\n"
+        "\n"
+        "  shutdown                Stop one broker cleanly (alias: stop)\n"
+        "                          Uses -s <path>, or the sole running broker;\n"
+        "                          SIGTERM + wait until the socket disappears\n"
+        "  gc [--dry-run] [--mcp]  Reap leftover MCP clients (or -s one broker)\n"
         "  board status <name>     Show a board's active wires\n"
         "  board list [dir]        List *.board.json manifests (dir, $SMOLMUX_BOARD_DIR,\n"
         "                          or ~/.config/smolmux) and which are up\n"
@@ -1622,7 +1669,7 @@ static int cmd_brokers(int argc, char **argv)
         printf("No active smolmux brokers found.\n");
     } else {
         for (size_t i = 0; i < shown; i++) {
-            char line[320];
+            char line[480];
             sm_broker_info_format(&infos[i], line, sizeof(line));
             printf("%s\n", line);
         }
@@ -1775,13 +1822,46 @@ static int build_wire_argv(const char *broker, const sm_board_manifest_t *m,
     return a;
 }
 
-static int board_up(const char *manifest_path, int foreground)
+static int board_up(const char *manifest_path, int foreground, int identity_ok)
 {
     sm_board_manifest_t m;
     if (sm_board_manifest_load(manifest_path, &m) != 0) {
         fprintf(stderr, "error: failed to load manifest %s\n", manifest_path);
         return 1;
     }
+
+    const char *okenv = getenv("SMOLMUX_IDENTITY_OK");
+    if (okenv && okenv[0] && strcmp(okenv, "0") != 0)
+        identity_ok = 1;
+
+    /* D3: refuse named-board auto-bind on weak by-id unless seat is pinned
+     * and matches now, or the operator set identity_ok. */
+    for (size_t i = 0; i < m.wire_count; i++) {
+        sm_board_wire_t *w = &m.wires[i];
+        if (strcmp(w->link, "uart") != 0)
+            continue;
+        int weak = sm_serial_by_id_is_weak(w->device);
+        char now[256];
+        now[0] = '\0';
+        const char *probe = w->by_path[0] ? w->by_path : w->device;
+        (void)sm_serial_resolve_by_path(probe, now, sizeof(now));
+        if (sm_identity_named_board_is_ambiguous(1, weak, w->policy,
+                                                 w->by_path, now,
+                                                 identity_ok)) {
+            cJSON *err = sm_identity_ambiguous_json(m.board, w->device,
+                "named board + weak by-id; pin by_path (policy=seat) "
+                "or pass --identity-ok / SMOLMUX_IDENTITY_OK=1");
+            char *s = cJSON_PrintUnformatted(err);
+            fprintf(stderr, "%s\n",
+                    s ? s : "{\"error\":\"identity_ambiguous\"}");
+            free(s);
+            cJSON_Delete(err);
+            return 1;
+        }
+    }
+
+    if (identity_ok)
+        setenv("SMOLMUX_IDENTITY_OK", "1", 1);
 
     char broker[4096];
     resolve_broker_path(broker, sizeof(broker));
@@ -1888,6 +1968,18 @@ static int board_down(const char *name)
     return 0;
 }
 
+/* CTL-1 hooks: board up/down are owning-phase controls (spawn/SIGTERM), not
+ * presence-only help text. Tests drive these against real/PTY brokers. */
+int cli_test_board_up(const char *manifest_path)
+{
+    return board_up(manifest_path, 0 /* detached */, 0);
+}
+
+int cli_test_board_down(const char *board_name)
+{
+    return board_down(board_name);
+}
+
 static int board_status(const char *name)
 {
     sm_broker_info_t infos[64];
@@ -1898,7 +1990,7 @@ static int board_status(const char *name)
     for (size_t i = 0; i < shown; i++) {
         if (!infos[i].reachable || strcmp(infos[i].board, name) != 0)
             continue;
-        char line[320];
+        char line[480];
         sm_broker_info_format(&infos[i], line, sizeof(line));
         printf("%s\n", line);
         found++;
@@ -2007,18 +2099,21 @@ static int cmd_board(int argc, char **argv)
     if (strcmp(action, "up") == 0) {
         const char *manifest = NULL;
         int foreground = 0;
+        int identity_ok = 0;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--foreground") == 0 || strcmp(argv[i], "-F") == 0)
                 foreground = 1;
+            else if (strcmp(argv[i], "--identity-ok") == 0)
+                identity_ok = 1;
             else
                 manifest = argv[i];
         }
         if (!manifest) {
             fprintf(stderr, "usage: smolmux-cli board up <manifest.json> "
-                    "[--foreground]\n");
+                    "[--foreground] [--identity-ok]\n");
             return 1;
         }
-        return board_up(manifest, foreground);
+        return board_up(manifest, foreground, identity_ok);
     }
     if (strcmp(action, "down") == 0) {
         if (argc < 3) { fprintf(stderr, "usage: smolmux-cli board down <name>\n"); return 1; }
@@ -2051,7 +2146,7 @@ typedef struct {
 static int cmd_break_uboot(int argc, char **argv)
 {
     const char *key = " ";
-    const char *stop = "=>\\s*$|U-Boot>\\s*$";   /* common U-Boot prompts */
+    const char *stop = "=>[[:space:]]*$|U-Boot>[[:space:]]*$";
     int interval_ms = SM_DEFAULT_FLOOD_INTERVAL_MS;
     int duration_ms = SM_DEFAULT_FLOOD_DURATION_MS;
     const char *reset_pin = NULL;        /* --reset dtr|rts (reset_and_interrupt) */
@@ -2116,6 +2211,186 @@ static int cmd_break_uboot(int argc, char **argv)
     return matched ? 0 : 2;   /* 2 = flooded but no prompt (timeout) */
 }
 
+/* Explicit -s path from the global options, for commands that manage a broker
+ * without connecting through the needs_broker path (shutdown). */
+static const char *g_socket_arg;
+
+/* Stop one broker cleanly: probe its pid, SIGTERM, wait for the socket to
+ * disappear. Uses the explicit -s path, or the sole running broker; with
+ * several brokers up it refuses and lists them (never guess a kill target). */
+static int cmd_shutdown(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+
+    char sock[SM_SOCK_PATH_MAX];
+    if (g_socket_arg) {
+        snprintf(sock, sizeof(sock), "%s", g_socket_arg);
+    } else {
+        char paths[16][SM_SOCK_PATH_MAX];
+        size_t n = sm_discover_all_sockets(paths, 16);
+        if (n == 0) {
+            fprintf(stderr, "error: no broker socket found\n"
+                    "  Use -s <path> or start a broker first\n");
+            return 1;
+        }
+        if (n > 1) {
+            size_t shown = n < 16 ? n : 16;
+            fprintf(stderr, "error: %zu brokers running — pick one with -s:\n", n);
+            for (size_t i = 0; i < shown; i++)
+                fprintf(stderr, "  %s\n", paths[i]);
+            return 1;
+        }
+        snprintf(sock, sizeof(sock), "%s", paths[0]);
+    }
+
+    int pid = -1;
+    char err[256];
+    int timeout = cli.timeout_ms > 0 ? cli.timeout_ms : 5000;
+    if (sm_broker_stop_by_socket(sock, timeout, &pid, err, sizeof(err)) != 0) {
+        fprintf(stderr, "error: %s\n", err);
+        return 1;
+    }
+    printf("Stopped broker pid %d (%s removed).\n", pid, sock);
+    return 0;
+}
+
+static int proc_ppid(int pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    char buf[512];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    char *rp = strrchr(buf, ')');
+    if (!rp)
+        return -1;
+    char state;
+    int ppid;
+    if (sscanf(rp + 1, " %c %d", &state, &ppid) != 2)
+        return -1;
+    return ppid;
+}
+
+/* Reap leftover MCP stdio servers. Default: orphans (ppid 1) and dead pids.
+ * --mcp SIGTERMs every *-mcp client. --dry-run lists only. */
+static int cmd_gc(int argc, char **argv)
+{
+    int dry = 0, kill_mcp = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0)
+            dry = 1;
+        else if (strcmp(argv[i], "--mcp") == 0)
+            kill_mcp = 1;
+        else {
+            fprintf(stderr,
+                    "usage: smolmux-cli gc [--dry-run] [--mcp]\n"
+                    "  Default: SIGTERM dead or orphaned (ppid 1) MCP clients.\n"
+                    "  --mcp      SIGTERM every *-mcp / claude-mcp client\n"
+                    "  --dry-run  list only\n");
+            return 1;
+        }
+    }
+
+    char socks[32][SM_SOCK_PATH_MAX];
+    size_t n;
+    if (g_socket_arg) {
+        snprintf(socks[0], sizeof(socks[0]), "%s", g_socket_arg);
+        n = 1;
+    } else {
+        n = sm_discover_all_sockets(socks, 32);
+        if (n > 32)
+            n = 32;
+    }
+    if (n == 0) {
+        fprintf(stderr, "error: no broker socket found\n");
+        return 1;
+    }
+
+    int listed = 0, killed = 0;
+    for (size_t i = 0; i < n; i++) {
+        sm_broker_info_t info;
+        if (sm_broker_probe(socks[i], &info, 800) != 0 || !info.reachable)
+            continue;
+
+        int mcp_named = 0, have_mcp_pid = 0;
+        for (int k = 0; k < info.client_name_n; k++) {
+            if (!sm_client_name_is_mcp(info.client_name[k]))
+                continue;
+            mcp_named = 1;
+            if (info.client_pid[k] > 0)
+                have_mcp_pid = 1;
+        }
+        if (!mcp_named)
+            continue;
+
+        if (!have_mcp_pid) {
+            /* Old broker: status has no peer pid. SOCK_DIAG + /proc. */
+            int pids[32];
+            int np = sm_unix_mcp_peer_pids(socks[i], info.pid, pids, 32);
+            if (np < 0)
+                printf("%s  (broker reports MCP clients but no pids; "
+                       "cannot list socket peers)\n",
+                       socks[i]);
+            else if (np == 0)
+                printf("%s  (broker reports MCP clients but no pids; "
+                       "no smolmux-mcp process holds this socket)\n",
+                       socks[i]);
+            for (int k = 0; k < np; k++) {
+                int pid = pids[k];
+                int alive = kill(pid, 0) == 0;
+                int ppid = alive ? proc_ppid(pid) : -1;
+                int do_kill = sm_gc_should_kill("smolmux-mcp", alive, ppid,
+                                                kill_mcp);
+                printf("%s  smolmux-mcp  pid=%d  ppid=%d  %s%s\n",
+                       socks[i], pid, ppid,
+                       do_kill ? "KILL" : "keep",
+                       dry ? " (dry-run)" : "");
+                listed++;
+                if (do_kill && !dry && pid > 0) {
+                    if (kill(pid, SIGTERM) == 0)
+                        killed++;
+                    else
+                        fprintf(stderr, "  SIGTERM %d: %s\n", pid,
+                                strerror(errno));
+                }
+            }
+            continue;
+        }
+
+        for (int k = 0; k < info.client_name_n; k++) {
+            const char *nm = info.client_name[k];
+            int pid = info.client_pid[k];
+            if (!sm_client_name_is_mcp(nm))
+                continue;
+            int alive = pid > 0 && kill(pid, 0) == 0;
+            int ppid = alive ? proc_ppid(pid) : -1;
+            int do_kill = sm_gc_should_kill(nm, alive, ppid, kill_mcp);
+            printf("%s  %s  pid=%d  ppid=%d  %s%s\n",
+                   socks[i], nm, pid, ppid,
+                   do_kill ? "KILL" : "keep",
+                   dry ? " (dry-run)" : "");
+            listed++;
+            if (do_kill && !dry && pid > 0) {
+                if (kill(pid, SIGTERM) == 0)
+                    killed++;
+                else
+                    fprintf(stderr, "  SIGTERM %d: %s\n", pid, strerror(errno));
+            }
+        }
+    }
+    if (listed == 0)
+        printf("No MCP clients found.\n");
+    else if (!dry)
+        printf("Signaled %d process%s.\n", killed, killed == 1 ? "" : "es");
+    return 0;
+}
+
 static const subcmd_t subcmds[] = {
     {"send",       cmd_send,       1, "controller"},
     {"read",       cmd_read,       1, "observer"},
@@ -2128,6 +2403,9 @@ static const subcmd_t subcmds[] = {
     {"brokers",    cmd_brokers,    0, NULL},
     {"boards",     cmd_boards,     0, NULL},
     {"board",      cmd_board,      0, NULL},
+    {"shutdown",   cmd_shutdown,   0, NULL},
+    {"stop",       cmd_shutdown,   0, NULL},
+    {"gc",         cmd_gc,         0, NULL},
     {"sysrq",      cmd_sysrq,     1, "controller"},
     {"break-uboot", cmd_break_uboot, 1, "controller"},
     {"pin",        cmd_pin,       1, "controller"},
@@ -2165,7 +2443,7 @@ int main(int argc, char *argv[])
     /* Use '+' prefix to stop at first non-option */
     while ((opt = getopt_long(argc, argv, "+s:jt:vVh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 's': socket_path = optarg; break;
+        case 's': socket_path = optarg; g_socket_arg = optarg; break;
         case 'j': cli.json_output = 1; break;
         case 't': cli.timeout_ms = atoi(optarg); break;
         case 'v': cli.verbose = 1; break;
@@ -2216,8 +2494,16 @@ int main(int argc, char *argv[])
     if (cmd->needs_broker) {
         char discovered[108];
         if (!socket_path) {
+            int env_pin = getenv(SM_SOCKET_ENV) && getenv(SM_SOCKET_ENV)[0];
+            if (sm_autodiscover_should_refuse(env_pin)) {
+                fprintf(stderr,
+                        "error: multiple brokers; pass -s <socket> "
+                        "(first-glob is a wrong-board magnet)\n"
+                        "  smolmux-cli brokers    # list sockets\n");
+                return 1;
+            }
             if (sm_discover_socket(discovered, sizeof(discovered)) == 0) {
-                socket_path = discovered;
+                socket_path = discovered;   /* g_socket_arg stays NULL: explicit -s only */
             } else {
                 fprintf(stderr, "error: no broker socket found\n"
                         "  Use -s <path>, set $SMOLMUX_SOCKET, or start a broker\n");

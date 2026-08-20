@@ -56,6 +56,9 @@ int sm_anomaly_add_pattern(sm_anomaly_detector_t *det,
 size_t sm_anomaly_feed(sm_anomaly_detector_t *det,
                        const uint8_t *data, size_t len, double ts);
 
+/* Drop the sliding window (keep patterns). Call on a new link session. */
+void sm_anomaly_reset_window(sm_anomaly_detector_t *det);
+
 /* Get recent incidents */
 const sm_anomaly_incident_t *sm_anomaly_get_incidents(const sm_anomaly_detector_t *det,
                                                       size_t *count);

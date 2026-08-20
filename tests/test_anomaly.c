@@ -1,6 +1,8 @@
 #include "test_main.h"
 #include "anomaly.h"
 
+#include <string.h>
+
 static void test_detect_kernel_panic(void)
 {
     sm_anomaly_detector_t det;
@@ -162,6 +164,145 @@ static void test_match_text_is_the_matched_line(void)
     sm_anomaly_destroy(&det);
 }
 
+/* Wave 2: ESP32/MCU builtins without a device profile. */
+static void test_esp32_guru_with_backtrace(void)
+{
+    sm_anomaly_detector_t det;
+    sm_anomaly_init(&det);
+    sm_anomaly_add_builtins(&det);
+
+    const char *blob =
+        "Guru Meditation Error: Core  0 panic'ed (LoadProhibited)\n"
+        "Backtrace: 0x400d1234:0x3ffb0000 0x400d5678:0x3ffb0020\n";
+    size_t n = sm_anomaly_feed(&det, (const uint8_t *)blob, strlen(blob),
+                               1000.0);
+    ASSERT_INT_EQ((int)n, 1);
+
+    size_t count;
+    const sm_anomaly_incident_t *incs = sm_anomaly_get_incidents(&det, &count);
+    ASSERT_INT_EQ((int)count, 1);
+    ASSERT_STR_EQ(incs[0].pattern_name, "guru_meditation");
+    ASSERT_STR_EQ(incs[0].severity, "critical");
+    ASSERT(strstr(incs[0].match_text, "Backtrace:") != NULL,
+           "match_text includes Backtrace line");
+
+    sm_anomaly_destroy(&det);
+}
+
+static void test_esp32_brownout_exactly_one(void)
+{
+    sm_anomaly_detector_t det;
+    sm_anomaly_init(&det);
+    sm_anomaly_add_builtins(&det);
+
+    const char *line = "Brownout detector was triggered\n";
+    size_t n = sm_anomaly_feed(&det, (const uint8_t *)line, strlen(line),
+                               1000.0);
+    ASSERT_INT_EQ((int)n, 1);
+
+    det.window_len = 0;
+    n = sm_anomaly_feed(&det, (const uint8_t *)line, strlen(line), 1001.0);
+    ASSERT_INT_EQ((int)n, 0);  /* cooldown */
+
+    size_t count;
+    sm_anomaly_get_incidents(&det, &count);
+    ASSERT_INT_EQ((int)count, 1);
+
+    sm_anomaly_destroy(&det);
+}
+
+static void test_esp32_task_wdt(void)
+{
+    sm_anomaly_detector_t det;
+    sm_anomaly_init(&det);
+    sm_anomaly_add_builtins(&det);
+
+    /* Short line: avoids also matching the generic watchdog regex
+     * (watchdog.*reset) via "watchdog … reset" spanning the longer banner. */
+    const char *line = "Task watchdog got triggered\n";
+    size_t n = sm_anomaly_feed(&det, (const uint8_t *)line, strlen(line),
+                               1000.0);
+    ASSERT(n >= 1, "task_wdt fires");
+
+    size_t count;
+    const sm_anomaly_incident_t *incs = sm_anomaly_get_incidents(&det, &count);
+    int saw = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(incs[i].pattern_name, "task_wdt") == 0) {
+            saw = 1;
+            ASSERT_STR_EQ(incs[i].severity, "warning");
+        }
+    }
+    ASSERT(saw, "task_wdt incident recorded");
+    ASSERT_INT_EQ((int)count, 1);  /* exactly one incident for this feed */
+
+    sm_anomaly_destroy(&det);
+}
+
+static void test_esp32_reset_line(void)
+{
+    sm_anomaly_detector_t det;
+    sm_anomaly_init(&det);
+    sm_anomaly_add_builtins(&det);
+
+    const char *line = "rst:0x10 (RTCWDT_RTC_RESET),boot:0x13\n";
+    size_t n = sm_anomaly_feed(&det, (const uint8_t *)line, strlen(line),
+                               1000.0);
+    ASSERT(n >= 1, "esp_reset fires on fresh detector");
+
+    size_t count;
+    const sm_anomaly_incident_t *incs = sm_anomaly_get_incidents(&det, &count);
+    int saw = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(incs[i].pattern_name, "esp_reset") == 0)
+            saw = 1;
+    }
+    ASSERT(saw, "esp_reset incident present");
+
+    sm_anomaly_destroy(&det);
+}
+
+static void test_pattern_name_replace_no_double(void)
+{
+    sm_anomaly_detector_t det;
+    sm_anomaly_init(&det);
+    sm_anomaly_add_builtins(&det);
+    size_t before = det.pattern_count;
+
+    /* Same name as a builtin — replaces, does not grow the list. */
+    int rc = sm_anomaly_add_pattern(&det, "guru_meditation",
+                                    "Guru Meditation Error", "critical");
+    ASSERT_INT_EQ(rc, 0);
+    ASSERT_INT_EQ((int)det.pattern_count, (int)before);
+
+    size_t n = sm_anomaly_feed(&det,
+        (const uint8_t *)"Guru Meditation Error: boom\n", 28, 1000.0);
+    ASSERT_INT_EQ((int)n, 1);
+
+    size_t count;
+    sm_anomaly_get_incidents(&det, &count);
+    ASSERT_INT_EQ((int)count, 1);
+
+    sm_anomaly_destroy(&det);
+}
+
+/* Prefilter used strstr — a NUL mid-window blinded the next ~256 bytes. */
+static void test_nul_does_not_blind_prefilter(void)
+{
+    sm_anomaly_detector_t det;
+    sm_anomaly_init(&det);
+    sm_anomaly_add_builtins(&det);
+
+    uint8_t chunk[64];
+    memset(chunk, 'x', sizeof(chunk));
+    chunk[10] = 0;
+    memcpy(chunk + 20, "Kernel panic - not syncing", 26);
+    size_t n = sm_anomaly_feed(&det, chunk, 50, 2000.0);
+    ASSERT(n >= 1, "panic after embedded NUL still detected");
+
+    sm_anomaly_destroy(&det);
+}
+
 int main(void)
 {
     printf("test_anomaly\n");
@@ -175,6 +316,12 @@ int main(void)
     RUN_TEST(test_literal_prefilter_wdt);
     RUN_TEST(test_pre_context);
     RUN_TEST(test_match_text_is_the_matched_line);
+    RUN_TEST(test_esp32_guru_with_backtrace);
+    RUN_TEST(test_esp32_brownout_exactly_one);
+    RUN_TEST(test_esp32_task_wdt);
+    RUN_TEST(test_esp32_reset_line);
+    RUN_TEST(test_pattern_name_replace_no_double);
+    RUN_TEST(test_nul_does_not_blind_prefilter);
 
     TEST_REPORT();
 }

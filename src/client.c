@@ -145,12 +145,15 @@ size_t sm_client_feed(sm_client_t *c, sm_msg_t *out, size_t max_out)
         return 0;
     }
     ssize_t n = read(c->fd, c->read_buf + c->read_len, avail);
-    if (n <= 0) {
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        n = 0; /* still extract leftover complete lines */
+    else if (n <= 0) {
         if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
             c->disconnected = 1;
         return 0;
     }
-    c->read_len += (size_t)n;
+    if (n > 0)
+        c->read_len += (size_t)n;
 
     /* Extract complete lines */
     size_t count = 0;

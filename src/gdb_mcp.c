@@ -27,6 +27,7 @@
 #include "cJSON.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <glob.h>
 #include <poll.h>
@@ -371,14 +372,21 @@ static char *tool_breakpoint(cJSON *args)
     int temporary = sm_json_get_bool(args, "temporary", 0);
     if (!loc) return strdup("[ERROR] missing 'location'");
 
-    char cmd[640];
-    int n = snprintf(cmd, sizeof(cmd), "-break-insert");
-    if (temporary) n += snprintf(cmd + n, sizeof(cmd) - n, " -t");
-    if (cond && cond[0]) n += snprintf(cmd + n, sizeof(cmd) - n, " -c \"%s\"", cond);
-    snprintf(cmd + n, sizeof(cmd) - n, " %s", loc);
+    /* Growable buffer — fixed cmd[640] + snprintf return-value accumulation
+     * wrote past the stack array once condition made n > sizeof(cmd). */
+    sm_strbuf_t sb;
+    sm_strbuf_init(&sb);
+    sm_strbuf_printf(&sb, "-break-insert");
+    if (temporary)
+        sm_strbuf_append_str(&sb, " -t");
+    if (cond && cond[0])
+        sm_strbuf_printf(&sb, " -c \"%s\"", cond);
+    sm_strbuf_printf(&sb, " %s", loc);
+    char *cmd = sm_strbuf_steal(&sb);
 
     char cls[32];
     cJSON *r = gdb_mi_command(cmd, 5000, cls, sizeof(cls));
+    free(cmd);
     char *err = mi_error_text(r, cls);
     if (err) { if (r) cJSON_Delete(r); return err; }
 
@@ -999,7 +1007,12 @@ static int command_is_blocked(const char *cmd)
     while (*cmd >= '0' && *cmd <= '9') cmd++;      /* skip any MI token */
     while (*cmd == ' ' || *cmd == '\t') cmd++;
     if (*cmd == '!' || *cmd == '|') return 1;
-    static const char *const blocked[] = { "shell","pipe","python","guile","make" };
+    /* Mirrors gdb_code_exec_cmds in src/links/gdb.c — keep the two in step.
+     * "eval" runs its formatted argument as a command, so it reaches a shell
+     * without the word ever appearing contiguously. */
+    static const char *const blocked[] = {
+        "shell","pipe","python","guile","make","eval"
+    };
     for (size_t i = 0; i < sizeof(blocked)/sizeof(blocked[0]); i++) {
         size_t n = strlen(blocked[i]);
         if (strncmp(cmd, blocked[i], n) == 0 &&
@@ -1255,38 +1268,132 @@ static void slugify(const char *in, char *out, size_t n)
     if (o == 0) snprintf(out, n, "unknown");
 }
 
-/* Expand a leading "~/" to $HOME. */
-static void expand_path(const char *in, char *out, size_t n)
+/* The one directory this tool may write to: where profiles are auto-
+ * discovered from anyway (sm_profile_resolve_path globs it non-recursively). */
+static int profile_dir(char *out, size_t n)
 {
-    if (in[0] == '~' && in[1] == '/') {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return -1;
+    snprintf(out, n, SM_PROFILE_CONFIG_DIR_FMT, home);
+    return 0;
+}
+
+/*
+ * Turn the caller-supplied "path" into a concrete file to write, or refuse.
+ *
+ * The caller here is an AI agent, so "whatever string arrived in the tool
+ * arguments" is not a safe filename. Previously this expanded "~/" and handed
+ * the result straight to a truncating fopen(path,"wb") after mkdir -p'ing
+ * every parent, which let a confused or prompt-injected agent overwrite any
+ * file the user could write -- ~/.bashrc, a source file, a git object -- and
+ * silently create directory trees on the way.
+ *
+ * Accepted now: a bare filename, or a path that lands directly in the profile
+ * directory. Anything with a ".." component is refused outright rather than
+ * normalised, and a subdirectory is refused because profile discovery does
+ * not recurse, so writing there would produce a file nothing can load.
+ *
+ * Returns 0 and fills out[]; on refusal returns -1 and fills why[].
+ */
+static int resolve_profile_write_path(const char *spec, char *out, size_t n,
+                                      char *why, size_t why_n)
+{
+    char dir[400];
+    if (profile_dir(dir, sizeof(dir)) != 0) {
+        snprintf(why, why_n, "HOME is not set, so there is no profile "
+                             "directory to write to");
+        return -1;
+    }
+
+    /* Expand a leading "~/" the way the old behaviour did. */
+    char expanded[512];
+    if (spec[0] == '~' && spec[1] == '/') {
         const char *home = getenv("HOME");
-        snprintf(out, n, "%s/%s", home ? home : ".", in + 2);
+        snprintf(expanded, sizeof(expanded), "%s/%s", home, spec + 2);
     } else {
-        snprintf(out, n, "%s", in);
+        snprintf(expanded, sizeof(expanded), "%s", spec);
     }
+
+    /* Refuse traversal rather than trying to normalise it away. */
+    if (strcmp(expanded, "..") == 0 ||
+        strncmp(expanded, "../", 3) == 0 ||
+        strstr(expanded, "/../") != NULL ||
+        (strlen(expanded) >= 3 &&
+         strcmp(expanded + strlen(expanded) - 3, "/..") == 0)) {
+        snprintf(why, why_n, "path contains '..'");
+        return -1;
+    }
+
+    const char *base;
+    if (strchr(expanded, '/') == NULL) {
+        base = expanded;                       /* bare filename */
+    } else {
+        size_t dlen = strlen(dir);
+        if (strncmp(expanded, dir, dlen) != 0 || expanded[dlen] != '/') {
+            snprintf(why, why_n,
+                     "profiles may only be written to %s (got %s)",
+                     dir, expanded);
+            return -1;
+        }
+        base = expanded + dlen + 1;
+        if (base[0] == '\0' || strchr(base, '/') != NULL) {
+            snprintf(why, why_n,
+                     "write directly into %s, not a subdirectory — profile "
+                     "discovery does not recurse", dir);
+            return -1;
+        }
+    }
+
+    size_t blen = strlen(base);
+    size_t slen = strlen(SM_GDB_PROFILE_FILE_SUFFIX);
+    if (blen <= slen ||
+        strcmp(base + blen - slen, SM_GDB_PROFILE_FILE_SUFFIX) != 0) {
+        snprintf(why, why_n, "filename must end in %s",
+                 SM_GDB_PROFILE_FILE_SUFFIX);
+        return -1;
+    }
+
+    int len = snprintf(out, n, "%s/%s", dir, base);
+    if (len < 0 || (size_t)len >= n) {
+        snprintf(why, why_n, "path too long");
+        return -1;
+    }
+    return 0;
 }
 
-/* mkdir -p the parent directories of a file path (best effort). */
-static void mkdir_parents(const char *path)
+/* Write the profile. Creates the profile directory and its immediate parent
+ * (~/.config) if missing -- two known components, never the "mkdir -p every
+ * parent of whatever string arrived" the old code did. O_NOFOLLOW refuses a
+ * symlink planted at the target, and without overwrite O_EXCL refuses to
+ * clobber an existing profile at all. */
+static int write_profile_file(const char *path, const char *text, int overwrite)
 {
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/') continue;
-        *p = '\0';
-        mkdir(tmp, 0755);
-        *p = '/';
+    char dir[400];
+    if (profile_dir(dir, sizeof(dir)) == 0) {
+        char parent[400];
+        snprintf(parent, sizeof(parent), "%s", dir);
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent) {
+            *slash = '\0';
+            mkdir(parent, 0755);   /* ~/.config keeps conventional perms */
+        }
+        mkdir(dir, 0700);
     }
-}
 
-static int write_text_file(const char *path, const char *text)
-{
-    mkdir_parents(path);
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
+    int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC |
+                (overwrite ? O_TRUNC : O_EXCL);
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return -1;
+
     size_t len = strlen(text);
-    int ok = fwrite(text, 1, len, f) == len;
-    if (fclose(f) != 0) ok = 0;
+    size_t off = 0;
+    int ok = 1;
+    while (off < len) {
+        ssize_t w = write(fd, text + off, len - off);
+        if (w <= 0) { ok = 0; break; }
+        off += (size_t)w;
+    }
+    if (close(fd) != 0) ok = 0;
     return ok ? 0 : -1;
 }
 
@@ -1416,19 +1523,36 @@ static char *tool_generate_profile(cJSON *args)
 
     const char *path = sm_json_get_string(args, "path");
     if (path && path[0]) {
-        char expanded[512];
-        expand_path(path, expanded, sizeof(expanded));
+        char target[512], why[320];
         sm_strbuf_t sb;
         sm_strbuf_init(&sb);
-        if (write_text_file(expanded, pjson) == 0)
+
+        if (resolve_profile_write_path(path, target, sizeof(target),
+                                       why, sizeof(why)) != 0) {
+            /* Refusing still returns the profile inline, so the work is not
+             * lost and the caller can save it deliberately. */
+            sm_strbuf_printf(&sb,
+                "[ERROR] refused to write '%s': %s.\n"
+                "Pass a bare filename ending in %s, or omit path to get the "
+                "profile inline.\n\n",
+                path, why, SM_GDB_PROFILE_FILE_SUFFIX);
+        } else if (write_profile_file(target, pjson,
+                                      sm_json_get_bool(args, "overwrite", 0)) == 0) {
             sm_strbuf_printf(&sb,
                 "Saved auto-generated target profile to %s\n"
-                "Use it next session with `-p %s`, or drop it in "
-                "~/.config/smolmux/ for auto-discovery.\n\n", expanded, expanded);
-        else
+                "Use it next session with `-p %s` — it is already in the "
+                "auto-discovery directory.\n\n", target, target);
+        } else if (errno == EEXIST) {
             sm_strbuf_printf(&sb,
-                "[ERROR] could not write %s — profile returned inline:\n\n",
-                expanded);
+                "[ERROR] %s already exists — not overwriting. Pass "
+                "overwrite:true to replace it, or choose another name. "
+                "Profile returned inline:\n\n", target);
+        } else {
+            sm_strbuf_printf(&sb,
+                "[ERROR] could not write %s: %s — profile returned inline:\n\n",
+                target, strerror(errno));
+        }
+
         sm_strbuf_append_str(&sb, pjson);
         free(pjson);
         return sm_strbuf_steal(&sb);
@@ -1638,10 +1762,16 @@ static cJSON *build_gdb_tools_list(void)
         NULL, NULL, 0));
 
     props = cJSON_CreateObject();
-    add_str(props, "path", "Optional file path to write the profile to (e.g. "
-                           "~/.config/smolmux/mine.gdb-profile.json). '~/' is "
-                           "expanded; parent dirs are created. Omit to return "
-                           "the JSON inline only.");
+    add_str(props, "path", "Optional filename to save the profile as, e.g. "
+                           "'mine.gdb-profile.json'. Must end in "
+                           ".gdb-profile.json and is always written into the "
+                           "auto-discovery directory ~/.config/smolmux/ — a "
+                           "full path there is accepted, anywhere else is "
+                           "refused, and an existing file is never replaced "
+                           "unless overwrite is true. Omit to return the JSON "
+                           "inline only.");
+    add_bool(props, "overwrite", "Replace the file if it already exists "
+                                 "(default false).");
     add_str(props, "rtos", "Optional RTOS name (e.g. 'zephyr', 'freertos') to "
                            "stamp into the profile — not auto-detected over SWD.");
     cJSON_AddItemToArray(tools, tool_entry("gdb_generate_profile",
@@ -2158,10 +2288,30 @@ int main(int argc, char *argv[])
         SM_LOG_INFO(LOG_TAG, "connected to broker via %s", socket_path);
     }
 
+    /* A refused handshake has to be fatal and loud. Unlike the serial MCP
+     * server this one has no offline mode, so continuing into the poll loop
+     * on a socket the broker already dropped just exited rc=0 with no output
+     * at all — the operator saw a dead server and no reason for it. */
     sm_broker_conn_send(&g.conn, sm_msg_hello(g.name, "controller"));
     cJSON *welcome = sm_broker_conn_wait(&g.conn, NULL, 5000);
-    if (welcome) cJSON_Delete(welcome);
-    else SM_LOG_WARN(LOG_TAG, "no welcome received from broker");
+    if (!welcome) {
+        SM_LOG_ERROR(LOG_TAG, "broker did not answer the hello handshake");
+        return 1;
+    }
+    {
+        const char *wtype = sm_json_get_string(welcome, "type");
+        if (!wtype || strcmp(wtype, "welcome") != 0) {
+            const char *why = sm_json_get_string(welcome, "message");
+            SM_LOG_ERROR(LOG_TAG,
+                         "broker rejected this client: %s. If the broker runs "
+                         "with --auth-token, export the same SMOLMUX_AUTH_TOKEN "
+                         "for this MCP server.",
+                         why && why[0] ? why : "handshake refused");
+            cJSON_Delete(welcome);
+            return 1;
+        }
+    }
+    cJSON_Delete(welcome);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

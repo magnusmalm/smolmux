@@ -8,6 +8,7 @@
 #include "util/json_helpers.h"
 #include "util/shared_line.h"
 #include "util/sock_util.h"
+#include "constants.h"
 
 #include <pthread.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #define TEST_SOCK "/tmp/smolmux-test.sock"
 #define STARTUP_DELAY 150000  /* 150ms */
@@ -62,28 +64,44 @@ static void send_json(int fd, cJSON *msg)
     cJSON_Delete(msg);
 }
 
+/* Per-fd leftover so a single read() that coalesced multiple NDJSON lines
+ * does not drop everything after the first message (Wave 2 abort tests
+ * batch anomaly + expect_result + output into one kernel read). */
+static char recv_leftover[16384];
+static size_t recv_leftover_len;
+static int recv_leftover_fd = -1;
+
 static sm_msg_t recv_json(int fd)
 {
-    char buf[8192];
-    size_t total = 0;
+    if (fd != recv_leftover_fd) {
+        recv_leftover_fd = fd;
+        recv_leftover_len = 0;
+    }
 
-    /* Read until we get a newline */
     for (int attempts = 0; attempts < 50; attempts++) {
-        ssize_t n = read(fd, buf + total, sizeof(buf) - total - 1);
-        if (n > 0) {
-            total += (size_t)n;
-            buf[total] = '\0';
-            if (memchr(buf, '\n', total))
-                break;
+        char *nl = memchr(recv_leftover, '\n', recv_leftover_len);
+        if (nl) {
+            size_t line_len = (size_t)(nl - recv_leftover);
+            sm_msg_t msg = sm_msg_decode(recv_leftover, line_len + 1);
+            size_t rest = recv_leftover_len - line_len - 1;
+            memmove(recv_leftover, nl + 1, rest);
+            recv_leftover_len = rest;
+            return msg;
         }
-        usleep(10000);
+        if (recv_leftover_len >= sizeof(recv_leftover) - 1) {
+            /* Line too long — drop and resync */
+            recv_leftover_len = 0;
+        }
+        ssize_t n = read(fd, recv_leftover + recv_leftover_len,
+                         sizeof(recv_leftover) - recv_leftover_len - 1);
+        if (n > 0)
+            recv_leftover_len += (size_t)n;
+        else
+            usleep(10000);
     }
 
-    if (total == 0) {
-        sm_msg_t empty = {SM_MSG_UNKNOWN, NULL};
-        return empty;
-    }
-    return sm_msg_decode(buf, total);
+    sm_msg_t empty = {SM_MSG_UNKNOWN, NULL};
+    return empty;
 }
 
 typedef struct test_ctx {
@@ -130,6 +148,235 @@ static void teardown(test_ctx_t *ctx)
     sm_broker_destroy(&ctx->broker);
     close(ctx->master);
     close(ctx->slave);
+}
+
+/* --- sm_broker_stop_by_socket: real child process, SIGTERM path --- */
+
+static sm_broker_t g_child_broker;
+
+static void child_sigterm(int sig)
+{
+    (void)sig;
+    sm_broker_stop(&g_child_broker);
+}
+
+/* Fork a child running a real broker on a fresh PTY, mimicking main.c's
+ * SIGTERM handler -> sm_broker_stop -> clean teardown (socket unlinked).
+ * Parent keeps the PTY master open for the test's duration. */
+static pid_t fork_broker_process(const char *sock, int *master_out,
+                                 char *slave_name_out, size_t slave_name_len)
+{
+    int master = -1, slave = -1;
+    if (openpty(&master, &slave, NULL, NULL, NULL) != 0)
+        return -1;
+    if (slave_name_out)
+        snprintf(slave_name_out, slave_name_len, "%s", ttyname(slave));
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = child_sigterm;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM, &sa, NULL);
+
+        char *slave_name = ttyname(slave);
+        sm_link_t *link = sm_uart_new(slave_name, 115200, 0);
+        sm_broker_init(&g_child_broker, link, sock);
+        snprintf(g_child_broker.port, sizeof(g_child_broker.port), "%s",
+                 slave_name);
+        g_child_broker.baudrate = 115200;
+        broker_thread(&g_child_broker);
+        sm_broker_destroy(&g_child_broker);
+        _exit(0);
+    }
+    close(slave);
+    *master_out = master;
+    return pid;
+}
+
+static void stop_test_sock_path(char *out, size_t len, const char *tag)
+{
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0])
+        tmp = "/tmp";
+    snprintf(out, len, "%s/test-broker-%s-%d.sock", tmp, tag, (int)getpid());
+}
+
+static void test_stop_by_socket(void)
+{
+    char sock[SM_SOCK_PATH_MAX];
+    stop_test_sock_path(sock, sizeof(sock), "stop");
+    unlink(sock);
+
+    int master = -1;
+    pid_t pid = fork_broker_process(sock, &master, NULL, 0);
+    ASSERT(pid > 0, "forked broker child");
+
+    int fd = -1;
+    for (int i = 0; i < 150; i++) {
+        fd = connect_unix(sock);
+        if (fd >= 0)
+            break;
+        usleep(20 * 1000);
+    }
+    ASSERT(fd >= 0, "child broker reachable");
+    if (fd >= 0)
+        close(fd);
+
+    int bpid = -1;
+    char err[256] = "";
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 5000, &bpid, err,
+                                           sizeof(err)), 0);
+    ASSERT_INT_EQ(bpid, (int)pid);
+
+    struct stat st;
+    ASSERT(stat(sock, &st) != 0 && errno == ENOENT,
+           "socket unlinked after stop");
+
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid, "child reaped");
+    ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "child exited cleanly");
+    close(master);
+
+    /* Second stop must fail loudly, not hang or invent a pid. */
+    err[0] = '\0';
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 1000, NULL, err,
+                                           sizeof(err)), -1);
+    ASSERT(strstr(err, "no broker socket") != NULL,
+           "second stop reports missing broker");
+}
+
+/* sm_broker_register_client_async() takes ownership of the fd a sink thread
+ * hands over. When the handover write fails the broker never learns about that
+ * fd, so the function must close it — otherwise every failed handover leaks a
+ * descriptor for the broker's lifetime. Provoke the failure deterministically
+ * by closing the pipe's read end so the write returns EPIPE (main() ignores
+ * SIGPIPE). */
+static void test_register_async_closes_fd_on_failed_handover(void)
+{
+    sm_broker_t b;
+    ASSERT_INT_EQ(sm_broker_init(&b, NULL, TEST_SOCK), 0);
+
+    /* Break the handover channel; clear the fd so destroy does not double
+     * close what we closed here. */
+    close(b.reg_pipe[0]);
+    b.reg_pipe[0] = -1;
+
+    int pair[2];
+    ASSERT_INT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+
+    sm_broker_register_client_async(&b, pair[0], 1);
+
+    /* Nothing allocates an fd between the close inside the function and this
+     * check, so the number cannot have been recycled — EBADF means closed. */
+    ASSERT(fcntl(pair[0], F_GETFD) == -1 && errno == EBADF,
+           "failed handover closes the fd instead of leaking it");
+    ASSERT_INT_EQ((int)b.client_count, 0);
+
+    close(pair[1]);
+    sm_broker_destroy(&b);
+}
+
+/* sm_find_broker_for_endpoint: direct path, by-id-style symlink, negative.
+ * Discovery only globs smolmux-*.sock under XDG_RUNTIME_DIR and /tmp, so the
+ * test broker lives in a private XDG dir with a glob-matching name. */
+static void test_find_broker_for_endpoint(void)
+{
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    /* 80 keeps xdg + "/smolmux-find-test.sock" inside SM_SOCK_PATH_MAX. */
+    char xdg[80];
+    snprintf(xdg, sizeof(xdg), "%s/smolmux-find-xdg-%d", tmpdir, (int)getpid());
+    ASSERT(mkdir(xdg, 0700) == 0 || errno == EEXIST, "mkdir private XDG");
+    char saved_xdg[256] = {0};
+    const char *prev_xdg = getenv("XDG_RUNTIME_DIR");
+    if (prev_xdg)
+        snprintf(saved_xdg, sizeof(saved_xdg), "%s", prev_xdg);
+    setenv("XDG_RUNTIME_DIR", xdg, 1);
+
+    char sock[SM_SOCK_PATH_MAX];
+    snprintf(sock, sizeof(sock), "%s/smolmux-find-test.sock", xdg);
+    unlink(sock);
+
+    int master = -1;
+    char slave_name[128] = "";
+    pid_t pid = fork_broker_process(sock, &master, slave_name,
+                                    sizeof(slave_name));
+    ASSERT(pid > 0, "forked broker child");
+    ASSERT(slave_name[0], "captured pty slave name");
+
+    int fd = -1;
+    for (int i = 0; i < 150; i++) {
+        fd = connect_unix(sock);
+        if (fd >= 0)
+            break;
+        usleep(20 * 1000);
+    }
+    ASSERT(fd >= 0, "child broker reachable");
+    if (fd >= 0)
+        close(fd);
+
+    sm_broker_info_t info;
+    memset(&info, 0, sizeof(info));
+    ASSERT_INT_EQ(sm_find_broker_for_endpoint(slave_name, &info, 800), 0);
+    ASSERT_STR_EQ(info.socket, sock);
+    ASSERT_INT_EQ(info.pid, (int)pid);
+
+    /* A by-id-style symlink to the same device must match via realpath. */
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0])
+        tmp = "/tmp";
+    char link_path[256];
+    snprintf(link_path, sizeof(link_path), "%s/test-byid-link-%d", tmp,
+             (int)getpid());
+    unlink(link_path);
+    ASSERT_INT_EQ(symlink(slave_name, link_path), 0);
+    memset(&info, 0, sizeof(info));
+    ASSERT_INT_EQ(sm_find_broker_for_endpoint(link_path, &info, 800), 0);
+    ASSERT_STR_EQ(info.socket, sock);
+    unlink(link_path);
+
+    /* A port nobody holds finds nothing. */
+    ASSERT_INT_EQ(sm_find_broker_for_endpoint("/dev/null", NULL, 800), -1);
+
+    char err[256] = "";
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 5000, NULL, err,
+                                           sizeof(err)), 0);
+    int status = 0;
+    ASSERT(waitpid(pid, &status, 0) == pid, "child reaped");
+    close(master);
+
+    if (prev_xdg)
+        setenv("XDG_RUNTIME_DIR", saved_xdg, 1);
+    else
+        unsetenv("XDG_RUNTIME_DIR");
+    rmdir(xdg);
+}
+
+static void test_stop_by_socket_stale(void)
+{
+    char sock[SM_SOCK_PATH_MAX];
+    stop_test_sock_path(sock, sizeof(sock), "stale");
+    unlink(sock);
+
+    /* Bind then close without unlinking: the file remains, nobody listens. */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    ASSERT(fd >= 0, "socket created");
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock);
+    ASSERT_INT_EQ(bind(fd, (struct sockaddr *)&addr, sizeof(addr)), 0);
+    close(fd);
+
+    char err[256] = "";
+    ASSERT_INT_EQ(sm_broker_stop_by_socket(sock, 1000, NULL, err,
+                                           sizeof(err)), -1);
+    ASSERT(strstr(err, "not responding") != NULL, "stale socket reported");
+    unlink(sock);
 }
 
 /* --- Tests --- */
@@ -359,6 +606,7 @@ static void test_send_expect_timeout(void)
         if (msg.type == SM_MSG_EXPECT_RESULT) {
             found_result = 1;
             ASSERT_INT_EQ(sm_json_get_bool(msg.root, "matched", 0), 0);
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "aborted", 0), 0);
             sm_msg_free(&msg);
             break;
         }
@@ -367,6 +615,337 @@ static void test_send_expect_timeout(void)
     ASSERT(found_result, "received timeout expect_result");
 
     close(fd);
+    teardown(&ctx);
+}
+
+/* Wave 2: critical serial anomaly aborts a long expect early. */
+static void test_expect_aborted_by_critical_anomaly(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("test", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    /* Long timeout — must not wait it out. */
+    send_json(fd, sm_msg_send_expect("e-abort", (const uint8_t *)"cmd\n", 4,
+                                      "never_match_this_pattern", 10000));
+
+    usleep(50000);
+    char buf[256];
+    read(ctx.master, buf, sizeof(buf));
+
+    /* Critical builtin (no profile required). */
+    const char *panic = "Guru Meditation Error: Core 0 panic'ed\n";
+    write(ctx.master, panic, strlen(panic));
+    usleep(200000);
+
+    sm_msg_t msg;
+    int found_result = 0;
+    for (int i = 0; i < 40; i++) {
+        msg = recv_json(fd);
+        if (!msg.root) continue;
+        if (msg.type == SM_MSG_EXPECT_RESULT) {
+            found_result = 1;
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "matched", 0), 0);
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "aborted", 0), 1);
+            ASSERT_STR_EQ(sm_json_get_string(msg.root, "abort_reason"),
+                          "anomaly");
+            ASSERT_STR_EQ(sm_json_get_string(msg.root, "abort_pattern"),
+                          "guru_meditation");
+            sm_msg_free(&msg);
+            break;
+        }
+        sm_msg_free(&msg);
+    }
+    ASSERT(found_result, "received aborted expect_result");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* Wave 3: observer may listen_expect; no TX on the wire. */
+static void test_listen_expect_observer(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("obs", "observer"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    /* Observer cannot send */
+    send_json(fd, sm_msg_send("s1", (const uint8_t *)"nope\n", 5));
+    sm_msg_t err = recv_json(fd);
+    ASSERT(err.root != NULL, "got error for observer send");
+    ASSERT_INT_EQ(err.type, SM_MSG_ERROR);
+    sm_msg_free(&err);
+
+    send_json(fd, sm_msg_listen_expect("L1", "READY", 5000));
+    usleep(50000);
+    /* No bytes should have been written for listen_expect */
+    fcntl(ctx.master, F_SETFL, O_NONBLOCK);
+    char junk[64];
+    ssize_t rn = read(ctx.master, junk, sizeof(junk));
+    ASSERT(rn < 0 || rn == 0, "listen_expect wrote nothing to device");
+
+    write(ctx.master, "boot READY now\n", 15);
+    usleep(150000);
+
+    int found = 0;
+    for (int i = 0; i < 40; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) continue;
+        if (msg.type == SM_MSG_EXPECT_RESULT) {
+            found = 1;
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "matched", 0), 1);
+            sm_msg_free(&msg);
+            break;
+        }
+        sm_msg_free(&msg);
+    }
+    ASSERT(found, "observer listen_expect got match");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* Wave 3: history_request with since_seq returns cursor metadata. */
+static void test_history_since_seq(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("c", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    write(ctx.master, "hello-history-seq\n", 18);
+    usleep(100000);
+    /* Drain output notifications */
+    for (int i = 0; i < 5; i++) {
+        sm_msg_t m = recv_json(fd);
+        if (!m.root) break;
+        sm_msg_free(&m);
+    }
+
+    send_json(fd, sm_msg_history_request_seq("h1", 0, 0));
+    usleep(100000);
+
+    int found = 0;
+    for (int i = 0; i < 20; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) continue;
+        if (msg.type == SM_MSG_HISTORY_RESPONSE) {
+            found = 1;
+            ASSERT(sm_json_get_double(msg.root, "cursor", -1.0) >= 0.0,
+                   "cursor present");
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "has_more", 1), 0);
+            cJSON *chunks = cJSON_GetObjectItemCaseSensitive(msg.root, "chunks");
+            ASSERT(cJSON_IsArray(chunks) && cJSON_GetArraySize(chunks) >= 1,
+                   "chunks non-empty");
+            sm_msg_free(&msg);
+            break;
+        }
+        sm_msg_free(&msg);
+    }
+    ASSERT(found, "history_response with since_seq");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+static void test_history_since_seq_negative_clamped(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("c", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+    write(ctx.master, "neg-seq\n", 8);
+    usleep(80000);
+    for (int i = 0; i < 5; i++) {
+        sm_msg_t m = recv_json(fd);
+        if (!m.root) break;
+        sm_msg_free(&m);
+    }
+    const char *raw =
+        "{\"type\":\"history_request\",\"id\":\"hn\",\"since_seq\":-1}\n";
+    ASSERT(write(fd, raw, strlen(raw)) == (ssize_t)strlen(raw), "wrote");
+    usleep(80000);
+    int found = 0;
+    for (int i = 0; i < 20; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) continue;
+        if (msg.type == SM_MSG_HISTORY_RESPONSE) {
+            found = 1;
+            ASSERT(sm_json_get_double(msg.root, "cursor", -1.0) >= 0.0,
+                   "negative since_seq did not wrap");
+            sm_msg_free(&msg);
+            break;
+        }
+        sm_msg_free(&msg);
+    }
+    ASSERT(found, "history_response after negative since_seq");
+    close(fd);
+    teardown(&ctx);
+}
+
+/* Warning-level anomaly (esp_reset) must not abort expects. */
+static void test_expect_not_aborted_by_warning_anomaly(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("test", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    send_json(fd, sm_msg_send_expect("e-warn", (const uint8_t *)"cmd\n", 4,
+                                      "never_match_this_pattern", 200));
+
+    usleep(30000);
+    char buf[256];
+    read(ctx.master, buf, sizeof(buf));
+    write(ctx.master, "rst:0x1 (POWERON_RESET),boot:0x13\n", 34);
+    usleep(400000);  /* past the 200ms timeout */
+
+    sm_msg_t msg;
+    int found_result = 0;
+    for (int i = 0; i < 40; i++) {
+        msg = recv_json(fd);
+        if (!msg.root) continue;
+        if (msg.type == SM_MSG_EXPECT_RESULT) {
+            found_result = 1;
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "matched", 0), 0);
+            ASSERT_INT_EQ(sm_json_get_bool(msg.root, "aborted", 0), 0);
+            sm_msg_free(&msg);
+            break;
+        }
+        sm_msg_free(&msg);
+    }
+    ASSERT(found_result, "received timeout (not abort) expect_result");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* pin_control forwarded any client-supplied key straight to link->set_param(),
+ * which reaches every parameter a link implements. On a GDB link that included
+ * allow_shell, so a controller could switch the code-exec guard off with one
+ * message — an opt-in that was only ever meant to be the operator's call
+ * (now --gdb-allow-shell). The wire protocol documents pin as <dtr|rts|break>;
+ * anything else must be refused rather than passed through. */
+static void test_pin_control_rejects_non_pin_keys(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("pin-test", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    /* The one that mattered, plus other link params that are not pins. */
+    static const char *const not_pins[] = {
+        "allow_shell", "target", "baud", "parity", "flow_control",
+    };
+    for (size_t i = 0; i < sizeof(not_pins) / sizeof(not_pins[0]); i++) {
+        send_json(fd, sm_msg_pin_control("p1", not_pins[i], "1", 0));
+        sm_msg_t resp = recv_json(fd);
+        ASSERT_NOT_NULL(resp.root);
+        ASSERT_INT_EQ(resp.type, SM_MSG_ERROR);
+        sm_msg_free(&resp);
+    }
+
+    /* A real line control must still reach the link. It cannot be asserted by
+     * success here: the fixture's link is a PTY, and PTYs reject the modem
+     * ioctls, so TIOCMBIS fails and the broker answers "pin control failed".
+     * The discriminator is which failure — reaching the link and failing there
+     * is the gate letting it through; "unknown pin" would be the gate eating
+     * it. */
+    send_json(fd, sm_msg_pin_control("p2", "dtr", "set", 0));
+    sm_msg_t dtr = recv_json(fd);
+    ASSERT_NOT_NULL(dtr.root);
+    if (dtr.root) {
+        const char *m = sm_json_get_string(dtr.root, "message");
+        ASSERT(dtr.type != SM_MSG_ERROR ||
+               (m && strstr(m, "unknown pin") == NULL),
+               "dtr reaches the link rather than being rejected as unknown");
+    }
+    sm_msg_free(&dtr);
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* Autoresponder response bytes are where credentials live — answering a login
+ * prompt is an advertised use. Installing a rule needs controller rights, so
+ * reading one back must too; an observer previously got the secret. The rule
+ * also outlives its creator by design, so it carries attribution. */
+static void test_autoresponder_secret_not_readable_by_observer(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int ctl = connect_unix(TEST_SOCK);
+    send_json(ctl, sm_msg_hello("boss", "controller"));
+    sm_msg_t w = recv_json(ctl);
+    sm_msg_free(&w);
+
+    cJSON *cfg = cJSON_CreateObject();
+    cJSON_AddStringToObject(cfg, "type", "configure_autoresponder");
+    cJSON_AddStringToObject(cfg, "id", "c1");
+    cJSON_AddStringToObject(cfg, "name", "login");
+    cJSON_AddStringToObject(cfg, "pattern", "login:");
+    cJSON_AddStringToObject(cfg, "response_b64", "aHVudGVyMgo=");  /* hunter2\n */
+    send_json(ctl, cfg);
+    sm_msg_t ack = recv_json(ctl);
+    sm_msg_free(&ack);
+
+    /* Controller sees the bytes and the attribution. */
+    cJSON *q = cJSON_CreateObject();
+    cJSON_AddStringToObject(q, "type", "autoresponders_request");
+    cJSON_AddStringToObject(q, "id", "q1");
+    send_json(ctl, q);
+    sm_msg_t cr = recv_json(ctl);
+    ASSERT_NOT_NULL(cr.root);
+    if (cr.root) {
+        cJSON *r0 = cJSON_GetArrayItem(cJSON_GetObjectItem(cr.root, "rules"), 0);
+        ASSERT_STR_EQ(sm_json_get_string(r0, "response_b64"), "aHVudGVyMgo=");
+        ASSERT_STR_EQ(sm_json_get_string(r0, "created_by"), "boss");
+    }
+    sm_msg_free(&cr);
+
+    /* Observer gets the length, never the secret. */
+    int obs = connect_unix(TEST_SOCK);
+    send_json(obs, sm_msg_hello("nosy", "observer"));
+    sm_msg_t w2 = recv_json(obs);
+    sm_msg_free(&w2);
+
+    cJSON *q2 = cJSON_CreateObject();
+    cJSON_AddStringToObject(q2, "type", "autoresponders_request");
+    cJSON_AddStringToObject(q2, "id", "q2");
+    send_json(obs, q2);
+    sm_msg_t orr = recv_json(obs);
+    ASSERT_NOT_NULL(orr.root);
+    if (orr.root) {
+        cJSON *r0 = cJSON_GetArrayItem(cJSON_GetObjectItem(orr.root, "rules"), 0);
+        ASSERT_NULL(cJSON_GetObjectItem(r0, "response_b64"));
+        ASSERT_INT_EQ(sm_json_get_int(r0, "response_len", -1), 8);
+        /* Still useful: the observer can see a rule exists and who left it. */
+        ASSERT_STR_EQ(sm_json_get_string(r0, "created_by"), "boss");
+    }
+    sm_msg_free(&orr);
+
+    close(ctl);
+    close(obs);
     teardown(&ctx);
 }
 
@@ -431,6 +1010,10 @@ static void test_status_query(void)
     ASSERT_NOT_NULL(resp.root);
     ASSERT_INT_EQ(resp.type, SM_MSG_STATUS_RESPONSE);
     ASSERT_INT_EQ(sm_json_get_bool(resp.root, "connected", 0), 1);
+    ASSERT(sm_json_get_double(resp.root, "link_up_ts", 0.0) > 0.0,
+           "link_up_ts set after open");
+    ASSERT(sm_json_get_double(resp.root, "last_rx_age_ms", -1.0) >= 0.0,
+           "last_rx_age_ms present");
     sm_msg_free(&resp);
 
     close(fd);
@@ -987,6 +1570,145 @@ static void test_link_disconnect_reconnect(void)
     teardown(&ctx);
 }
 
+/* I1: after disconnect, history contains the fence — not only old login:. */
+static void test_history_fence_on_link_down(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    write(ctx.master, "login:\n", 7);
+    usleep(100000);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("hist", "observer"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    close(ctx.master);
+    ctx.master = -1;
+    usleep(300000);
+
+    for (int i = 0; i < 20; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) break;
+        int down = (msg.type == SM_MSG_LINK_DOWN);
+        sm_msg_free(&msg);
+        if (down) break;
+    }
+
+    send_json(fd, sm_msg_history_request("hf1", 0.0, 4096));
+    sm_msg_t resp = recv_json(fd);
+    ASSERT_NOT_NULL(resp.root);
+    ASSERT_INT_EQ(resp.type, SM_MSG_HISTORY_RESPONSE);
+    cJSON *chunks = cJSON_GetObjectItem(resp.root, "chunks");
+    ASSERT(cJSON_IsArray(chunks), "chunks array");
+    int saw_fence = 0;
+    int saw_login = 0;
+    cJSON *ch;
+    cJSON_ArrayForEach(ch, chunks) {
+        const char *b64 = sm_json_get_string(ch, "data");
+        if (!b64) continue;
+        size_t n = 0;
+        uint8_t *raw = sm_base64_decode(b64, strlen(b64), &n);
+        if (!raw) continue;
+        if (memmem(raw, n, "login:", 6))
+            saw_login = 1;
+        if (memmem(raw, n, "link down", 9))
+            saw_fence = 1;
+        free(raw);
+    }
+    sm_msg_free(&resp);
+    ASSERT(saw_login, "pre-down bytes still in ring");
+    ASSERT(saw_fence, "history JSON contains link-down fence");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* Disconnect then suspend must not reconnect while suspended (TIOCEXCL seize). */
+static void test_suspend_blocks_reconnect(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+    ctx.broker.reconnect = 1;
+    ctx.broker.reconnect_delay_s = 0;
+    ctx.broker.reconnect_next = 0;
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("ctl", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    close(ctx.master);
+    ctx.master = -1;
+    usleep(300000);
+
+    /* Drain link_down */
+    for (int i = 0; i < 20; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) break;
+        int down = (msg.type == SM_MSG_LINK_DOWN);
+        sm_msg_free(&msg);
+        if (down) break;
+    }
+    ASSERT(ctx.broker.link_disconnected == 1, "disconnected");
+
+    send_json(fd, sm_msg_suspend("su1"));
+    usleep(100000);
+    ASSERT(ctx.broker.suspended == 1, "suspended");
+
+    /* Force reconnect attempt window; must stay disconnected while suspended. */
+    ctx.broker.reconnect_next = 0;
+    usleep(200000);
+    ASSERT(ctx.broker.suspended == 1, "still suspended");
+    ASSERT(ctx.broker.link_disconnected == 1,
+           "must not reconnect while suspended");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+static int g_spy_open_calls;
+static int (*g_real_open)(sm_link_t *);
+
+static int spy_open(sm_link_t *self)
+{
+    g_spy_open_calls++;
+    return g_real_open ? g_real_open(self) : -1;
+}
+
+/* D1: weak by-id with empty last seat must not call open() on reconnect. */
+static void test_weak_empty_seat_refuses_reconnect_open(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    g_real_open = ctx.link->open;
+    ctx.link->open = spy_open;
+    g_spy_open_calls = 0;
+
+    ctx.broker.reconnect = 1;
+    ctx.broker.identity_weak_by_id = 1;
+    ctx.broker.identity_by_path[0] = '\0';
+    ctx.broker.reconnect_delay_s = 0;
+    ctx.broker.reconnect_next = 0;
+
+    close(ctx.master);
+    ctx.master = -1;
+    usleep(300000);
+
+    ASSERT(ctx.broker.link_disconnected == 1, "disconnected");
+    ctx.broker.reconnect_next = 0;
+    usleep(250000);
+
+    ASSERT_INT_EQ(g_spy_open_calls, 0);
+    ASSERT(ctx.broker.link_disconnected == 1,
+           "must stay down when last seat is unset");
+
+    ctx.link->open = g_real_open;
+    teardown(&ctx);
+}
+
 static double mono_ms(void)
 {
     struct timespec ts;
@@ -1248,6 +1970,13 @@ static void test_broker_discover_and_json(void)
         ASSERT(sm_json_get_string(j, "endpoint") != NULL, "json has endpoint");
         ASSERT_STR_EQ(sm_json_get_string(j, "board"), "grpboard");
         ASSERT_STR_EQ(sm_json_get_string(j, "role"), "swd");
+        ASSERT(sm_json_get_string(j, "identity") != NULL, "json has identity");
+        ASSERT(cJSON_GetObjectItem(j, "identity_by_id") != NULL,
+               "json has identity_by_id");
+        ASSERT(cJSON_GetObjectItem(j, "identity_by_path") != NULL,
+               "json has identity_by_path");
+        ASSERT(cJSON_IsArray(cJSON_GetObjectItem(j, "client_names")),
+               "json has client_names");
         cJSON_Delete(j);
     }
 
@@ -1759,6 +2488,102 @@ static void test_boot_no_stall_when_complete(void)
     teardown(&ctx);
 }
 
+static void test_probe_does_not_leak_clients(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+    for (int i = 0; i < 20; i++) {
+        sm_broker_info_t info;
+        ASSERT_INT_EQ(sm_broker_probe(TEST_SOCK, &info, 800), 0);
+    }
+    sm_broker_info_t info;
+    ASSERT_INT_EQ(sm_broker_probe(TEST_SOCK, &info, 800), 0);
+    ASSERT_INT_EQ(info.client_count, 0);
+    teardown(&ctx);
+}
+
+static void test_killed_client_dropped(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        int fd = sm_connect_unix(TEST_SOCK);
+        if (fd < 0)
+            _exit(2);
+        cJSON *h = sm_msg_hello("zombie-hold", "observer");
+        size_t len = 0;
+        char *line = sm_msg_encode(h, &len);
+        cJSON_Delete(h);
+        if (line) {
+            sm_write_all(fd, line, len);
+            free(line);
+        }
+        for (;;)
+            pause();
+    }
+    usleep(200000);
+    sm_broker_info_t info;
+    ASSERT_INT_EQ(sm_broker_probe(TEST_SOCK, &info, 800), 0);
+    ASSERT_INT_EQ(info.client_count, 1);
+
+    kill(pid, SIGKILL);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    int gone = 0;
+    for (int i = 0; i < 30; i++) {
+        if (sm_broker_probe(TEST_SOCK, &info, 400) == 0 &&
+            info.client_count == 0) {
+            gone = 1;
+            break;
+        }
+        usleep(100000);
+    }
+    teardown(&ctx);
+    ASSERT(gone, "killed peer must leave the client table");
+}
+
+static void hello_named(int fd, const char *name)
+{
+    cJSON *h = sm_msg_hello(name, "observer");
+    size_t len = 0;
+    char *line = sm_msg_encode(h, &len);
+    cJSON_Delete(h);
+    if (line) {
+        sm_write_all(fd, line, len);
+        free(line);
+    }
+}
+
+static void test_hello_same_name_replaces(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd1 = sm_connect_unix(TEST_SOCK);
+    ASSERT(fd1 >= 0, "fd1");
+    hello_named(fd1, "claude-mcp");
+    usleep(80000);
+
+    int fd2 = sm_connect_unix(TEST_SOCK);
+    ASSERT(fd2 >= 0, "fd2");
+    hello_named(fd2, "claude-mcp");
+    usleep(80000);
+
+    sm_broker_info_t info;
+    ASSERT_INT_EQ(sm_broker_probe(TEST_SOCK, &info, 800), 0);
+    int n_mcp = 0;
+    for (int i = 0; i < info.client_name_n; i++)
+        if (strcmp(info.client_name[i], "claude-mcp") == 0)
+            n_mcp++;
+    close(fd1);
+    close(fd2);
+    teardown(&ctx);
+    ASSERT_INT_EQ(n_mcp, 1);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1772,6 +2597,13 @@ int main(void)
     RUN_TEST(test_observer_cannot_send);
     RUN_TEST(test_send_expect);
     RUN_TEST(test_send_expect_timeout);
+    RUN_TEST(test_expect_aborted_by_critical_anomaly);
+    RUN_TEST(test_expect_not_aborted_by_warning_anomaly);
+    RUN_TEST(test_listen_expect_observer);
+    RUN_TEST(test_history_since_seq);
+    RUN_TEST(test_history_since_seq_negative_clamped);
+    RUN_TEST(test_pin_control_rejects_non_pin_keys);
+    RUN_TEST(test_autoresponder_secret_not_readable_by_observer);
     RUN_TEST(test_takeover_release);
     RUN_TEST(test_status_query);
     RUN_TEST(test_broker_probe);
@@ -1790,6 +2622,9 @@ int main(void)
     RUN_TEST(test_coalesce_head_size_cap);
     RUN_TEST(test_write_queue_overflow);
     RUN_TEST(test_link_disconnect_reconnect);
+    RUN_TEST(test_history_fence_on_link_down);
+    RUN_TEST(test_suspend_blocks_reconnect);
+    RUN_TEST(test_weak_empty_seat_refuses_reconnect_open);
     RUN_TEST(test_link_drain_cap_enforced);
     RUN_TEST(test_link_drain_until_eagain);
     RUN_TEST(test_break_nonblocking);
@@ -1802,6 +2637,13 @@ int main(void)
     RUN_TEST(test_boot_stall_fires);
     RUN_TEST(test_boot_no_stall_when_complete);
     RUN_TEST(test_broker_listens_on_derived_long_byid_socket);
+    RUN_TEST(test_stop_by_socket);
+    RUN_TEST(test_stop_by_socket_stale);
+    RUN_TEST(test_find_broker_for_endpoint);
+    RUN_TEST(test_register_async_closes_fd_on_failed_handover);
+    RUN_TEST(test_probe_does_not_leak_clients);
+    RUN_TEST(test_killed_client_dropped);
+    RUN_TEST(test_hello_same_name_replaces);
 
     TEST_REPORT();
 }

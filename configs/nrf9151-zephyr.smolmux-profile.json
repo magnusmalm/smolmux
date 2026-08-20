@@ -2,7 +2,7 @@
     "name": "nrf9151-zephyr",
     "device_type": "zephyr",
     "description": "nRF9151 SiP running Zephyr RTOS with modem AT interface",
-    "prompt_pattern": "uart:~\\$\\s*$",
+    "prompt_pattern": "uart:~\\$[[:space:]]*$",
     "commands": [
         "kernel version",
         "kernel uptime",

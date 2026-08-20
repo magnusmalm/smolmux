@@ -8,10 +8,13 @@
 typedef struct sm_expect_result {
     char id[64];
     int matched;
+    int aborted;           /* 1 = ended early (e.g. critical anomaly) */
     uint8_t *data;         /* accumulated data (owned — caller must free) */
     size_t data_len;
     char pattern[256];
     char client_id[32];
+    char abort_reason[32]; /* e.g. "anomaly"; empty if not aborted */
+    char abort_pattern[64];/* anomaly pattern name when aborted */
 } sm_expect_result_t;
 
 typedef struct sm_expect_request {
@@ -24,7 +27,10 @@ typedef struct sm_expect_request {
     size_t buf_cap;
     size_t search_offset;  /* scan optimization: skip already-scanned data */
     int matched;
+    int aborted;
     char client_id[32];
+    char abort_reason[32];
+    char abort_pattern[64];
 } sm_expect_request_t;
 
 typedef struct sm_expect_engine {
@@ -47,5 +53,11 @@ size_t sm_expect_collect(sm_expect_engine_t *eng, double now,
 void sm_expect_cancel_client(sm_expect_engine_t *eng, const char *client_id);
 void sm_expect_cancel_id(sm_expect_engine_t *eng, const char *id);
 void sm_expect_cancel_all(sm_expect_engine_t *eng);
+
+/* Mark every pending expect aborted (matched stays 0). Used when a critical
+ * anomaly means the board is not going to produce the expected output.
+ * reason is typically "anomaly"; pattern_name is the incident pattern. */
+void sm_expect_abort_all(sm_expect_engine_t *eng, const char *reason,
+                         const char *pattern_name);
 
 #endif /* SM_EXPECT_H */

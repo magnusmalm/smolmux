@@ -4,6 +4,8 @@
 #include "logger.h"
 #include "util/str.h"
 #include "sinks/mcp_schemas.h"
+#include "mcp_instructions.h"
+#include "mcp_explain.h"
 #include "cJSON.h"
 
 #include <stdlib.h>
@@ -180,14 +182,56 @@ static void handle_initialize(sm_mcp_sink_t *mcp, cJSON *id)
     cJSON_AddStringToObject(result, "protocolVersion", SM_MCP_PROTOCOL_VERSION);
     cJSON *caps = cJSON_CreateObject();
     cJSON_AddItemToObject(caps, "tools", cJSON_CreateObject());
+    cJSON_AddItemToObject(caps, "prompts", cJSON_CreateObject());
     cJSON_AddItemToObject(result, "capabilities", caps);
     cJSON *info = cJSON_CreateObject();
     cJSON_AddStringToObject(info, "name", SM_NAME);
     cJSON_AddStringToObject(info, "version", SM_VERSION);
     cJSON_AddItemToObject(result, "serverInfo", info);
+    cJSON_AddStringToObject(result, "instructions",
+                            sm_mcp_serial_instructions());
     mcp_send_result(id, result);
     mcp->initialized = 1;
     SM_LOG_INFO(LOG_TAG, "MCP initialized");
+}
+
+static void handle_prompts_list(sm_mcp_sink_t *mcp, cJSON *id)
+{
+    (void)mcp;
+    mcp_send_result(id, sm_mcp_serial_prompts_list_result());
+}
+
+static void handle_prompts_get(sm_mcp_sink_t *mcp, cJSON *id, cJSON *params)
+{
+    (void)mcp;
+    cJSON *name = params
+        ? cJSON_GetObjectItemCaseSensitive(params, "name") : NULL;
+    if (!cJSON_IsString(name) || !name->valuestring[0]) {
+        mcp_send_error(id, -32602, "missing prompt name");
+        return;
+    }
+
+    cJSON *args = params
+        ? cJSON_GetObjectItemCaseSensitive(params, "arguments") : NULL;
+    char *text = NULL;
+    const char *desc = NULL;
+    if (sm_mcp_serial_prompt_get(name->valuestring, args, &text, &desc) != 0) {
+        mcp_send_error(id, -32602, "unknown prompt");
+        return;
+    }
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddStringToObject(result, "description", desc ? desc : "");
+    cJSON *msgs = cJSON_AddArrayToObject(result, "messages");
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", "user");
+    cJSON *content = cJSON_CreateObject();
+    cJSON_AddStringToObject(content, "type", "text");
+    cJSON_AddStringToObject(content, "text", text ? text : "");
+    cJSON_AddItemToObject(m, "content", content);
+    cJSON_AddItemToArray(msgs, m);
+    free(text);
+    mcp_send_result(id, result);
 }
 
 static void handle_tools_list(sm_mcp_sink_t *mcp, cJSON *id)
@@ -253,6 +297,11 @@ static void dispatch_message(sm_mcp_sink_t *mcp, cJSON *msg)
         }
         handle_tools_call(mcp, id, params);
         cJSON_Delete(params_tmp);
+    } else if (strcmp(m, "prompts/list") == 0) {
+        handle_prompts_list(mcp, id);
+    } else if (strcmp(m, "prompts/get") == 0) {
+        cJSON *params = cJSON_GetObjectItemCaseSensitive(msg, "params");
+        handle_prompts_get(mcp, id, params);
     } else {
         if (id) mcp_send_error(id, -32601, "method not found");
     }
@@ -351,9 +400,11 @@ static void mcp_on_readable(sm_sink_t *self)
 
 static void mcp_on_expect_result(sm_sink_t *self, const char *id,
                                    int matched, const uint8_t *data,
-                                   size_t data_len, const char *pattern)
+                                   size_t data_len, const char *pattern,
+                                   int aborted, const char *abort_pattern)
 {
     sm_mcp_sink_t *mcp = self->data;
+    (void)pattern;
 
     /* Find the pending call */
     for (int i = 0; i < SM_MCP_MAX_PENDING_CALLS; i++) {
@@ -364,11 +415,23 @@ static void mcp_on_expect_result(sm_sink_t *self, const char *id,
         /* Build response text */
         char *text;
         if (data && data_len > 0) {
-            text = malloc(data_len + 64);
+            text = malloc(data_len + 128);
             if (!text) { text = strdup("(allocation failed)"); goto send_result; }
-            if (!matched && !p->timeout_mode && !p->is_monitor) {
+            if (aborted && !p->is_monitor) {
+                /* Critical anomaly aborted the wait (not a plain timeout). */
+                int prefix_len = snprintf(text, data_len + 128,
+                    "[ABORTED anomaly:%s] ",
+                    abort_pattern && abort_pattern[0]
+                        ? abort_pattern : "unknown");
+                if (prefix_len < 0)
+                    prefix_len = 0;
+                if ((size_t)prefix_len > data_len + 127)
+                    prefix_len = (int)(data_len + 127);
+                memcpy(text + prefix_len, data, data_len);
+                text[prefix_len + (int)data_len] = '\0';
+            } else if (!matched && !p->timeout_mode && !p->is_monitor) {
                 /* Expect timed out with no match: prefix the captured output. */
-                snprintf(text, data_len + 64, "[TIMEOUT] ");
+                snprintf(text, data_len + 128, "[TIMEOUT] ");
                 size_t prefix_len = strlen(text);
                 memcpy(text + prefix_len, data, data_len);
                 text[prefix_len + data_len] = '\0';
@@ -416,11 +479,26 @@ static void mcp_on_expect_result(sm_sink_t *self, const char *id,
                 memcpy(text, data, data_len);
                 text[data_len] = '\0';
             }
+        } else if (aborted && !p->is_monitor) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[ABORTED anomaly:%s] (no output)",
+                     abort_pattern && abort_pattern[0]
+                         ? abort_pattern : "unknown");
+            text = strdup(buf);
         } else {
             text = strdup("(no output)");
         }
 
 send_result:
+        if (!text)
+            text = strdup("(allocation failed)");
+        if (!p->is_monitor) {
+            size_t ninc;
+            const sm_anomaly_incident_t *incs =
+                sm_anomaly_get_incidents(&mcp->broker->anomaly, &ninc);
+            text = sm_mcp_append_recent_incidents(text, incs, ninc, 5);
+            text = sm_mcp_maybe_explain_result(text);
+        }
         mcp_send_tool_result(p->jsonrpc_id, text ? text : "(allocation failed)");
         free(text);
 

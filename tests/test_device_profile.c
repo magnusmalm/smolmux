@@ -241,7 +241,7 @@ static void test_profile_resolve_short_name(void)
     if (f) { fputs(json_e, f); fclose(f); }
 
     /* Point HOME at a tree with .config/smolmux */
-    char fake_home[512], conf[576], cfg_parent[576];
+    char fake_home[520], conf[576], cfg_parent[576];
     snprintf(fake_home, sizeof(fake_home), "%s/home", dir);
     snprintf(cfg_parent, sizeof(cfg_parent), "%s/.config", fake_home);
     snprintf(conf, sizeof(conf), "%s/.config/smolmux", fake_home);
@@ -290,6 +290,35 @@ static void test_profile_resolve_short_name(void)
     rmdir(cfg_parent);
     rmdir(fake_home);
     rmdir(dir);
+}
+
+/* Ship configs: ESP profiles' first boot stage must accept an Arduino-style
+ * "rst:0x.." cold boot as well as the classic "ESP-ROM:" banner
+ * (ISSUE-DF-ESP-3: some Arduino cores never print ESP-ROM). */
+static void test_load_shipped_esp_profiles(void)
+{
+    const char *names[] = {
+        "esp32-arduino-lvgl.smolmux-profile.json",
+        "esp-idf-uart.smolmux-profile.json",
+        NULL
+    };
+    for (int i = 0; names[i]; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "configs/%s", names[i]);
+        if (access(path, R_OK) != 0)
+            snprintf(path, sizeof(path), "../configs/%s", names[i]);
+        ASSERT(access(path, R_OK) == 0, "shipped ESP profile found");
+
+        sm_device_profile_t p;
+        ASSERT_INT_EQ(sm_profile_load(&p, path), 0);
+        ASSERT(p.boot_stage_count >= 3, "ESP profile has boot stages");
+        ASSERT_STR_EQ(p.boot_stages[0].name, "reset");
+        ASSERT(strstr(p.boot_stages[0].pattern, "ESP-ROM:") != NULL,
+               "stage 0 keeps classic ESP-ROM alternative");
+        ASSERT(strstr(p.boot_stages[0].pattern, "rst:0x") != NULL,
+               "stage 0 accepts Arduino rst:0x reset line");
+        sm_profile_destroy(&p);
+    }
 }
 
 /* Ship config: empty-password guidance + shell stage + BusyBox-friendly cmds. */
@@ -355,6 +384,7 @@ int main(void)
     RUN_TEST(test_load_missing_file);
     RUN_TEST(test_profile_resolve_short_name);
     RUN_TEST(test_load_shipped_linux_shell_profile);
+    RUN_TEST(test_load_shipped_esp_profiles);
 
     TEST_REPORT();
 }

@@ -11,6 +11,7 @@
 #include <pty.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdlib.h>
 
 #define TEST_SOCK "/tmp/smolmux-test-mcp.sock"
 #define STARTUP_DELAY 150000  /* 150ms */
@@ -183,7 +184,93 @@ static void test_initialize(void)
     ASSERT_NOT_NULL(info);
     ASSERT_STR_EQ(sm_json_get_string(info, "name"), "smolmux");
 
+    /* Wave 1 P0a: instructions on initialize */
+    const char *ins = sm_json_get_string(result, "instructions");
+    ASSERT_NOT_NULL(ins);
+    ASSERT(strlen(ins) >= 200, "instructions length >= 200");
+    ASSERT(strstr(ins, "serial_suspend") != NULL, "instructions: suspend");
+    ASSERT(strstr(ins, "serial_get_incidents") != NULL,
+           "instructions: incidents");
+
+    cJSON *caps_out = cJSON_GetObjectItemCaseSensitive(result, "capabilities");
+    ASSERT_NOT_NULL(caps_out);
+    ASSERT(cJSON_GetObjectItemCaseSensitive(caps_out, "prompts") != NULL,
+           "capabilities.prompts advertised");
+
     cJSON_Delete(resp);
+    teardown(&ctx);
+}
+
+static void test_prompts_list_and_get(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    cJSON *init_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(init_params, "protocolVersion", "2024-11-05");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                       init_params));
+    usleep(100000);
+    char buf[16384];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    /* prompts/list — exact three names */
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "prompts/list", NULL));
+    usleep(100000);
+    int n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(n > 0, "got prompts/list response");
+    cJSON *resp = cJSON_Parse(buf);
+    ASSERT_NOT_NULL(resp);
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(resp, "result");
+    cJSON *prompts = cJSON_GetObjectItemCaseSensitive(result, "prompts");
+    ASSERT(cJSON_IsArray(prompts), "prompts array");
+    ASSERT_INT_EQ(cJSON_GetArraySize(prompts), 3);
+    int saw_b = 0, saw_d = 0, saw_f = 0;
+    cJSON *p;
+    cJSON_ArrayForEach(p, prompts) {
+        const char *name = sm_json_get_string(p, "name");
+        if (name && strcmp(name, "bringup") == 0) saw_b = 1;
+        else if (name && strcmp(name, "debug_serial") == 0) saw_d = 1;
+        else if (name && strcmp(name, "flash_safe") == 0) saw_f = 1;
+    }
+    ASSERT(saw_b && saw_d && saw_f, "exact prompt set on sink");
+    cJSON_Delete(resp);
+
+    /* prompts/get flash_safe */
+    cJSON *get_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(get_params, "name", "flash_safe");
+    send_jsonrpc(ctx.mcp_stdin_write,
+                 jsonrpc_request(3, "prompts/get", get_params));
+    usleep(100000);
+    n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(n > 0, "got prompts/get response");
+    resp = cJSON_Parse(buf);
+    ASSERT_NOT_NULL(resp);
+    result = cJSON_GetObjectItemCaseSensitive(resp, "result");
+    cJSON *msgs = cJSON_GetObjectItemCaseSensitive(result, "messages");
+    ASSERT(cJSON_IsArray(msgs) && cJSON_GetArraySize(msgs) >= 1, "messages");
+    cJSON *msg0 = cJSON_GetArrayItem(msgs, 0);
+    cJSON *content = cJSON_GetObjectItemCaseSensitive(msg0, "content");
+    const char *text = sm_json_get_string(content, "text");
+    ASSERT(text && strstr(text, "serial_suspend") != NULL,
+           "flash_safe cites serial_suspend");
+    ASSERT(text && strstr(text, "serial_boot_status") != NULL,
+           "flash_safe cites serial_boot_status");
+    cJSON_Delete(resp);
+
+    /* unknown prompt -> error */
+    cJSON *bad = cJSON_CreateObject();
+    cJSON_AddStringToObject(bad, "name", "not_a_prompt");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(4, "prompts/get", bad));
+    usleep(100000);
+    n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(n > 0, "got error response");
+    resp = cJSON_Parse(buf);
+    ASSERT_NOT_NULL(resp);
+    ASSERT(cJSON_GetObjectItemCaseSensitive(resp, "error") != NULL,
+           "unknown prompt is error");
+    cJSON_Delete(resp);
+
     teardown(&ctx);
 }
 
@@ -217,7 +304,21 @@ static void test_tools_list(void)
 
     cJSON *tools = cJSON_GetObjectItemCaseSensitive(result, "tools");
     ASSERT(cJSON_IsArray(tools), "tools is array");
-    ASSERT(cJSON_GetArraySize(tools) == 16, "16 tools registered");
+    ASSERT(cJSON_GetArraySize(tools) == 17, "17 tools registered");
+
+    /* Wave 4: annotations on at least one RO and one destructive tool */
+    int saw_ro = 0, saw_destr = 0;
+    cJSON *t;
+    cJSON_ArrayForEach(t, tools) {
+        cJSON *ann = cJSON_GetObjectItemCaseSensitive(t, "annotations");
+        if (!cJSON_IsObject(ann)) continue;
+        cJSON *ro = cJSON_GetObjectItemCaseSensitive(ann, "readOnlyHint");
+        cJSON *de = cJSON_GetObjectItemCaseSensitive(ann, "destructiveHint");
+        if (cJSON_IsTrue(ro)) saw_ro = 1;
+        if (cJSON_IsTrue(de)) saw_destr = 1;
+    }
+    ASSERT(saw_ro, "readOnlyHint on some tool");
+    ASSERT(saw_destr, "destructiveHint on some tool");
 
     cJSON_Delete(resp);
     teardown(&ctx);
@@ -474,18 +575,154 @@ static void test_method_not_found(void)
     teardown(&ctx);
 }
 
+/* SM-15 was closed on the wire path only; the in-process MCP sink used to
+ * forward any pin key to link->set_param (allow_shell, target, …). */
+static void test_serial_pin_control_rejects_non_pin_keys(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    static const char *const bad[] = {
+        "allow_shell", "target", "baud", "parity", "flow_control",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        cJSON *args = cJSON_CreateObject();
+        cJSON_AddStringToObject(args, "pin", bad[i]);
+        cJSON_AddStringToObject(args, "action", "1");
+        cJSON *params = cJSON_CreateObject();
+        cJSON_AddStringToObject(params, "name", "serial_pin_control");
+        cJSON_AddItemToObject(params, "arguments", args);
+        send_jsonrpc(ctx.mcp_stdin_write,
+                      jsonrpc_request((int)(100 + i), "tools/call", params));
+        usleep(100000);
+
+        char buf[4096];
+        int n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+        ASSERT(n > 0, "got pin_control response");
+        cJSON *resp = cJSON_Parse(buf);
+        ASSERT_NOT_NULL(resp);
+        cJSON *result = cJSON_GetObjectItemCaseSensitive(resp, "result");
+        ASSERT_NOT_NULL(result);
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(result, "content");
+        cJSON *first = cJSON_GetArrayItem(content, 0);
+        const char *text = sm_json_get_string(first, "text");
+        ASSERT_NOT_NULL(text);
+        ASSERT(strstr(text, "unknown pin") != NULL,
+               "rejects non-line-control pin key");
+        cJSON_Delete(resp);
+    }
+
+    teardown(&ctx);
+}
+
+/* REL-MCP-4K: oversized command is fail-closed; PTY must not see a clip. */
+static void test_serial_send_command_too_long(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    cJSON *init_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(init_params, "protocolVersion", "2024-11-05");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    usleep(100000);
+    char buf[8192];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    char *long_cmd = malloc(5001);
+    ASSERT_NOT_NULL(long_cmd);
+    memset(long_cmd, 'A', 5000);
+    long_cmd[5000] = '\0';
+
+    cJSON *call_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(call_params, "name", "serial_send_command");
+    cJSON *tool_args = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool_args, "command", long_cmd);
+    cJSON_AddStringToObject(tool_args, "expect_pattern", "x");
+    cJSON_AddNumberToObject(tool_args, "timeout_ms", 200);
+    cJSON_AddItemToObject(call_params, "arguments", tool_args);
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(4, "tools/call",
+                                                      call_params));
+    usleep(100000);
+
+    int flags = fcntl(ctx.master, F_GETFL, 0);
+    fcntl(ctx.master, F_SETFL, flags | O_NONBLOCK);
+    char dev[256];
+    ssize_t dn = read(ctx.master, dev, sizeof(dev) - 1);
+    if (dn < 0)
+        dn = 0;
+    dev[dn] = '\0';
+
+    int n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(n > 0, "got too-long response");
+    ASSERT(strstr(buf, "too long") != NULL, "fail-closed on 4k overflow");
+    ASSERT(strstr(dev, "AAAA") == NULL, "partial command not sent");
+
+    free(long_cmd);
+    teardown(&ctx);
+}
+
+/* REL-CR: eol=cr writes CR, not LF. */
+static void test_serial_send_command_eol_cr(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    cJSON *init_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(init_params, "protocolVersion", "2024-11-05");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    usleep(100000);
+    char buf[8192];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    cJSON *call_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(call_params, "name", "serial_send_command");
+    cJSON *tool_args = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool_args, "command", "ver");
+    cJSON_AddStringToObject(tool_args, "eol", "cr");
+    cJSON_AddStringToObject(tool_args, "expect_pattern", "never-match-xx");
+    cJSON_AddNumberToObject(tool_args, "timeout_ms", 200);
+    cJSON_AddItemToObject(call_params, "arguments", tool_args);
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(5, "tools/call",
+                                                      call_params));
+    usleep(80000);
+
+    char dev[64];
+    memset(dev, 0, sizeof(dev));
+    ssize_t dn = read(ctx.master, dev, sizeof(dev) - 1);
+    if (dn < 0)
+        dn = 0;
+    int saw_cr = 0, saw_lf = 0;
+    for (ssize_t i = 0; i < dn; i++) {
+        if (dev[i] == '\r')
+            saw_cr = 1;
+        if (dev[i] == '\n')
+            saw_lf = 1;
+    }
+    ASSERT(saw_cr, "eol=cr writes CR to the device");
+    ASSERT(!saw_lf, "eol=cr must not write LF");
+
+    teardown(&ctx);
+}
+
 int main(void)
 {
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
     printf("test_mcp\n");
 
     RUN_TEST(test_initialize);
+    RUN_TEST(test_prompts_list_and_get);
     RUN_TEST(test_tools_list);
     RUN_TEST(test_serial_read);
     RUN_TEST(test_serial_port_status);
     RUN_TEST(test_serial_boot_status);
     RUN_TEST(test_serial_add_autoresponder);
     RUN_TEST(test_serial_send_command);
+    RUN_TEST(test_serial_send_command_too_long);
+    RUN_TEST(test_serial_send_command_eol_cr);
     RUN_TEST(test_method_not_found);
+    RUN_TEST(test_serial_pin_control_rejects_non_pin_keys);
 
     TEST_REPORT();
 }

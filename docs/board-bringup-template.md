@@ -45,8 +45,12 @@ the board's "socket map".
 | ---------------- | --------------- | ------------------ | ------ |
 | Console UART     | `/dev/ttyUSB0`  | `...-console.sock` | ☐ up   |
 | Debug SWD        | OpenOCD :3333   | `...-gdb.sock`     | ☐ up   |
+| Shared-cable pair| same USB dual IF| two roles above    | ☐ doc  |
 | Aux UART         |                 |                    | ☐ up   |
 | Ethernet / other |                 |                    |        |
+
+If console + SWD share **one USB plug** (dual FTDI), note both by-id paths
+and which interface OpenOCD owns — see `docs/dual-service-usb-cable.md`.
 
 Broker command per wire (keyed by role):
 - **Console UART** - `smolmux /dev/ttyUSB0 -b 115200 --board <board> --role console -p configs/<board>.smolmux-profile.json -s /tmp/smolmux-<board>-console.sock`

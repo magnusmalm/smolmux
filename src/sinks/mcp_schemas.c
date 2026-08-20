@@ -3,6 +3,9 @@
  * previously-duplicated tool-list builders so they cannot drift. */
 #include "sinks/mcp_schemas.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 static cJSON *schema_object(void)
 {
     cJSON *s = cJSON_CreateObject();
@@ -42,23 +45,80 @@ static void schema_add_boolean(cJSON *props, const char *name, const char *desc)
     cJSON_AddItemToObject(props, name, p);
 }
 
-static cJSON *make_tool(const char *name, const char *desc, cJSON *input_schema)
+static cJSON *make_tool_ex(const char *name, const char *desc, cJSON *input_schema,
+                           int read_only, int destructive, int open_world,
+                           const char *title)
 {
     cJSON *t = cJSON_CreateObject();
     cJSON_AddStringToObject(t, "name", name);
     cJSON_AddStringToObject(t, "description", desc);
     cJSON_AddItemToObject(t, "inputSchema", input_schema);
+    cJSON *ann = cJSON_CreateObject();
+    if (title)
+        cJSON_AddStringToObject(ann, "title", title);
+    cJSON_AddBoolToObject(ann, "readOnlyHint", read_only ? 1 : 0);
+    cJSON_AddBoolToObject(ann, "destructiveHint", destructive ? 1 : 0);
+    cJSON_AddBoolToObject(ann, "openWorldHint", open_world ? 1 : 0);
+    cJSON_AddItemToObject(t, "annotations", ann);
     return t;
+}
+
+static cJSON *make_tool(const char *name, const char *desc, cJSON *input_schema)
+{
+    return make_tool_ex(name, desc, input_schema, 0, 0, 1, NULL);
+}
+
+static cJSON *make_tool_ro(const char *name, const char *desc, cJSON *input_schema)
+{
+    return make_tool_ex(name, desc, input_schema, 1, 0, 0, NULL);
+}
+
+static cJSON *make_tool_destr(const char *name, const char *desc,
+                              cJSON *input_schema)
+{
+    return make_tool_ex(name, desc, input_schema, 0, 1, 1, NULL);
 }
 
 /* --- tools/list --- */
 
+int sm_mcp_mutate_enabled(void)
+{
+    const char *e = getenv("SMOLMUX_MCP_MUTATE");
+    if (!e || !e[0])
+        return 0;
+    return e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
+           e[0] == 't' || e[0] == 'T';
+}
+
+int sm_mcp_tool_is_mutate(const char *name)
+{
+    static const char *mutate[] = {
+        "serial_send_command",
+        "serial_write",
+        "serial_add_autoresponder",
+        "serial_pin_control",
+        "serial_sysrq",
+        "serial_suspend",
+        "serial_resume",
+        "serial_add_watchdog",
+        NULL,
+    };
+    if (!name)
+        return 0;
+    for (int i = 0; mutate[i]; i++) {
+        if (strcmp(name, mutate[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 cJSON *sm_mcp_build_tools_list(void)
 {
     cJSON *tools = cJSON_CreateArray();
+    int mutate = sm_mcp_mutate_enabled();
 
     /* serial_send_command */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "command", "The command string to send.");
@@ -78,12 +138,13 @@ cJSON *sm_mcp_build_tools_list(void)
     {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
-        cJSON_AddItemToArray(tools, make_tool("serial_read",
-            "Read buffered serial output without sending anything.", s));
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_read",
+            "Read buffered serial output without sending anything "
+            "(session drain; prefer history for lossless capture).", s));
     }
 
     /* serial_write */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "data", "The string to send (sent as-is).");
@@ -99,7 +160,7 @@ cJSON *sm_mcp_build_tools_list(void)
     {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
-        cJSON_AddItemToArray(tools, make_tool("serial_port_status",
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_port_status",
             "Get the current status of the serial port and connected clients.", s));
     }
 
@@ -107,14 +168,14 @@ cJSON *sm_mcp_build_tools_list(void)
     {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
-        cJSON_AddItemToArray(tools, make_tool("serial_boot_status",
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_boot_status",
             "Report cold-boot progress: which boot stages the device has reached, "
             "the furthest stage, and whether the boot has stalled. Requires the "
             "device profile to declare boot_stages; otherwise reports none.", s));
     }
 
     /* serial_add_autoresponder */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "name", "Unique name for this rule (re-adding "
@@ -141,7 +202,7 @@ cJSON *sm_mcp_build_tools_list(void)
     }
 
     /* serial_pin_control */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "pin", "Pin to control: dtr, rts, or break.");
@@ -154,12 +215,12 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("pin"));
         cJSON_AddItemToArray(req, cJSON_CreateString("action"));
         cJSON_AddItemToObject(s, "required", req);
-        cJSON_AddItemToArray(tools, make_tool("serial_pin_control",
+        cJSON_AddItemToArray(tools, make_tool_destr("serial_pin_control",
             "Control serial port pins or send a break signal.", s));
     }
 
     /* serial_sysrq */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "key", "Single character SysRq key (e.g. h, b, t).");
@@ -171,24 +232,41 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("key"));
         cJSON_AddItemToObject(s, "required", req);
-        cJSON_AddItemToArray(tools, make_tool("serial_sysrq",
+        cJSON_AddItemToArray(tools, make_tool_destr("serial_sysrq",
             "Send a Linux SysRq command (BREAK + key) to the serial device.", s));
     }
 
     /* serial_suspend */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
-        cJSON_AddItemToArray(tools, make_tool("serial_suspend",
+        cJSON_AddItemToArray(tools, make_tool_destr("serial_suspend",
             "Suspend the serial port so external tools can access the device.", s));
     }
 
     /* serial_resume */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool("serial_resume",
             "Resume the serial port after a suspend.", s));
+    }
+
+    /* serial_wait_for */
+    {
+        cJSON *s = schema_object();
+        cJSON *props = cJSON_CreateObject();
+        schema_add_string(props, "pattern",
+            "Regex to match in device output (listen-only; no TX).");
+        schema_add_integer(props, "timeout_ms",
+            "Max wait in ms (default 30000, clamp 100–3600000).");
+        cJSON_AddItemToObject(s, "properties", props);
+        cJSON *req = cJSON_CreateArray();
+        cJSON_AddItemToArray(req, cJSON_CreateString("pattern"));
+        cJSON_AddItemToObject(s, "required", req);
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_wait_for",
+            "Wait for a regex in serial output without sending. Works for "
+            "observers. Ends early on critical anomaly (ABORTED).", s));
     }
 
     /* serial_output_history */
@@ -196,12 +274,18 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_number(props, "seconds",
-            "If > 0, return output from the last N seconds.");
+            "If > 0, return output from the last N seconds (prose).");
         schema_add_integer(props, "last_bytes",
-            "If > 0, return the last N bytes of output.");
+            "If > 0, return the last N bytes of output (prose).");
+        schema_add_number(props, "since_seq",
+            "Cursor from a prior history response: lossless page as JSON "
+            "(cursor/dropped/has_more/chunks). Prefer this over serial_read.");
+        schema_add_integer(props, "max_bytes",
+            "With since_seq: max raw bytes in this page (default broker cap).");
         cJSON_AddItemToObject(s, "properties", props);
-        cJSON_AddItemToArray(tools, make_tool("serial_output_history",
-            "Get non-destructive timestamped output history.", s));
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_output_history",
+            "Non-destructive history. With since_seq: JSON cursor page. "
+            "Without: prose by time/bytes. serial_read is drain-only.", s));
     }
 
     /* serial_get_incidents */
@@ -211,12 +295,12 @@ cJSON *sm_mcp_build_tools_list(void)
         schema_add_number(props, "seconds",
             "If > 0, only return incidents from the last N seconds.");
         cJSON_AddItemToObject(s, "properties", props);
-        cJSON_AddItemToArray(tools, make_tool("serial_get_incidents",
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_get_incidents",
             "Get detected anomalies/crashes from the broker.", s));
     }
 
     /* serial_add_watchdog */
-    {
+    if (mutate) {
         cJSON *s = schema_object();
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "name", "Name for this watchdog pattern.");
@@ -240,7 +324,7 @@ cJSON *sm_mcp_build_tools_list(void)
         schema_add_integer(props, "duration_seconds",
             "How long to monitor (max 300 seconds, default 30).");
         cJSON_AddItemToObject(s, "properties", props);
-        cJSON_AddItemToArray(tools, make_tool("serial_monitor",
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_monitor",
             "Monitor serial output for a duration, returning output and anomalies.", s));
     }
 
@@ -248,7 +332,7 @@ cJSON *sm_mcp_build_tools_list(void)
     {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
-        cJSON_AddItemToArray(tools, make_tool("serial_generate_report",
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_generate_report",
             "Generate a status report for the serial device.", s));
     }
 
@@ -256,8 +340,9 @@ cJSON *sm_mcp_build_tools_list(void)
     {
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
-        cJSON_AddItemToArray(tools, make_tool("serial_list_ports",
-            "List available serial ports.", s));
+        cJSON_AddItemToArray(tools, make_tool_ro("serial_list_ports",
+            "List serial ports with by-id and USB VID/PID when available. "
+            "Bridge chips name the adapter, not the MCU.", s));
     }
 
     return tools;

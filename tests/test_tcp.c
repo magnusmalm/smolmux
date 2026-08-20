@@ -217,6 +217,44 @@ static void test_tcp_auth_token(void)
     teardown(&ctx);
 }
 
+/* How a bind address is classified decides whether the startup gate below
+ * fires, so it must agree with what sm_tcp_sink_new() actually binds —
+ * including the fallback where NULL or an unparseable address means
+ * loopback. Both live in tcp.c for exactly that reason. */
+static void test_bind_loopback_classification(void)
+{
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback(NULL), 1);        /* sink default */
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback("not-an-ip"), 1); /* sink fallback */
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback("127.0.0.1"), 1);
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback("127.1.2.3"), 1); /* all of /8 */
+
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback("0.0.0.0"), 0);   /* the dangerous one */
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback("192.168.1.10"), 0);
+    ASSERT_INT_EQ(sm_tcp_bind_is_loopback("10.0.0.1"), 0);
+}
+
+/* A tokenless TCP sink hands every reachable peer full control of the device.
+ * Previously any bind address was accepted with only a log warning — easy to
+ * miss, and invisible when the broker is detached by `board up`. Refuse the
+ * network-exposed case unless the operator opts in explicitly. */
+static void test_startup_refuses_exposed_tokenless_tcp(void)
+{
+    /* Refuse: reachable from other hosts, no token, no opt-in. */
+    ASSERT_INT_EQ(sm_tcp_refuse_unauthenticated("0.0.0.0", 0, 0), 1);
+    ASSERT_INT_EQ(sm_tcp_refuse_unauthenticated("192.168.1.10", 0, 0), 1);
+
+    /* Allow: a token makes the exposure a deliberate, authenticated choice. */
+    ASSERT_INT_EQ(sm_tcp_refuse_unauthenticated("0.0.0.0", 1, 0), 0);
+
+    /* Allow: explicit opt-in, for someone who means it. */
+    ASSERT_INT_EQ(sm_tcp_refuse_unauthenticated("0.0.0.0", 0, 1), 0);
+
+    /* Allow: loopback without a token stays a warning, not an error — that
+     * is the common single-user workflow and breaking it would be wrong. */
+    ASSERT_INT_EQ(sm_tcp_refuse_unauthenticated(NULL, 0, 0), 0);
+    ASSERT_INT_EQ(sm_tcp_refuse_unauthenticated("127.0.0.1", 0, 0), 0);
+}
+
 int main(void)
 {
     printf("test_tcp\n");
@@ -225,6 +263,8 @@ int main(void)
     RUN_TEST(test_tcp_send_receive);
     RUN_TEST(test_tcp_output_broadcast);
     RUN_TEST(test_tcp_auth_token);
+    RUN_TEST(test_bind_loopback_classification);
+    RUN_TEST(test_startup_refuses_exposed_tokenless_tcp);
 
     TEST_REPORT();
 }
