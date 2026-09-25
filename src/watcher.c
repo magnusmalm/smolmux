@@ -18,6 +18,7 @@
 #include "util/sock_util.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <stdarg.h>
 #include <poll.h>
@@ -339,9 +340,17 @@ static void write_report(const cJSON *anomaly, const cJSON *chunks)
     char filepath[768];
     snprintf(filepath, sizeof(filepath), "%s/%s", watcher.output_dir, filename);
 
-    FILE *f = fopen(filepath, "w");
-    if (!f) {
+    int fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0) {
         log_warn("Failed to write report %s: %s", filepath, strerror(errno));
+        free(report);
+        return;
+    }
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        log_warn("Failed to write report %s: fdopen", filepath);
         free(report);
         return;
     }
@@ -524,9 +533,9 @@ static void signal_handler(int sig)
 
 /* --- Main --- */
 
-static void usage(const char *prog)
+static void usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
+    fprintf(out,
         "%s-watcher — autonomous anomaly incident reporter\n"
         "\n"
         "Connects to a running smolmux broker as an observer, watches for\n"
@@ -611,10 +620,10 @@ int main(int argc, char *argv[])
             printf("%s-watcher %s\n", SM_NAME, SM_VERSION);
             return 0;
         case 'h':
-            usage(argv[0]);
+            usage(stdout, argv[0]);
             return 0;
         default:
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return 1;
         }
     }
@@ -624,6 +633,13 @@ int main(int argc, char *argv[])
     if (!socket_path && optind < argc)
         socket_path = argv[optind];
     if (!socket_path) {
+        int env_pin = getenv(SM_SOCKET_ENV) && getenv(SM_SOCKET_ENV)[0];
+        if (sm_autodiscover_should_refuse(env_pin)) {
+            fprintf(stderr,
+                    "Error: multiple brokers; pass -s <socket>\n"
+                    "  smolmux-cli brokers    # list sockets\n");
+            return 1;
+        }
         if (sm_discover_socket(discovered_path, sizeof(discovered_path)) == 0) {
             socket_path = discovered_path;
         } else {
@@ -631,10 +647,26 @@ int main(int argc, char *argv[])
                     "  Specify -s path, set %s, or start a broker\n", SM_SOCKET_ENV);
             return 1;
         }
+    } else {
+        int rrs = sm_resolve_client_socket(discovered_path,
+                                           sizeof(discovered_path),
+                                           socket_path);
+        if (rrs < 0) {
+            fprintf(stderr, "Error: cannot resolve socket from '%s'\n"
+                            "  smolmux-cli brokers\n", socket_path);
+            return 1;
+        }
+        if (rrs == 1) {
+            fprintf(stderr,
+                    "note: '%s' is a device node; using socket %s\n"
+                    "  smolmux-cli brokers lists live brokers\n",
+                    socket_path, discovered_path);
+        }
+        socket_path = discovered_path;
     }
 
     /* Create output directory */
-    mkdir(watcher.output_dir, 0755);
+    mkdir(watcher.output_dir, 0700);
 
     /* Set up signal handling */
     struct sigaction sa;

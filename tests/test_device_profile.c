@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stdlib.h>
+#include "find_shipped.h"
 /* access() for shipped profile path probe */
 
 static void test_defaults(void)
@@ -292,9 +293,8 @@ static void test_profile_resolve_short_name(void)
     rmdir(dir);
 }
 
-/* Ship configs: ESP profiles' first boot stage must accept an Arduino-style
- * "rst:0x.." cold boot as well as the classic "ESP-ROM:" banner
- * (ISSUE-DF-ESP-3: some Arduino cores never print ESP-ROM). */
+/* ISSUE-DF-ESP-3: Arduino cores may never print ESP-ROM:. Stage 0 must
+ * still accept rst:0x. */
 static void test_load_shipped_esp_profiles(void)
 {
     const char *names[] = {
@@ -303,11 +303,10 @@ static void test_load_shipped_esp_profiles(void)
         NULL
     };
     for (int i = 0; names[i]; i++) {
-        char path[256];
-        snprintf(path, sizeof(path), "configs/%s", names[i]);
-        if (access(path, R_OK) != 0)
-            snprintf(path, sizeof(path), "../configs/%s", names[i]);
-        ASSERT(access(path, R_OK) == 0, "shipped ESP profile found");
+        char rel[128], path[512];
+        snprintf(rel, sizeof(rel), "configs/%s", names[i]);
+        if (test_find_shipped(path, sizeof(path), rel) != 0)
+            continue;
 
         sm_device_profile_t p;
         ASSERT_INT_EQ(sm_profile_load(&p, path), 0);
@@ -324,19 +323,12 @@ static void test_load_shipped_esp_profiles(void)
 /* Ship config: empty-password guidance + shell stage + BusyBox-friendly cmds. */
 static void test_load_shipped_linux_shell_profile(void)
 {
-    const char *candidates[] = {
-        "configs/linux-shell.smolmux-profile.json",
-        "../configs/linux-shell.smolmux-profile.json",
-        NULL
-    };
-    const char *path = NULL;
-    for (int i = 0; candidates[i]; i++) {
-        if (access(candidates[i], R_OK) == 0) {
-            path = candidates[i];
-            break;
-        }
+    char path[512];
+    if (test_find_shipped(path, sizeof(path),
+                          "configs/linux-shell.smolmux-profile.json") != 0) {
+        ASSERT(0, "shipped linux-shell profile found");
+        return;
     }
-    ASSERT_NOT_NULL(path); /* run from build/ or repo root */
 
     sm_device_profile_t p;
     ASSERT_INT_EQ(sm_profile_load(&p, path), 0);
@@ -370,6 +362,14 @@ static void test_load_shipped_linux_shell_profile(void)
     sm_profile_destroy(&p);
 }
 
+static void test_missing_shipped_does_not_walk(void)
+{
+    char path[512];
+    ASSERT_INT_EQ(test_find_shipped(path, sizeof(path),
+                                    "configs/no-such-profile-zzzz.json"), -1);
+    ASSERT(path[0] == '\0', "out empty on miss");
+}
+
 int main(void)
 {
     printf("test_device_profile\n");
@@ -385,6 +385,7 @@ int main(void)
     RUN_TEST(test_profile_resolve_short_name);
     RUN_TEST(test_load_shipped_linux_shell_profile);
     RUN_TEST(test_load_shipped_esp_profiles);
+    RUN_TEST(test_missing_shipped_does_not_walk);
 
     TEST_REPORT();
 }

@@ -25,7 +25,7 @@ void sm_expect_destroy(sm_expect_engine_t *eng)
 int sm_expect_add(sm_expect_engine_t *eng, const char *id,
                   const char *pattern, double timeout_s, const char *client_id)
 {
-    if (eng->count >= SM_MAX_EXPECT_PENDING) return -1;
+    if (eng->count >= SM_MAX_EXPECT_PENDING) return SM_EXPECT_ERR_FULL;
 
     /* Enforce per-client limit to prevent resource exhaustion */
     size_t client_count = 0;
@@ -33,13 +33,14 @@ int sm_expect_add(sm_expect_engine_t *eng, const char *id,
         if (strcmp(eng->requests[i].client_id, client_id) == 0)
             client_count++;
     }
-    if (client_count >= SM_MAX_EXPECT_PER_CLIENT) return -1;
+    if (client_count >= SM_MAX_EXPECT_PER_CLIENT)
+        return SM_EXPECT_ERR_PER_CLIENT;
 
     if (eng->count >= eng->capacity) {
         size_t new_cap = eng->capacity ? eng->capacity * 2 : 16;
-        if (new_cap > SM_MAX_EXPECT_PENDING) return -1;
+        if (new_cap > SM_MAX_EXPECT_PENDING) return SM_EXPECT_ERR_FULL;
         void *tmp = realloc(eng->requests, new_cap * sizeof(sm_expect_request_t));
-        if (!tmp) return -1;
+        if (!tmp) return SM_EXPECT_ERR_NOMEM;
         eng->requests = tmp;
         eng->capacity = new_cap;
     }
@@ -52,14 +53,14 @@ int sm_expect_add(sm_expect_engine_t *eng, const char *id,
     snprintf(req->client_id, sizeof(req->client_id), "%s", client_id);
 
     req->compiled = sm_regex_compile(pattern, NULL, 0);
-    if (!req->compiled) return -1;
+    if (!req->compiled) return SM_EXPECT_ERR_BAD_PATTERN;
 
     req->deadline = sm_now_monotonic() + timeout_s;
     req->buf_cap = 4096;
     req->buffer = malloc(req->buf_cap);
     if (!req->buffer) {
         sm_regex_free(req->compiled);
-        return -1;
+        return SM_EXPECT_ERR_NOMEM;
     }
     req->buf_len = 0;
     req->matched = 0;
@@ -78,12 +79,28 @@ void sm_expect_feed(sm_expect_engine_t *eng, const uint8_t *data, size_t len)
         sm_expect_request_t *req = &eng->requests[i];
         if (req->matched) continue;
 
-        /* Skip if buffer would exceed cap */
-        if (req->buf_len + len > SM_MAX_EXPECT_BUF_SIZE) continue;
+        /* Slide rather than drop new bytes: a match after 256KiB of noise
+         * must still be seen. Keep the tail of this window. */
+        const uint8_t *src = data;
+        size_t n = len;
+        if (n > SM_MAX_EXPECT_BUF_SIZE) {
+            src += n - SM_MAX_EXPECT_BUF_SIZE;
+            n = SM_MAX_EXPECT_BUF_SIZE;
+            req->buf_len = 0;
+            req->search_offset = 0;
+        } else if (req->buf_len + n > SM_MAX_EXPECT_BUF_SIZE) {
+            size_t drop = req->buf_len + n - SM_MAX_EXPECT_BUF_SIZE;
+            memmove(req->buffer, req->buffer + drop, req->buf_len - drop);
+            req->buf_len -= drop;
+            if (req->search_offset > drop)
+                req->search_offset -= drop;
+            else
+                req->search_offset = 0;
+        }
 
         /* Grow buffer if needed — the >= keeps one spare byte for the NUL */
         int oom = 0;
-        while (req->buf_len + len >= req->buf_cap) {
+        while (req->buf_len + n >= req->buf_cap) {
             size_t new_cap = req->buf_cap * 2;
             void *tmp = realloc(req->buffer, new_cap);
             if (!tmp) { oom = 1; break; }
@@ -91,8 +108,8 @@ void sm_expect_feed(sm_expect_engine_t *eng, const uint8_t *data, size_t len)
             req->buf_cap = new_cap;
         }
         if (oom) continue;
-        memcpy(req->buffer + req->buf_len, data, len);
-        req->buf_len += len;
+        memcpy(req->buffer + req->buf_len, src, n);
+        req->buf_len += n;
         req->buffer[req->buf_len] = '\0';
 
         /* Try match — scan from near where new data starts to avoid O(N*M).

@@ -24,6 +24,7 @@
 #include "util/str.h"
 #include "util/profile_resolve.h"
 #include "logger.h"
+#include "gdb_mcp_tool_names.h"
 #include "cJSON.h"
 
 #include <errno.h>
@@ -212,6 +213,7 @@ static void gdb_on_broker_output(void *user, const uint8_t *data, size_t len)
 {
     (void)user;
     sm_strbuf_append(&g.mi_buf, (const char *)data, len);
+    sm_strbuf_cap(&g.mi_buf, SM_GDB_MCP_MI_BUF_MAX);
 
     size_t start = 0;
     for (size_t i = 0; i < g.mi_buf.len; i++) {
@@ -1563,8 +1565,19 @@ static char *tool_generate_profile(cJSON *args)
 
 /* --- Tool dispatch --- */
 
+static int gdb_tool_listed(const char *name)
+{
+    for (int i = 0; i < SM_GDB_MCP_TOOL_NAME_COUNT; i++)
+        if (strcmp(sm_gdb_mcp_tool_names[i], name) == 0)
+            return 1;
+    return 0;
+}
+
 static char *dispatch_tool(const char *name, cJSON *args)
 {
+    /* Single name table: list and dispatch must agree. */
+    if (!gdb_tool_listed(name))
+        return fmtdup("[ERROR] unknown tool: %s", name);
     if (strcmp(name, "gdb_launch") == 0)            return tool_launch(args);
     if (strcmp(name, "gdb_breakpoint") == 0)        return tool_breakpoint(args);
     if (strcmp(name, "gdb_delete_breakpoint") == 0) return tool_delete_breakpoint(args);
@@ -1790,6 +1803,25 @@ static cJSON *build_gdb_tools_list(void)
     cJSON_AddItemToArray(tools, tool_entry("gdb_command",
         "Send a raw GDB/MI command to the debugger.", props, req1, 1));
 
+    {
+        int nnames = SM_GDB_MCP_TOOL_NAME_COUNT;
+        int nlist = cJSON_GetArraySize(tools);
+        int mismatch = (nlist != nnames);
+        cJSON *it;
+        cJSON_ArrayForEach(it, tools) {
+            const char *nm = NULL;
+            cJSON *n = cJSON_GetObjectItemCaseSensitive(it, "name");
+            if (cJSON_IsString(n))
+                nm = n->valuestring;
+            if (!nm || !gdb_tool_listed(nm))
+                mismatch = 1;
+        }
+        if (mismatch) {
+            SM_LOG_ERROR(LOG_TAG, "gdb tools/list drifted from gdb_tool_names");
+            cJSON_Delete(tools);
+            return cJSON_CreateArray();
+        }
+    }
     return tools;
 }
 
@@ -2188,9 +2220,9 @@ static int discover_profile(const char *profile_path)
     return 0;
 }
 
-static void usage(const char *prog)
+static void usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
+    fprintf(out,
         "Usage: %s [socket] [options]\n\n"
         "Connect to a smolmux broker holding a GDB link (broker started with\n"
         "--gdb) and expose GDB debugging tools over MCP stdio.\n\n"
@@ -2228,7 +2260,7 @@ int main(int argc, char *argv[])
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "s:T:p:n:vVh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+s:T:p:n:vVh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 's': socket_path = optarg; break;
         case 'T': tcp_target = optarg; break;
@@ -2236,8 +2268,8 @@ int main(int argc, char *argv[])
         case 'n': snprintf(g.name, sizeof(g.name), "%s", optarg); break;
         case 'v': g.verbose = 1; break;
         case 'V': fprintf(stderr, "%s-gdb-mcp %s\n", SM_NAME, SM_VERSION); return 0;
-        case 'h': usage(argv[0]); return 0;
-        default:  usage(argv[0]); return 1;
+        case 'h': usage(stdout, argv[0]); return 0;
+        default:  usage(stderr, argv[0]); return 1;
         }
     }
 
@@ -2270,14 +2302,46 @@ int main(int argc, char *argv[])
         SM_LOG_INFO(LOG_TAG, "connected to broker via TCP %s:%d", host, port);
     } else {
         char discovered[108];
-        if (!socket_path && optind < argc) socket_path = argv[optind];
+        if (!socket_path && optind < argc) {
+            if (argv[optind][0] == '-') {
+                fprintf(stderr, "Error: option after socket (POSIX getopt)\n");
+                return 1;
+            }
+            socket_path = argv[optind++];
+        }
+        if (optind < argc && argv[optind][0] == '-') {
+            fprintf(stderr, "Error: option after socket (POSIX getopt)\n");
+            return 1;
+        }
         if (!socket_path) {
+            int env_pin = getenv(SM_SOCKET_ENV) && getenv(SM_SOCKET_ENV)[0];
+            if (sm_autodiscover_should_refuse(env_pin)) {
+                fprintf(stderr,
+                        "Error: multiple brokers; pass -s <socket>\n");
+                return 1;
+            }
             if (sm_discover_socket(discovered, sizeof(discovered)) == 0)
                 socket_path = discovered;
             else {
                 fprintf(stderr, "Error: no broker socket found\n");
                 return 1;
             }
+        } else {
+            static char resolved[SM_SOCK_PATH_MAX];
+            int rrs = sm_resolve_client_socket(resolved, sizeof(resolved),
+                                               socket_path);
+            if (rrs < 0) {
+                fprintf(stderr, "Error: cannot resolve socket from '%s'\n"
+                                "  smolmux-cli brokers\n", socket_path);
+                return 1;
+            }
+            if (rrs == 1) {
+                fprintf(stderr,
+                        "note: '%s' is a device node; using socket %s\n"
+                        "  smolmux-cli brokers lists live brokers\n",
+                        socket_path, resolved);
+            }
+            socket_path = resolved;
         }
         g.conn.fd = sm_connect_unix(socket_path);
         if (g.conn.fd < 0) {

@@ -86,6 +86,16 @@ char *sm_strbuf_steal(sm_strbuf_t *sb)
     return result;
 }
 
+void sm_strbuf_cap(sm_strbuf_t *sb, size_t max)
+{
+    if (!sb || !sb->data || max == 0 || sb->len <= max)
+        return;
+    size_t drop = sb->len - max;
+    memmove(sb->data, sb->data + drop, max);
+    sb->len = max;
+    sb->data[sb->len] = '\0';
+}
+
 void sm_strbuf_destroy(sm_strbuf_t *sb)
 {
     free(sb->data);

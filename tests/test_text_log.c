@@ -6,7 +6,7 @@
 #include <glob.h>
 #include <unistd.h>
 #include <time.h>
-#include <unistd.h>
+#include <string.h>
 
 /* Fixed reference instant: 2009-02-13 23:31:30 UTC. All expectations are
  * derived through localtime_r() with the same seconds value the code under
@@ -188,6 +188,70 @@ static void test_long_line_truncated(void)
     unlink(path);
 }
 
+/* Bare CR is a line end (I3 / ACT-022). Must be visible without close. */
+static void test_bare_cr_is_line_end(void)
+{
+    set_dir("barecr");
+    char path[600];
+    expected_path(path, sizeof(path), "ttyUSB2", TS_BASE);
+    unlink(path);
+
+    sm_text_log_t *log = sm_text_log_open(g_dir, "/dev/ttyUSB2");
+    ASSERT_NOT_NULL(log);
+    if (!log) return;
+
+    sm_text_log_write(log, (const uint8_t *)"only-cr\r", 8, TS_BASE);
+
+    FILE *fp = fopen(path, "r");
+    ASSERT_NOT_NULL(fp);
+    if (fp) {
+        char stamp[32], line[256], want[300];
+        expected_stamp(stamp, sizeof(stamp), TS_BASE);
+        snprintf(want, sizeof(want), "%sonly-cr", stamp);
+        ASSERT_STR_EQ(read_line(fp, line, sizeof(line)), want);
+        fclose(fp);
+    }
+    sm_text_log_close(log);
+    unlink(path);
+}
+
+/* Failed day rotation must keep the previous fp (I3). */
+static void test_rotate_keeps_fp_on_open_fail(void)
+{
+    set_dir("rotfail");
+    mkdir(g_dir, 0700);
+    double day1 = TS_BASE;
+    double day2 = TS_BASE + 2 * 86400;
+    char path1[600];
+    expected_path(path1, sizeof(path1), "ttyACM1", day1);
+    unlink(path1);
+
+    sm_text_log_t *log = sm_text_log_open(g_dir, "/dev/ttyACM1");
+    ASSERT_NOT_NULL(log);
+    if (!log) return;
+    sm_text_log_write(log, (const uint8_t *)"keep-me\n", 8, day1);
+
+    chmod(g_dir, 0500);
+    sm_text_log_write(log, (const uint8_t *)"after-fail\n", 11, day2);
+    chmod(g_dir, 0700);
+    sm_text_log_close(log);
+
+    FILE *fp = fopen(path1, "r");
+    ASSERT_NOT_NULL(fp);
+    if (fp) {
+        char line[256];
+        int saw_keep = 0, saw_after = 0;
+        while (read_line(fp, line, sizeof(line))) {
+            if (strstr(line, "keep-me")) saw_keep = 1;
+            if (strstr(line, "after-fail")) saw_after = 1;
+        }
+        fclose(fp);
+        ASSERT(saw_keep, "original line still in old file");
+        ASSERT(saw_after, "post-rotate-fail line kept on previous fp");
+    }
+    unlink(path1);
+}
+
 static void test_null_safety(void)
 {
     sm_text_log_write(NULL, (const uint8_t *)"x\n", 2, TS_BASE);
@@ -273,6 +337,8 @@ int main(void)
     RUN_TEST(test_long_line_truncated);
     RUN_TEST(test_null_safety);
     RUN_TEST(test_flush_visible_without_close);
+    RUN_TEST(test_bare_cr_is_line_end);
+    RUN_TEST(test_rotate_keeps_fp_on_open_fail);
 
     TEST_REPORT();
 }

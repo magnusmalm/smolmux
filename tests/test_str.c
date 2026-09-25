@@ -46,6 +46,19 @@ static void test_steal(void)
     free(s);
 }
 
+static void test_cap_keeps_tail(void)
+{
+    sm_strbuf_t sb;
+    sm_strbuf_init(&sb);
+    sm_strbuf_append_str(&sb, "abcdefghij");
+    sm_strbuf_cap(&sb, 4);
+    ASSERT_INT_EQ((int)sb.len, 4);
+    ASSERT_STR_EQ(sb.data, "ghij");
+    sm_strbuf_cap(&sb, 100);
+    ASSERT_STR_EQ(sb.data, "ghij");
+    sm_strbuf_destroy(&sb);
+}
+
 static void test_empty_append(void)
 {
     sm_strbuf_t sb;
@@ -64,6 +77,7 @@ int main(void)
     RUN_TEST(test_printf);
     RUN_TEST(test_steal);
     RUN_TEST(test_empty_append);
+    RUN_TEST(test_cap_keeps_tail);
 
     TEST_REPORT();
 }

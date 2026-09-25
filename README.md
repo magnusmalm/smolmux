@@ -129,11 +129,15 @@ Options:
   --tcp-bind <addr>           TCP bind address (default: 127.0.0.1)
   --auth-token <token>        Require token in hello from TCP clients
                               (prefer env SMOLMUX_AUTH_TOKEN - hidden from ps)
+  --auth-token-file <path>    Read the token from a file
   --insecure-no-auth          Allow a non-loopback --tcp-bind with no token.
                               Refused by default: it is an open console.
   --ws-port <port>            Enable WebSocket sink (default: 5556)
   --no-text-log               Disable text log
+  --no-io-log                 Disable JSONL I/O log
   --no-reconnect              Don't auto-reconnect on disconnect
+  --wait-device <seconds>     Wait for the device path before open
+  --gdb-allow-shell           Permit GDB shell/python/eval (off by default)
   --list-ports                List available serial ports and exit
   --list-profiles             List available device profiles and exit
   --help-protocol             Show wire protocol documentation
@@ -158,7 +162,7 @@ Example session:
 
 ```json
 -> {"type":"hello","name":"my-tool","role":"controller","protocol_version":1}
-<- {"type":"welcome","broker_version":"0.2.0","protocol_version":1,"port":"/dev/ttyUSB0","baud":115200,"your_role":"controller"}
+<- {"type":"welcome","broker_version":"0.3.0","protocol_version":1,"port":"/dev/ttyUSB0","baud":115200,"your_role":"controller"}
 -> {"type":"send","id":"1","data":"dW5hbWUgLWEK"}
 <- {"type":"output","data":"TGludXggNC4xOS4w...","timestamp":1709654321.123}
 ```
@@ -231,8 +235,9 @@ complete product.
 
 **smolmux Pro** is convenience, not a feature gate: prebuilt static binaries
 (x86_64 + aarch64, musl, zero runtime dependencies), the curated profile pack
-with per-profile notes, the full MCP setup guide, and **6 months** of email
-support. One-time purchase (**$79**).
+with per-profile notes, and **6 months** of email support. One-time purchase
+(**$79**). MCP setup for zip paths is `docs/MCP-SETUP-FULL.md` (also in
+this public tree).
 
 **[Buy smolmux Pro - $79 one-time](https://buy.polar.sh/polar_cl_bby5IXfnmPSq6W8SLy0wzHDFm5nXch62djGUX4WXXZT)** -
 download includes current static binaries and the profile pack.

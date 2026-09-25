@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.3.0
+
+- Version is 0.3.0 (`SM_VERSION` and CMake `project VERSION`).
+- Named MCU and FPGA boards stay in the Pro zip `profiles/` directory.
+- The Pro zip includes a host installer. It copies packed `*.json` into
+  `~/.config/smolmux/` with `cp -n`, so files already in that directory are
+  left unchanged.
+- Zip updates are Polar customer portal only.
+- Auto-discover ignores leftover unreachable `.sock` files. Two live
+  brokers still require `-s`. `smolmux-cli brokers` lists leftovers.
+- `smolmux-cli status --json` (flag after the subcommand) emits JSON.
+- `--list-profiles` lists `~/.config/smolmux/` and `./profiles/`, not
+  `./configs/`.
+- Packed MCP setup uses `~/.local/bin` after the host installer.
+- `-h` / `--help` prints usage on stdout. Unknown options still print usage on
+  stderr.
+- Idle UART does not log a link-health warning or broadcast `link_health`
+  degraded. Never-RX idle is one INFO line. GDB `silence_normal` is unchanged.
+- Each `smolmux-cli` hello uses `smolmux-cli-<command>-<pid>`, so two CLI
+  sessions do not replace each other. MCP same-name replace is unchanged.
+- WEAK by-id startup warning points at `docs/PERSISTENT-SERIAL.md`.
+- `--list-profiles` prints each profile name once. `~/.config` wins over
+  `./profiles/`.
+- Human `identity_ambiguous` is a short stderr hint. `--json` still prints
+  the candidate list.
+
 ## 0.2.0
 
 - CLI/MCP refuse first-glob when more than one broker socket exists

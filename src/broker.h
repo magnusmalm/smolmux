@@ -46,6 +46,8 @@ typedef struct sm_broker {
     int reconnect_delay_s;
     int link_connecting;            /* async (non-blocking) reconnect in progress */
     double link_connect_deadline;   /* monotonic; give up the connect past this */
+    int pending_resume_ack;         /* 1 = broadcast resumed (not link_up) */
+    char pending_resume_id[64];     /* hello/resume id for the error path */
 
     /* Link health monitoring (for dogfooding reliability) */
     double last_link_rx_time;   /* Last successful byte received from link */
@@ -106,6 +108,7 @@ typedef struct sm_broker {
     char log_dir[256];
     char text_log_dir[256];
     int no_text_log;
+    int no_io_log;
     char auth_token[64];    /* required in hello from network clients if set */
 
     sm_sink_t **sinks;

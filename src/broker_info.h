@@ -2,6 +2,7 @@
 #define SM_BROKER_INFO_H
 
 #include <stddef.h>
+#include <stdio.h>
 #include "cJSON.h"
 #include "util/sock_util.h"
 
@@ -30,9 +31,15 @@ typedef struct sm_broker_info {
     char identity_strength[16]; /* WEAK / STRONG / n/a */
 } sm_broker_info_t;
 
+/* One port as JSON (caller owns the object). Always includes vid/pid. */
+cJSON *sm_serial_port_info_to_json(const sm_serial_port_info_t *info);
+
 /* Structured identity_ambiguous error (caller owns the object). */
 cJSON *sm_identity_ambiguous_json(const char *board, const char *device,
                                   const char *reason);
+
+void sm_identity_ambiguous_fprint(FILE *out, const char *board,
+                                  const char *device, const char *reason);
 
 /* Probe a broker at socket_path: connect as an observer, request status, and
  * fill *out. Returns 0 if reachable (out fully populated), -1 if not

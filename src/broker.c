@@ -634,51 +634,57 @@ int sm_broker_do_suspend(sm_broker_t *b, const char *by_name)
     return 0;
 }
 
+static int broker_identity_blocks_reopen(sm_broker_t *b)
+{
+    if (!b->identity_weak_by_id || !b->port[0])
+        return 0;
+    char now_path[256];
+    now_path[0] = '\0';
+    (void)sm_serial_resolve_by_path(b->port, now_path, sizeof(now_path));
+    return sm_identity_refuse_weak_seat_change(1, b->identity_by_path, now_path);
+}
+
+static void link_bring_up(sm_broker_t *b, int broadcast_up);
+static void link_watch_connecting(sm_broker_t *b);
+
 int sm_broker_do_resume(sm_broker_t *b, const char *by_name)
 {
     if (!b->suspended) return -1;
 
-    int rc = b->link->open(b->link);
-    if (rc != 0) return -2;
-
-    b->suspended = 0;
-    /* A prior disconnect may have left link_disconnected set; open succeeded
-     * so clear it (otherwise health/reconnect paths stay confused). */
-    b->link_disconnected = 0;
-    b->link_connecting = 0;
-
-    /* Reset health state after resume (we don't know yet if data will flow).
-     * last_link_rx_time is monotonic — it drives only the idle-duration health
-     * check, so it must not be perturbed by wall-clock/NTP steps. */
-    b->last_link_rx_time = sm_now_monotonic();
-    b->link_healthy = 0;   /* Will become healthy again on first real data */
-
-    int link_fd = b->link->read_fd(b->link);
-    if (link_fd >= 0) {
-        struct epoll_event ev = {.events = EPOLLIN | EPOLLHUP | EPOLLERR,
-                                 .data.ptr = EPOLL_TAG_LINK};
-        if (epoll_ctl(b->epoll_fd, EPOLL_CTL_ADD, link_fd, &ev) < 0) {
-            if (errno == EEXIST)
-                epoll_ctl(b->epoll_fd, EPOLL_CTL_MOD, link_fd, &ev);
-            else
-                SM_LOG_WARN(LOG_TAG, "epoll_ctl add link on resume: %s", strerror(errno));
-        }
-        int write_fd = b->link->write_fd ? b->link->write_fd(b->link) : link_fd;
-        if (write_fd >= 0 && write_fd != link_fd) {
-            struct epoll_event wev = {.events = 0, .data.ptr = EPOLL_TAG_LINK_OUT};
-            if (epoll_ctl(b->epoll_fd, EPOLL_CTL_ADD, write_fd, &wev) < 0 &&
-                errno != EEXIST)
-                SM_LOG_WARN(LOG_TAG, "epoll_ctl add link write on resume: %s",
-                            strerror(errno));
-        }
-        broker_update_link_epoll(b);
+    /* Same D1 gate as reconnect: weak by-id must not silently change seats. */
+    if (broker_identity_blocks_reopen(b)) {
+        SM_LOG_ERROR(LOG_TAG,
+            "refusing resume: weak by-id path %s moved seats (was %s)",
+            b->port,
+            b->identity_by_path[0] ? b->identity_by_path : "(unset)");
+        return -2;
     }
 
-    /* If a boot was in progress when we suspended, resume watching for a stall
-     * (a later stage advance would re-arm anyway, but a hang right after resume
-     * should still be caught). */
-    if (b->boot.furthest >= 0 && !sm_boot_terminal_reached(&b->boot))
-        stall_arm(b);
+    /* Serial-tcp: connect_begin/connect_poll so resume never blocks the
+     * epoll thread in getaddrinfo or a connect timeout. UART/GDB open()
+     * is O_NONBLOCK and must not sleep (gdb_close no longer nanosleeps).
+     * Blocking open stays in broker_setup only. */
+    int rc;
+    if (b->link->connect_begin) {
+        rc = b->link->connect_begin(b->link);
+        if (rc < 0)
+            return -2;
+        b->suspended = 0;
+        if (rc == 1) {
+            b->pending_resume_ack = 1;
+            link_watch_connecting(b);
+            SM_LOG_INFO(LOG_TAG, "resume connecting by %s", by_name);
+            return 0;
+        }
+        /* rc == 0: connected immediately */
+    } else {
+        rc = b->link->open(b->link);
+        if (rc != 0) return -2;
+        b->suspended = 0;
+    }
+
+    /* One site for epoll, identity, UP fence (D1 record). */
+    link_bring_up(b, 0);
 
     SM_LOG_INFO(LOG_TAG, "resumed by %s", by_name);
 
@@ -884,9 +890,12 @@ static void handle_send_expect(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
 
     /* Register expect BEFORE writing data */
     double timeout_s = (double)timeout_ms / 1000.0;
-    if (sm_expect_add(&b->expect, id, pattern, timeout_s, c->id) != 0) {
-        send_to_client(c, sm_msg_error(id, "invalid regex pattern"));
-        return;
+    {
+        int erc = sm_expect_add(&b->expect, id, pattern, timeout_s, c->id);
+        if (erc != 0) {
+            send_to_client(c, sm_msg_error(id, sm_expect_add_errstr(erc)));
+            return;
+        }
     }
 
     /* Send data to device */
@@ -906,7 +915,10 @@ static void handle_send_expect(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
         int rc = sm_broker_do_write(b, data, data_len, c->name);
         if (rc < 0) {
             sm_expect_cancel_id(&b->expect, id);
-            send_to_client(c, sm_msg_error(id, "write failed"));
+            const char *why = "write failed";
+            if (rc == -1) why = "serial port is suspended";
+            else if (rc == -2) why = "serial port disconnected";
+            send_to_client(c, sm_msg_error(id, why));
             free(data);
             return;
         }
@@ -942,10 +954,24 @@ static void handle_listen_expect(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     if (timeout_ms > SM_MAX_EXPECT_TIMEOUT_MS)
         timeout_ms = SM_MAX_EXPECT_TIMEOUT_MS;
 
-    double timeout_s = (double)timeout_ms / 1000.0;
-    if (sm_expect_add(&b->expect, id, pattern, timeout_s, c->id) != 0) {
-        send_to_client(c, sm_msg_error(id, "invalid regex pattern"));
+    double now = sm_now_monotonic();
+    if (now - c->listen_expect_window_start >= SM_LISTEN_EXPECT_RATE_WINDOW_S) {
+        c->listen_expect_window_start = now;
+        c->listen_expect_window_count = 0;
+    }
+    c->listen_expect_window_count++;
+    if (c->listen_expect_window_count > SM_LISTEN_EXPECT_RATE) {
+        send_to_client(c, sm_msg_error(id, "listen_expect rate limit"));
         return;
+    }
+
+    double timeout_s = (double)timeout_ms / 1000.0;
+    {
+        int erc = sm_expect_add(&b->expect, id, pattern, timeout_s, c->id);
+        if (erc != 0) {
+            send_to_client(c, sm_msg_error(id, sm_expect_add_errstr(erc)));
+            return;
+        }
     }
     /* No write — that is the whole point of listen_expect. */
 }
@@ -1040,6 +1066,8 @@ static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     /* Add log path */
     if (b->io_log)
         cJSON_AddStringToObject(resp, "log_path", b->io_log->path);
+    if (b->text_log && b->text_log->path[0])
+        cJSON_AddStringToObject(resp, "text_log_path", b->text_log->path);
 
     /* Boot-stage progress (only when a profile declares stages) */
     if (b->boot.stage_count > 0) {
@@ -1262,6 +1290,8 @@ static void handle_resume(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
         send_to_client(c, sm_msg_error(id, "not suspended"));
     else if (rc == -2)
         send_to_client(c, sm_msg_error(id, "failed to reopen serial port"));
+    else if (rc == 0 && b->pending_resume_ack && id)
+        snprintf(b->pending_resume_id, sizeof(b->pending_resume_id), "%s", id);
 }
 
 static void history_pending_clear(sm_broker_t *b)
@@ -1883,8 +1913,14 @@ sm_client_t *sm_broker_register_client(sm_broker_t *b, int fd)
     {
         struct ucred cred;
         socklen_t clen = sizeof(cred);
-        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0)
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0) {
             c->peer_pid = (int)cred.pid;
+            /* uid is diagnostic only; same-UID is not an authz boundary. */
+            SM_LOG_INFO(LOG_TAG, "new client %s (fd=%d pid=%d uid=%u)",
+                        c->id, fd, (int)cred.pid, (unsigned)cred.uid);
+        } else {
+            SM_LOG_INFO(LOG_TAG, "new client %s (fd=%d)", c->id, fd);
+        }
     }
     b->clients[b->client_count++] = c;
 
@@ -1896,7 +1932,6 @@ sm_client_t *sm_broker_register_client(sm_broker_t *b, int fd)
         return NULL;
     }
 
-    SM_LOG_INFO(LOG_TAG, "new client %s (fd=%d)", c->id, fd);
     return c;
 }
 
@@ -2146,7 +2181,8 @@ static void handle_link_disconnect(sm_broker_t *b)
     b->link->close(b->link);
     b->link_disconnected = 1;
     b->reconnect_delay_s = SM_RECONNECT_BASE_S;
-    b->reconnect_next = sm_now_monotonic() + b->reconnect_delay_s;
+    /* First reconnect try is immediate; backoff starts after a failed open. */
+    b->reconnect_next = sm_now_monotonic();
 
     history_fence(b, SM_HISTORY_FENCE_DOWN);
     sm_expect_abort_all(&b->expect, "link_down", "link_down");
@@ -2243,7 +2279,7 @@ static int broker_setup(sm_broker_t *b)
 
     broker_record_identity(b);
 
-    if (b->log_dir[0]) {
+    if (b->log_dir[0] && !b->no_io_log) {
         char tag[128], path[512];
         io_log_tag_from_port(b->port, tag, sizeof(tag));
         snprintf(path, sizeof(path), SM_IO_LOG_FILE_FMT, b->log_dir, tag);
@@ -2315,11 +2351,11 @@ static int broker_setup(sm_broker_t *b)
 /* Schedule the next reconnect attempt with exponential backoff. */
 static void link_schedule_retry(sm_broker_t *b)
 {
+    b->reconnect_next = sm_now_monotonic() + b->reconnect_delay_s;
+    SM_LOG_DEBUG(LOG_TAG, "reconnect failed, retry in %ds", b->reconnect_delay_s);
     b->reconnect_delay_s *= 2;
     if (b->reconnect_delay_s > SM_RECONNECT_MAX_S)
         b->reconnect_delay_s = SM_RECONNECT_MAX_S;
-    b->reconnect_next = sm_now_monotonic() + b->reconnect_delay_s;
-    SM_LOG_DEBUG(LOG_TAG, "reconnect failed, retry in %ds", b->reconnect_delay_s);
 }
 
 /* A link (re)connected: register it for I/O, reset health, clear the
@@ -2369,9 +2405,16 @@ static void link_bring_up(sm_broker_t *b, int broadcast_up)
     SM_LOG_INFO(LOG_TAG, "link reconnected");
 
     if (broadcast_up) {
-        cJSON *up = sm_msg_link_up(b->port);
-        broadcast(b, up, NULL);
-        cJSON_Delete(up);
+        if (b->pending_resume_ack) {
+            cJSON *rmsg = sm_msg_resumed(b->port);
+            broadcast(b, rmsg, NULL);
+            cJSON_Delete(rmsg);
+            b->pending_resume_ack = 0;
+        } else {
+            cJSON *up = sm_msg_link_up(b->port);
+            broadcast(b, up, NULL);
+            cJSON_Delete(up);
+        }
     }
 }
 
@@ -2396,6 +2439,15 @@ static void link_connect_give_up(sm_broker_t *b)
     b->link_connecting = 0;
     b->link->close(b->link);
     b->link_disconnected = 1;
+    if (b->pending_resume_ack) {
+        cJSON *err = sm_msg_error(b->pending_resume_id[0] ? b->pending_resume_id : "",
+                                  "failed to reopen serial port");
+        broadcast(b, err, NULL);
+        cJSON_Delete(err);
+        b->pending_resume_ack = 0;
+        b->pending_resume_id[0] = '\0';
+        b->suspended = 1; /* do not reconnect while a resume failed */
+    }
     link_schedule_retry(b);
 }
 
@@ -2420,35 +2472,30 @@ static void attempt_reconnect(sm_broker_t *b)
     if (!b->link_disconnected || !b->reconnect) return;
     if (sm_now_monotonic() < b->reconnect_next) return;
 
+    /* Weak by-id: refuse silent rebind if last or now seat is unknown or
+     * the physical seat changed. Do not skip this when last seat is empty.
+     * Run before connect_begin so UART and serial-tcp share D1. */
+    if (broker_identity_blocks_reopen(b)) {
+        SM_LOG_ERROR(LOG_TAG,
+            "refusing reconnect: weak by-id path %s moved seats "
+            "(was %s). Stop the broker or rebind deliberately "
+            "(see docs/PERSISTENT-SERIAL.md)",
+            b->port,
+            b->identity_by_path[0] ? b->identity_by_path : "(unset)");
+        /* Back off hard so we do not thrash; operator must intervene. */
+        b->reconnect_next = sm_now_monotonic() + 30.0;
+        return;
+    }
+
     /* Async path (e.g. serial-tcp): initiate a non-blocking connect so a slow
-     * or unreachable server never stalls the event loop. */
+     * or unreachable server never stalls the event loop. Reconnect uses the
+     * cached address (no getaddrinfo on this thread while the cache holds). */
     if (b->link->connect_begin) {
         int rc = b->link->connect_begin(b->link);
         if (rc == 0)       link_bring_up(b, 1);       /* immediate (loopback) */
         else if (rc == 1)  link_watch_connecting(b);  /* completes async */
         else               link_schedule_retry(b);    /* immediate failure */
         return;
-    }
-
-    /* Weak by-id: refuse silent rebind if last or now seat is unknown or
-     * the physical seat changed. Do not skip this when last seat is empty. */
-    if (b->identity_weak_by_id && b->port[0]) {
-        char now_path[256];
-        now_path[0] = '\0';
-        (void)sm_serial_resolve_by_path(b->port, now_path, sizeof(now_path));
-        if (sm_identity_refuse_weak_seat_change(1, b->identity_by_path,
-                                                now_path)) {
-            SM_LOG_ERROR(LOG_TAG,
-                "refusing reconnect: weak by-id path %s moved seats "
-                "(was %s, now %s). Stop the broker or rebind deliberately "
-                "(see docs/persistent-serial-devices.md)",
-                b->port,
-                b->identity_by_path[0] ? b->identity_by_path : "(unset)",
-                now_path[0] ? now_path : "(unresolved)");
-            /* Back off hard so we do not thrash; operator must intervene. */
-            b->reconnect_next = sm_now_monotonic() + 30.0;
-            return;
-        }
     }
 
     /* Blocking fallback (uart/gdb): open() at startup/reconnect is quick. */
@@ -2603,18 +2650,21 @@ int sm_broker_run(sm_broker_t *b)
                 continue;
             }
             if (ptr == EPOLL_TAG_LINK && !b->suspended && !b->link_disconnected) {
-                if (ev & (EPOLLHUP | EPOLLERR))
+                /* Drain RX before HUP/ERR. The kernel delivers EPOLLIN|EPOLLHUP
+                 * together on unplug when unread bytes remain; HUP-first
+                 * dropped those last console lines from history. Drain even
+                 * on HUP-only so leftover bytes are not left on the fd. */
+                if (ev & (EPOLLIN | EPOLLHUP | EPOLLERR))
+                    process_link_data(b);
+                if (!b->link_disconnected && (ev & (EPOLLHUP | EPOLLERR)))
                     handle_link_disconnect(b);
-                else {
-                    if (ev & EPOLLIN)
-                        process_link_data(b);
-                    if ((ev & EPOLLOUT) && b->link->flush_write_queue) {
-                        int rc = b->link->flush_write_queue(b->link);
-                        if (rc < 0)
-                            handle_link_disconnect(b);
-                        else
-                            broker_update_link_epoll(b);
-                    }
+                if (!b->link_disconnected && (ev & EPOLLOUT) &&
+                    b->link->flush_write_queue) {
+                    int rc = b->link->flush_write_queue(b->link);
+                    if (rc < 0)
+                        handle_link_disconnect(b);
+                    else
+                        broker_update_link_epoll(b);
                 }
                 continue;
             }
@@ -2685,25 +2735,17 @@ int sm_broker_run(sm_broker_t *b)
                 !b->link->silence_normal) {
                 double idle = now - b->last_link_rx_time;
                 if (b->last_link_rx_time > 0 &&
-                    idle > sm_broker_test_idle_degraded_s) {
+                    idle > sm_broker_test_idle_degraded_s &&
+                    b->bytes_rx_since_link_up == 0) {
                     if (b->link_healthy) {
-                        SM_LOG_WARN(LOG_TAG,
-                            "LINK HEALTH WARNING: No data received for %.1fs (port=%s). "
-                            "Link may be stuck or disconnected. Clients may see stale data.",
+                        SM_LOG_INFO(LOG_TAG,
+                            "No UART bytes for %.1fs (port=%s, still Connected). "
+                            "Idle consoles are normal. Pulse DTR/RTS if you expected a banner.",
                             idle, b->port);
                         b->link_healthy = 0;
                     }
-                    /* Broadcast health status so MCP/monitor clients can react */
-                    cJSON *health = cJSON_CreateObject();
-                    cJSON_AddStringToObject(health, "type", "link_health");
-                    cJSON_AddStringToObject(health, "status", "degraded");
-                    cJSON_AddNumberToObject(health, "idle_seconds", idle);
-                    cJSON_AddStringToObject(health, "port", b->port);
-                    sm_broker_broadcast_msg(b, health);
-                    cJSON_Delete(health);
                 } else if (idle < sm_broker_test_idle_recovered_s &&
                            !b->link_healthy) {
-                    /* Recovered */
                     b->link_healthy = 1;
                     SM_LOG_INFO(LOG_TAG, "Link health recovered (data flowing again)");
                 }

@@ -1,5 +1,6 @@
 #include "test_main.h"
 #include "expect.h"
+#include "constants.h"
 
 #include <time.h>
 #include <unistd.h>
@@ -135,6 +136,27 @@ static void test_regex_special_chars(void)
     sm_expect_destroy(&eng);
 }
 
+static void test_add_errors_are_distinct(void)
+{
+    sm_expect_engine_t eng;
+    sm_expect_init(&eng);
+
+    ASSERT_INT_EQ(sm_expect_add(&eng, "bad", "[", 1.0, "c1"),
+                  SM_EXPECT_ERR_BAD_PATTERN);
+
+    int i;
+    for (i = 0; i < SM_MAX_EXPECT_PER_CLIENT; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "e%d", i);
+        ASSERT_INT_EQ(sm_expect_add(&eng, id, "x", 1.0, "c1"), 0);
+    }
+    ASSERT_INT_EQ(sm_expect_add(&eng, "one-more", "x", 1.0, "c1"),
+                  SM_EXPECT_ERR_PER_CLIENT);
+    ASSERT_INT_EQ(sm_expect_add(&eng, "other", "x", 1.0, "c2"), 0);
+
+    sm_expect_destroy(&eng);
+}
+
 static void test_invalid_pattern(void)
 {
     sm_expect_engine_t eng;
@@ -229,6 +251,37 @@ static void test_abort_all_critical(void)
     sm_expect_destroy(&eng);
 }
 
+/* ACT-050: at 256KiB, slide the window so a late NEEDLE still matches.
+ * The old path skipped the feed (continue) and never matched. */
+static void test_slide_at_max_buf_still_matches(void)
+{
+    sm_expect_engine_t eng;
+    sm_expect_init(&eng);
+    sm_expect_add(&eng, "slide", "NEEDLE", 5.0, "client-1");
+
+    uint8_t noise[4096];
+    memset(noise, 'x', sizeof(noise));
+    size_t filled = 0;
+    while (filled < SM_MAX_EXPECT_BUF_SIZE) {
+        size_t n = sizeof(noise);
+        if (filled + n > SM_MAX_EXPECT_BUF_SIZE)
+            n = SM_MAX_EXPECT_BUF_SIZE - filled;
+        sm_expect_feed(&eng, noise, n);
+        filled += n;
+    }
+    sm_expect_feed(&eng, (const uint8_t *)"NEEDLE", 6);
+
+    sm_expect_result_t results[4];
+    size_t count = sm_expect_collect(&eng, now_mono(), results, 4);
+    ASSERT_INT_EQ((int)count, 1);
+    ASSERT_INT_EQ(results[0].matched, 1);
+    ASSERT(results[0].data && memmem(results[0].data, results[0].data_len,
+                                     "NEEDLE", 6),
+           "slid window contains NEEDLE");
+    free(results[0].data);
+    sm_expect_destroy(&eng);
+}
+
 static void test_timeout_not_aborted(void)
 {
     sm_expect_engine_t eng;
@@ -257,10 +310,12 @@ int main(void)
     RUN_TEST(test_multiple_concurrent);
     RUN_TEST(test_cancel_client);
     RUN_TEST(test_regex_special_chars);
+    RUN_TEST(test_add_errors_are_distinct);
     RUN_TEST(test_invalid_pattern);
     RUN_TEST(test_match_in_large_buffer);
     RUN_TEST(test_match_spanning_chunks_in_large_buffer);
     RUN_TEST(test_abort_all_critical);
+    RUN_TEST(test_slide_at_max_buf_still_matches);
     RUN_TEST(test_timeout_not_aborted);
 
     TEST_REPORT();

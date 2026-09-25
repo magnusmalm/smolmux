@@ -262,6 +262,28 @@ static void test_conn_wait_drains_data_before_hangup(void)
     sm_broker_conn_destroy(&c);
 }
 
+/* Clone of wait() IN-then-HUP onto pump (ACT-016). */
+static void test_conn_pump_drains_data_before_hangup(void)
+{
+    int sv[2];
+    ASSERT_INT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    const char *line =
+        "{\"type\":\"error\",\"message\":\"authentication failed\"}\n";
+    ASSERT(write(sv[1], line, strlen(line)) > 0, "queued the final message");
+    close(sv[1]);
+
+    sm_broker_conn_t c;
+    ASSERT_INT_EQ(sm_broker_conn_init(&c, 4096), 0);
+    c.fd = sv[0];
+
+    int rc = sm_broker_conn_pump(&c, 1000);
+    ASSERT(rc == 1, "pump delivered POLLIN before HUP (not -1)");
+    ASSERT(c.running, "connection still running after draining the line");
+
+    sm_broker_conn_destroy(&c);
+}
+
 static char g_event_type[32];
 static void event_cb(void *user, const char *type, cJSON *root)
 {
@@ -420,6 +442,23 @@ static void test_mcp_e2e_smoke(void)
     ASSERT(n > 0, "device received data");
     ASSERT(strstr(devbuf, "hello-mcp") != NULL, "device got serial_write payload");
 
+    /* As-is bytes: JSON "x\\ry" parses to x, backslash, r, y — not CR. */
+    resp = rpc_call(&fx, 31,
+        "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_write\",\"arguments\":{\"data\":\"x\\\\ry\"}}}",
+        500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) cJSON_Delete(resp);
+    memset(devbuf, 0, sizeof(devbuf));
+    n = 0;
+    for (int i = 0; i < 100 && n <= 0; i++) {
+        n = read(fx.master, devbuf, sizeof(devbuf) - 1);
+        if (n <= 0) usleep(10000);
+    }
+    ASSERT(n == 4, "as-is write is 4 bytes");
+    ASSERT(n >= 4 && memcmp(devbuf, "x\\ry", 4) == 0,
+           "standalone serial_write does not C-unescape");
+
     /* serial_read: device -> broker -> MCP output buffer */
     write(fx.master, "device-says-hi\n", 15);
     usleep(200000);  /* let output propagate broker -> mcp buffer */
@@ -532,6 +571,119 @@ static void test_mcp_e2e_smoke(void)
     }
 
     teardown(&fx);
+    unsetenv("SMOLMUX_MCP_MUTATE");
+}
+
+static void test_mcp_mutate_off_e2e(void)
+{
+    unsetenv("SMOLMUX_MCP_MUTATE");
+    fixture_t fx;
+    setup(&fx);
+
+    cJSON *resp = rpc_call(&fx, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        200);
+    ASSERT_NOT_NULL(resp);
+    if (resp) cJSON_Delete(resp);
+    rpc_send(&fx, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+
+    resp = rpc_call(&fx, 2,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}", 500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        cJSON *tools = cJSON_GetObjectItem(
+            cJSON_GetObjectItem(resp, "result"), "tools");
+        ASSERT(cJSON_IsArray(tools), "tools list");
+        ASSERT_INT_EQ(cJSON_GetArraySize(tools), 9);
+        int saw_read = 0;
+        int saw_write = 0, saw_send = 0, saw_sysrq = 0, saw_pin = 0;
+        cJSON *t;
+        cJSON_ArrayForEach(t, tools) {
+            const char *n = sm_json_get_string(t, "name");
+            if (!n) continue;
+            if (strcmp(n, "serial_read") == 0) saw_read = 1;
+            if (strcmp(n, "serial_write") == 0) saw_write = 1;
+            if (strcmp(n, "serial_send_command") == 0) saw_send = 1;
+            if (strcmp(n, "serial_sysrq") == 0) saw_sysrq = 1;
+            if (strcmp(n, "serial_pin_control") == 0) saw_pin = 1;
+        }
+        ASSERT(saw_read, "serial_read listed");
+        ASSERT(!saw_write, "serial_write omitted when mutate off");
+        ASSERT(!saw_send, "serial_send_command omitted when mutate off");
+        ASSERT(!saw_sysrq, "serial_sysrq omitted when mutate off");
+        ASSERT(!saw_pin, "serial_pin_control omitted when mutate off");
+        {
+            const char *mutate8[] = {
+                "serial_write", "serial_send_command", "serial_sysrq",
+                "serial_pin_control", "serial_add_autoresponder",
+                "serial_suspend", "serial_resume", "serial_add_watchdog",
+            };
+            for (int i = 0; i < 8; i++) {
+                int hit = 0;
+                cJSON *u;
+                cJSON_ArrayForEach(u, tools) {
+                    const char *n = sm_json_get_string(u, "name");
+                    if (n && strcmp(n, mutate8[i]) == 0)
+                        hit = 1;
+                }
+                ASSERT(!hit, "no mutate name in default tools/list");
+            }
+        }
+        cJSON_Delete(resp);
+    }
+
+    resp = rpc_call(&fx, 3,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_write\",\"arguments\":{\"data\":\"mutate-off-tx\"}}}",
+        500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        const char *text = tool_text(resp);
+        ASSERT(text && strstr(text, "mutate tools disabled") != NULL,
+               "standalone dispatch refuses serial_write");
+        cJSON_Delete(resp);
+    }
+    resp = rpc_call(&fx, 4,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_send_command\",\"arguments\":{\"command\":\"id\"}}}",
+        500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        const char *text = tool_text(resp);
+        ASSERT(text && strstr(text, "mutate tools disabled") != NULL,
+               "standalone dispatch refuses serial_send_command");
+        cJSON_Delete(resp);
+    }
+    resp = rpc_call(&fx, 5,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_sysrq\",\"arguments\":{\"key\":\"b\"}}}",
+        500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        const char *text = tool_text(resp);
+        ASSERT(text && strstr(text, "mutate tools disabled") != NULL,
+               "standalone dispatch refuses serial_sysrq");
+        cJSON_Delete(resp);
+    }
+    resp = rpc_call(&fx, 6,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_pin_control\",\"arguments\":"
+        "{\"pin\":\"dtr\",\"action\":\"pulse\"}}}",
+        500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        const char *text = tool_text(resp);
+        ASSERT(text && strstr(text, "mutate tools disabled") != NULL,
+               "standalone dispatch refuses serial_pin_control");
+        cJSON_Delete(resp);
+    }
+    char devbuf[64] = {0};
+    int fl = fcntl(fx.master, F_GETFL, 0);
+    fcntl(fx.master, F_SETFL, fl | O_NONBLOCK);
+    ssize_t n = read(fx.master, devbuf, sizeof(devbuf) - 1);
+    ASSERT(n <= 0, "no TX on device when mutate off");
+
+    teardown(&fx);
 }
 
 int main(int argc, char *argv[])
@@ -547,7 +699,9 @@ int main(int argc, char *argv[])
     g_mcp_bin = argv[1];
 
     RUN_TEST(test_mcp_e2e_smoke);
+    RUN_TEST(test_mcp_mutate_off_e2e);
     RUN_TEST(test_conn_wait_drains_data_before_hangup);
+    RUN_TEST(test_conn_pump_drains_data_before_hangup);
     RUN_TEST(test_conn_event_cb_link_down);
 #if SM_ENABLE_SINK_TCP
     RUN_TEST(test_mcp_auth_rejection_reaches_agent);

@@ -13,6 +13,7 @@ typedef struct sm_text_log {
     int current_year;      /* tm_year for rotation check */
     char line_buf[4096];
     size_t line_len;
+    char path[512];
 } sm_text_log_t;
 
 sm_text_log_t *sm_text_log_open(const char *dir, const char *port_name);

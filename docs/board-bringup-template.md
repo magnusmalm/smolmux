@@ -50,7 +50,7 @@ the board's "socket map".
 | Ethernet / other |                 |                    |        |
 
 If console + SWD share **one USB plug** (dual FTDI), note both by-id paths
-and which interface OpenOCD owns — see `docs/dual-service-usb-cable.md`.
+and which interface OpenOCD owns, see `docs/dual-service-usb-cable.md`.
 
 Broker command per wire (keyed by role):
 - **Console UART** - `smolmux /dev/ttyUSB0 -b 115200 --board <board> --role console -p configs/<board>.smolmux-profile.json -s /tmp/smolmux-<board>-console.sock`
@@ -62,7 +62,8 @@ Verify the grouping: `smolmux-cli boards` (or `smolmux-cli boards --json`).
 
 Or capture these wires as a `*.board.json` manifest and bring them all up with
 `smolmux-cli board up <manifest>` (detached; `--foreground` for CI). Stop with
-`smolmux-cli board down <board>`. See `configs/samc21.board.json`.
+`smolmux-cli board down <board>`. See `configs/newboard.board.json`.
+Named MCU manifests ship in the Pro zip `profiles/` directory.
 
 ## 3. Discovered facts (confirmed via smolmux)
 

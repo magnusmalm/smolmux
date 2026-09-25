@@ -11,6 +11,7 @@
 #include "protocol.h"
 #include "util/base64.h"
 #include "util/json_helpers.h"
+#include "monitor_esc.h"
 
 #include <pthread.h>
 #include <unistd.h>
@@ -180,6 +181,19 @@ static void test_send_keystroke(void)
     teardown(&ctx);
 }
 
+/* CTL-1: escape 'c' is not a second hello. Owning-phase helper. */
+static void test_escape_c_is_not_hello(void)
+{
+    ASSERT_INT_EQ(sm_mon_esc_kind('c'), SM_MON_ESC_RESTART_C);
+    ASSERT(sm_mon_esc_kind('c') != SM_MON_ESC_FORWARD, "c is not forwarded");
+    ASSERT_INT_EQ(sm_mon_esc_kind('q'), SM_MON_ESC_QUIT);
+    ASSERT_INT_EQ(sm_mon_esc_kind('t'), SM_MON_ESC_TAKEOVER);
+    ASSERT_INT_EQ(sm_mon_esc_wire(SM_MON_ESC_RESTART_C), SM_MON_WIRE_NONE);
+    ASSERT_INT_EQ(sm_mon_esc_wire(sm_mon_esc_kind('c')), SM_MON_WIRE_NONE);
+    ASSERT_INT_EQ(sm_mon_esc_wire(SM_MON_ESC_STATUS), SM_MON_WIRE_STATUS);
+    ASSERT_INT_EQ(sm_mon_esc_wire(SM_MON_ESC_TAKEOVER), SM_MON_WIRE_TAKEOVER);
+}
+
 static void test_role_upgrade_rejected(void)
 {
     test_ctx_t ctx;
@@ -238,6 +252,7 @@ int main(void)
 
     RUN_TEST(test_connect_observe);
     RUN_TEST(test_send_keystroke);
+    RUN_TEST(test_escape_c_is_not_hello);
     RUN_TEST(test_role_upgrade_rejected);
     RUN_TEST(test_status_request);
 

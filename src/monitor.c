@@ -8,7 +8,6 @@
  *   q / prefix  quit
  *   h / ?       help
  *   s           status request
- *   c           upgrade to controller
  *   t           takeover
  *   r           release
  *   b           send break
@@ -22,6 +21,7 @@
 #include "util/json_helpers.h"
 #include "util/keyspec.h"
 #include "util/sock_util.h"
+#include "monitor_esc.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -316,13 +316,18 @@ static void show_help(void)
     dprintf(STDERR_FILENO,
         "  h/?  this help\r\n"
         "  s    status\r\n"
-        "  c    upgrade to controller\r\n"
         "  t    takeover (exclusive send)\r\n"
         "  r    release takeover\r\n"
         "  b    send break\r\n"
         "  z    suspend (release port for external tools)\r\n"
         "  Z    resume (re-acquire port)\r\n"
         "--------------------------------------------\r\n");
+}
+
+static void observer_restart_hint(void)
+{
+    dprintf(STDERR_FILENO,
+            "\r\n[keystrokes not sent; restart with -c]\r\n");
 }
 
 static void handle_escape(uint8_t ch)
@@ -334,48 +339,53 @@ static void handle_escape(uint8_t ch)
         return;
     }
 
-    switch (ch) {
-    case 'q':
+    int kind = sm_mon_esc_kind(ch);
+    switch (kind) {
+    case SM_MON_ESC_QUIT:
         mon.running = 0;
         break;
-    case 'h':
-    case '?':
+    case SM_MON_ESC_HELP:
         show_help();
         break;
-    case 's':
+    case SM_MON_ESC_RESTART_C:
+        observer_restart_hint();
+        break;
+    default:
+        break;
+    }
+    /* Broker JSON only via sm_mon_esc_wire — RESTART_C is NONE (no hello). */
+    switch (sm_mon_esc_wire(kind)) {
+    case SM_MON_WIRE_STATUS:
         send_msg(sm_msg_status("mon-status"));
         break;
-    case 'c':
-        send_msg(sm_msg_hello(mon.name, "controller"));
-        dprintf(STDERR_FILENO, "\r\n[requesting controller role]\r\n");
-        break;
-    case 't':
+    case SM_MON_WIRE_TAKEOVER:
         send_msg(sm_msg_takeover("mon-takeover"));
         dprintf(STDERR_FILENO, "\r\n[requesting takeover]\r\n");
         break;
-    case 'r':
+    case SM_MON_WIRE_RELEASE:
         send_msg(sm_msg_release("mon-release"));
         dprintf(STDERR_FILENO, "\r\n[releasing takeover]\r\n");
         break;
-    case 'b':
+    case SM_MON_WIRE_BREAK:
         send_msg(sm_msg_pin_control("mon-brk", "break", "pulse", 250));
         dprintf(STDERR_FILENO, "\r\n[sending break]\r\n");
         break;
-    case 'z':
-        /* Controller-only at the broker; an observer gets an error reply,
-         * which handle_error surfaces. Use 'c'/'t' first to gain control. */
+    case SM_MON_WIRE_SUSPEND:
         send_msg(sm_msg_suspend("mon-suspend"));
         dprintf(STDERR_FILENO, "\r\n[requesting suspend — releasing port]\r\n");
         break;
-    case 'Z':
+    case SM_MON_WIRE_RESUME:
         send_msg(sm_msg_resume("mon-resume"));
         dprintf(STDERR_FILENO, "\r\n[requesting resume — re-acquiring port]\r\n");
         break;
-    default:
-        /* Forward the prefix key + the key as data */
-        if (strcmp(mon.role, "controller") == 0) {
-            uint8_t pair[2] = { mon.escape_char, ch };
-            send_msg(sm_msg_send("mon", pair, 2));
+    case SM_MON_WIRE_NONE:
+        if (kind == SM_MON_ESC_FORWARD) {
+            if (strcmp(mon.role, "controller") == 0) {
+                uint8_t pair[2] = { mon.escape_char, ch };
+                send_msg(sm_msg_send("mon", pair, 2));
+            } else {
+                observer_restart_hint();
+            }
         }
         break;
     }
@@ -425,13 +435,15 @@ static void handle_stdin_data(void)
 
     if (out_len > 0 && is_controller)
         send_msg(sm_msg_send("mon", out, out_len));
+    else if (out_len > 0)
+        observer_restart_hint();
 }
 
 /* --- Main --- */
 
-static void usage(const char *prog)
+static void usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
+    fprintf(out,
         "%s-monitor — interactive terminal client for smolmux\n"
         "\n"
         "Connects to a running smolmux broker and provides raw terminal\n"
@@ -447,7 +459,8 @@ static void usage(const char *prog)
         "  -e, --escape <key>      Prefix key: caret notation (^], ^A, ^?) or\n"
         "                          'esc' (default: ^] = Ctrl-])\n"
         "  -L, --list              List active brokers and what each holds, then exit\n"
-        "  -s, --socket <path>     Broker socket (same as smolmux-cli -s)\n"
+        "  -s, --socket <path>     Broker socket (not the TTY; a char device\n"
+        "                          is derived to the broker sock)\n"
         "  --tcp <host:port>       Connect via TCP instead of Unix socket\n"
         "  -V, --version           Show version\n"
         "  -h, --help              Show help\n"
@@ -463,7 +476,6 @@ static void usage(const char *prog)
         "  q    quit\n"
         "  h/?  help\n"
         "  s    status request\n"
-        "  c    upgrade to controller\n"
         "  t    takeover (exclusive send)\n"
         "  r    release takeover\n"
         "  b    send break\n"
@@ -557,10 +569,10 @@ int main(int argc, char *argv[])
             printf("%s-monitor %s\n", SM_NAME, SM_VERSION);
             return 0;
         case 'h':
-            usage(argv[0]);
+            usage(stdout, argv[0]);
             return 0;
         default:
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return 1;
         }
     }
@@ -603,11 +615,20 @@ int main(int argc, char *argv[])
             socket_path = env;
         } else {
             char socks[64][SM_SOCK_PATH_MAX];
-            size_t n = sm_discover_all_sockets(socks, 64);
+            size_t n = sm_discover_reachable_sockets(socks, 64);
             if (n == 0) {
-                fprintf(stderr, "Error: no broker socket found\n"
-                        "  Specify path, set %s, or start a broker\n",
-                        SM_SOCKET_ENV);
+                char leftover[64][SM_SOCK_PATH_MAX];
+                size_t nall = sm_discover_all_sockets(leftover, 64);
+                if (nall > 0)
+                    fprintf(stderr,
+                            "Error: no live broker socket found\n"
+                            "  %zu leftover socket(s); smolmux-cli brokers lists them\n"
+                            "  Specify path, set %s, or start a broker\n",
+                            nall, SM_SOCKET_ENV);
+                else
+                    fprintf(stderr, "Error: no broker socket found\n"
+                            "  Specify path, set %s, or start a broker\n",
+                            SM_SOCKET_ENV);
                 return 1;
             } else if (n == 1) {
                 snprintf(discovered_path, sizeof(discovered_path), "%s", socks[0]);
@@ -620,6 +641,24 @@ int main(int argc, char *argv[])
             }
         }
 
+        {
+            char resolved[SM_SOCK_PATH_MAX];
+            int rrs = sm_resolve_client_socket(resolved, sizeof(resolved),
+                                               socket_path);
+            if (rrs < 0) {
+                fprintf(stderr, "Error: cannot resolve socket from '%s'\n"
+                                "  smolmux-cli brokers\n", socket_path);
+                return 1;
+            }
+            if (rrs == 1) {
+                fprintf(stderr,
+                        "note: '%s' is a device node; using socket %s\n"
+                        "  smolmux-cli brokers lists live brokers\n",
+                        socket_path, resolved);
+            }
+            snprintf(discovered_path, sizeof(discovered_path), "%s", resolved);
+            socket_path = discovered_path;
+        }
         mon.sock_fd = sm_connect_unix(socket_path);
         if (mon.sock_fd < 0) {
             fprintf(stderr, "Error: cannot connect to %s: %s\n",

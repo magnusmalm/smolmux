@@ -46,6 +46,8 @@ For an unfamiliar board over console + SWD, with an AI agent as assistant:
    set board name, console `device` (prefer `/dev/serial/by-id/...`), `baud`,
    and GDB `target`. Procedure:
    [board-exploration-workflow.md](board-exploration-workflow.md) Step 1.
+   Named MCU and FPGA JSON is not in a public clone. Get those files from the
+   Pro zip `profiles/` directory.
 2. **Unknown chip?** Generic-SWD cold-attach:
    [openocd-cold-attach.md](openocd-cold-attach.md) (Cortex-M DAP is enough to start).
 3. **Point the agent at it.** Register MCP servers ([MCP-SETUP.md](MCP-SETUP.md)),

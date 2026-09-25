@@ -92,9 +92,14 @@ static char *tool_serial_send_command(sm_mcp_sink_t *mcp, cJSON *args,
     mcp_gen_expect_id(mcp, expect_id, sizeof(expect_id));
 
     double timeout_s = (double)timeout_ms / 1000.0;
-    if (sm_expect_add(&b->expect, expect_id, pattern, timeout_s,
-                       SM_MCP_CLIENT_ID) != 0) {
-        return strdup("[ERROR] invalid regex pattern");
+    {
+        int erc = sm_expect_add(&b->expect, expect_id, pattern, timeout_s,
+                                SM_MCP_CLIENT_ID);
+        if (erc != 0) {
+            char err[128];
+            snprintf(err, sizeof(err), "[ERROR] %s", sm_expect_add_errstr(erc));
+            return strdup(err);
+        }
     }
 
     /* Write command to device */
@@ -307,6 +312,8 @@ static char *tool_serial_pin_control(sm_mcp_sink_t *mcp, cJSON *args,
 
     if (!mcp_pin_is_line_control(pin))
         return strdup("[ERROR] unknown pin (expected dtr, rts, or break)");
+    if (strcmp(action, "send") == 0 && strcmp(pin, "break") != 0)
+        action = "pulse";
 
     if (strcmp(pin, "break") == 0) {
         mcp_break_ctx_t *ctx = calloc(1, sizeof(*ctx));
@@ -398,9 +405,14 @@ static char *tool_serial_wait_for(sm_mcp_sink_t *mcp, cJSON *args,
     mcp_gen_expect_id(mcp, expect_id, sizeof(expect_id));
 
     double timeout_s = (double)timeout_ms / 1000.0;
-    if (sm_expect_add(&b->expect, expect_id, pattern, timeout_s,
-                       SM_MCP_CLIENT_ID) != 0) {
-        return strdup("[ERROR] invalid regex pattern");
+    {
+        int erc = sm_expect_add(&b->expect, expect_id, pattern, timeout_s,
+                                SM_MCP_CLIENT_ID);
+        if (erc != 0) {
+            char err[128];
+            snprintf(err, sizeof(err), "[ERROR] %s", sm_expect_add_errstr(erc));
+            return strdup(err);
+        }
     }
 
     sm_mcp_pending_t *p = mcp_alloc_pending(mcp, jsonrpc_id, expect_id);
@@ -446,15 +458,19 @@ static char *history_json_page(sm_broker_t *b, uint64_t since_seq, int max_bytes
          * with NULs stripped for MCP JSON. */
         char *txt = malloc(len + 1);
         size_t t = 0;
-        if (txt) {
-            for (size_t j = 0; j < len; j++) {
-                uint8_t c = chunks[i].data[off + j];
-                if (c != 0) txt[t++] = (char)c;
-            }
-            txt[t] = '\0';
-            cJSON_AddStringToObject(ch, "text", txt);
-            free(txt);
+        if (!txt) {
+            cJSON_Delete(ch);
+            cJSON_Delete(root);
+            free(chunks);
+            return strdup("(allocation failed)");
         }
+        for (size_t j = 0; j < len; j++) {
+            uint8_t c = chunks[i].data[off + j];
+            if (c != 0) txt[t++] = (char)c;
+        }
+        txt[t] = '\0';
+        cJSON_AddStringToObject(ch, "text", txt);
+        free(txt);
         cJSON_AddNumberToObject(ch, "timestamp", chunks[i].timestamp);
         cJSON_AddNumberToObject(ch, "seq_start",
                                 (double)(chunks[i].seq_start + (uint64_t)off));
@@ -508,6 +524,10 @@ static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
         total_len += chunks[i].len;
 
     char *text = malloc(total_len + 1);
+    if (!text) {
+        free(chunks);
+        return strdup("(allocation failed)");
+    }
     size_t off = 0;
     for (size_t i = 0; i < count; i++) {
         /* Strip NUL bytes */
@@ -606,9 +626,14 @@ static char *tool_serial_monitor(sm_mcp_sink_t *mcp, cJSON *args,
     mcp_gen_expect_id(mcp, expect_id, sizeof(expect_id));
 
     double timeout_s = (double)duration;
-    if (sm_expect_add(&b->expect, expect_id, "^\\b$", timeout_s,
-                       SM_MCP_CLIENT_ID) != 0) {
-        return strdup("[ERROR] failed to register monitor");
+    {
+        int erc = sm_expect_add(&b->expect, expect_id, "^\\b$", timeout_s,
+                                SM_MCP_CLIENT_ID);
+        if (erc != 0) {
+            char err[128];
+            snprintf(err, sizeof(err), "[ERROR] %s", sm_expect_add_errstr(erc));
+            return strdup(err);
+        }
     }
 
     /* Register pending call */
@@ -714,6 +739,10 @@ char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
     char *result = NULL;
     if (sm_mcp_tool_is_mutate(name) && !sm_mcp_mutate_enabled())
         return strdup("[ERROR] mutate tools disabled (set SMOLMUX_MCP_MUTATE=1)");
+    /* In-process --mcp bypasses the Unix-client takeover check. Keep the
+     * --mcp flag (do not delete); refuse TX while another client holds it. */
+    if (sm_mcp_tool_is_mutate(name) && mcp->broker->takeover_client)
+        return strdup("[ERROR] another client holds takeover");
     if (strcmp(name, "serial_send_command") == 0)
         result = tool_serial_send_command(mcp, args, jsonrpc_id);
     else if (strcmp(name, "serial_read") == 0)

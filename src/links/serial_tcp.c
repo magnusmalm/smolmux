@@ -55,6 +55,7 @@ typedef struct serial_tcp_data {
     struct sockaddr_storage caddr;  /* cached resolved address */
     socklen_t caddr_len;
     int caddr_valid;    /* 1 once resolved; cleared on connect failure */
+    int resolve_count;  /* getaddrinfo calls (reconnect must not add these) */
 } serial_tcp_data_t;
 
 /* Resolve host:port once and cache the address, so reconnects skip the
@@ -76,6 +77,7 @@ static int st_resolve(serial_tcp_data_t *d)
     memcpy(&d->caddr, res->ai_addr, res->ai_addrlen);
     d->caddr_len = res->ai_addrlen;
     d->caddr_valid = 1;
+    d->resolve_count++;
     freeaddrinfo(res);
     return 0;
 }
@@ -151,6 +153,9 @@ static int st_open(sm_link_t *self)
 }
 
 /* Async connect for the broker's reconnect path: begin and return immediately.
+ * Uses the cached sockaddr so reconnect does not block in getaddrinfo on the
+ * broker thread. Cache is filled on first resolve; cleared on connect
+ * failure (next begin may re-resolve for IP changes).
  * Returns 0 = connected, 1 = in progress, -1 = failed (see connect_poll). */
 static int st_connect_begin(sm_link_t *self)
 {
@@ -431,6 +436,8 @@ static int st_get_status(sm_link_t *self, cJSON *out)
     cJSON_AddBoolToObject(out, "connected", d->fd >= 0);
     /* Whether the server negotiated RFC 2217 -> baud/pin/break control works. */
     cJSON_AddBoolToObject(out, "rfc2217", d->rfc2217_active);
+    cJSON_AddBoolToObject(out, "addr_cached", d->caddr_valid);
+    cJSON_AddNumberToObject(out, "resolve_count", d->resolve_count);
     return 0;
 }
 

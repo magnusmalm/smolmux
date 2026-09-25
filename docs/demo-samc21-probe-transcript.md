@@ -88,7 +88,8 @@ args: {
 }
 ```
 
-**What was written (shape; see also `configs/samc21.gdb-profile.json`):**
+**What was written (shape; same as the Pro zip file
+`profiles/samc21.gdb-profile.json`):**
 
 - `arch`: arm  
 - `important_registers`: r0-r12, sp, lr, pc, xpsr, msp, psp, control, primask  
@@ -106,7 +107,7 @@ afterward (see [board-bringup-template.md](board-bringup-template.md)).
 ```bash
 smolmux --gdb --gdb-target localhost:3333 -s /tmp/smolmux-gdb.sock \
   -p ~/.config/smolmux/samc21.gdb-profile.json
-# or short name after install: -p samc21
+# or Pro zip short name after you copy profiles/ to ~/.config/smolmux/: -p samc21
 ```
 
 Named registers and DSU-aware peripherals are available without re-probing.

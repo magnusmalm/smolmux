@@ -1,5 +1,6 @@
 #include "test_main.h"
 #include "links/link.h"
+#include "links/gdb.h"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -242,6 +243,20 @@ static void test_gdb_shell_blocked(void)
     n = read(cmd_read, buf, sizeof(buf));
     ASSERT(n == (ssize_t)strlen(ok2), "benign 'print' passed through");
 
+    /* Same word_is_code_exec rule on first word and interpreter-exec.
+     * "evaluation" shares the "eval" prefix (guard-rail false positive). */
+    const char *ok3 =
+        "-interpreter-exec console \"print counter\"\n";
+    ASSERT_INT_EQ(link->write_data(link, (const uint8_t *)ok3, strlen(ok3)), 0);
+    n = read(cmd_read, buf, sizeof(buf));
+    ASSERT(n == (ssize_t)strlen(ok3), "benign interpreter-exec passed");
+
+    const char *eval_fp =
+        "-interpreter-exec console \"print evaluation\"\n";
+    ASSERT(link->write_data(link, (const uint8_t *)eval_fp,
+                            strlen(eval_fp)) != 0,
+           "evaluation matches eval prefix in interpreter-exec");
+
     /* Explicit opt-in re-enables shell commands */
     ASSERT_INT_EQ(link->set_param(link, "allow_shell", "1"), 0);
     const char *sh = "shell echo hi\n";
@@ -253,6 +268,32 @@ static void test_gdb_shell_blocked(void)
     link->destroy(link);
     close(cmd_read);
     close(out_write);
+}
+
+static void test_gdb_line_invokes_shell_embedded_newline(void)
+{
+    /* Direct helper: contains_shell_command splits on \n and hid the hang. */
+    const uint8_t benign[] =
+        "-interpreter-exec console \"print foo\nprint bar\"";
+    alarm(1);
+    int rc = sm_gdb_line_invokes_shell(benign, sizeof(benign) - 1);
+    alarm(0);
+    ASSERT_INT_EQ(rc, 0);
+
+    /* Continue-after-newline: python after \n must still match. */
+    const uint8_t after_nl[] =
+        "-interpreter-exec console \"print foo\npython os\"";
+    alarm(1);
+    rc = sm_gdb_line_invokes_shell(after_nl, sizeof(after_nl) - 1);
+    alarm(0);
+    ASSERT_INT_EQ(rc, 1);
+
+    const uint8_t after_cr[] =
+        "-interpreter-exec console \"print foo\rpython os\"";
+    alarm(1);
+    rc = sm_gdb_line_invokes_shell(after_cr, sizeof(after_cr) - 1);
+    alarm(0);
+    ASSERT_INT_EQ(rc, 1);
 }
 
 static void test_gdb_write_nonblocking(void)
@@ -345,6 +386,69 @@ static void test_gdb_open_nonblocking_target(void)
     unlink(tmppath);
 }
 
+/* ACT-012: gdb_close must not nanosleep on the caller (broker thread). */
+static void test_gdb_close_does_not_sleep(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char tmppath[256];
+    snprintf(tmppath, sizeof(tmppath), "%s/test_gdb_hang_XXXXXX",
+             tmp && tmp[0] ? tmp : "/tmp");
+    int tmpfd = mkstemp(tmppath);
+    ASSERT(tmpfd >= 0, "mkstemp");
+    const char *script = "#!/bin/sh\ntrap '' TERM INT\nsleep 30\n";
+    write(tmpfd, script, strlen(script));
+    close(tmpfd);
+    chmod(tmppath, 0755);
+
+    extern sm_link_t *sm_gdb_new(const char *gdb_path, const char *target_spec);
+    sm_link_t *link = sm_gdb_new(tmppath, NULL);
+    ASSERT_NOT_NULL(link);
+    ASSERT_INT_EQ(link->open(link), 0);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    link->close(link);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (double)(t1.tv_sec - t0.tv_sec) +
+                (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    ASSERT(dt < 0.5, "gdb_close does not wait 2s on a hanging child");
+
+    link->destroy(link);
+    unlink(tmppath);
+}
+
+/* ACT-013: connect_begin must not poll 150+80ms on the caller. */
+static void test_gdb_connect_begin_does_not_poll(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char tmppath[256];
+    snprintf(tmppath, sizeof(tmppath), "%s/test_gdb_cb_XXXXXX",
+             tmp && tmp[0] ? tmp : "/tmp");
+    int tmpfd = mkstemp(tmppath);
+    ASSERT(tmpfd >= 0, "mkstemp");
+    const char *script = "#!/bin/sh\nexec cat\n";
+    write(tmpfd, script, strlen(script));
+    close(tmpfd);
+    chmod(tmppath, 0755);
+
+    extern sm_link_t *sm_gdb_new(const char *gdb_path, const char *target_spec);
+    sm_link_t *link = sm_gdb_new(tmppath, NULL);
+    ASSERT_NOT_NULL(link);
+    ASSERT(link->connect_begin != NULL, "gdb exposes connect_begin");
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ASSERT_INT_EQ(link->connect_begin(link), 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (double)(t1.tv_sec - t0.tv_sec) +
+                (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    ASSERT(dt < 0.12, "connect_begin does not poll 150ms");
+
+    link->close(link);
+    link->destroy(link);
+    unlink(tmppath);
+}
+
 static void test_gdb_silence_normal(void)
 {
     int cmd_read, out_write;
@@ -373,9 +477,12 @@ int main(void)
     RUN_TEST(test_gdb_close);
     RUN_TEST(test_gdb_fork_exec);
     RUN_TEST(test_gdb_shell_blocked);
+    RUN_TEST(test_gdb_line_invokes_shell_embedded_newline);
     RUN_TEST(test_gdb_write_nonblocking);
     RUN_TEST(test_gdb_open_nonblocking_target);
     RUN_TEST(test_gdb_silence_normal);
+    RUN_TEST(test_gdb_close_does_not_sleep);
+    RUN_TEST(test_gdb_connect_begin_does_not_poll);
 
     TEST_REPORT();
 }

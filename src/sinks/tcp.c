@@ -127,6 +127,7 @@ int sm_tcp_refuse_unauthenticated(const char *bind_addr, int have_auth_token,
 sm_sink_t *sm_tcp_sink_new(int port, const char *bind_addr)
 {
     sm_tcp_sink_t *tcp = calloc(1, sizeof(*tcp));
+    if (!tcp) return NULL;
     tcp->base.name = "tcp";
     tcp->base.fd = -1;
     tcp->base.start = tcp_start;

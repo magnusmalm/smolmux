@@ -20,7 +20,7 @@ ls -l /dev/serial/by-id/
 
 These often cover most setups without custom udev rules. Write rules only when you want friendlier names (`/dev/serial/rpi` instead of `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_SERIAL-if00-port0`).
 
-### Weak by-id (no USB serial) — class-only names
+### Weak by-id (no USB serial), class-only names
 
 Cheap CH340/CP210x bridges often **omit a USB serial number**. udev still
 creates a by-id name, but it is **class-only** (e.g.
@@ -42,10 +42,10 @@ board** after a replug.
 FT2232/FT4232-class devices often expose **two** by-id symlinks that share
 the USB serial and differ only in `-if00` / `-if01` (or channel). One
 interface may be claimed by **OpenOCD/libftdi** (JTAG); the other by
-**ftdi_sio** (tty for smolmux UART). Those are two contracts on one plug —
+**ftdi_sio** (tty for smolmux UART). Those are two contracts on one plug, 
 not one smolmux process. Pair them in a `*.board.json` (see
-`docs/dual-service-usb-cable.md` and `ft2232-dual.board.json` in
-`configs/` or the Pro zip `profiles/`).
+`docs/dual-service-usb-cable.md`). A filled FT2232 example is
+`ft2232-dual.board.json` in the Pro zip `profiles/` directory.
 
 ## Step 1: Identify Your Dongles (The Right Way)
 

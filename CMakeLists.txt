@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(smolmux VERSION 0.2.0 LANGUAGES C)
+project(smolmux VERSION 0.3.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -282,6 +282,8 @@ foreach(test_src ${TEST_SOURCES})
         ${CMAKE_SOURCE_DIR}/tests
     )
     target_link_libraries(${test_name} PRIVATE smolmux_lib)
+    target_compile_definitions(${test_name} PRIVATE
+        "SMOLMUX_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\"")
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
@@ -309,7 +311,7 @@ target_compile_definitions(cli_testlib PRIVATE main=cli_main)
 target_sources(test_cli PRIVATE $<TARGET_OBJECTS:cli_testlib>)
 # with-port test drives a broker-in-thread over a PTY (openpty needs libutil)
 target_link_libraries(test_cli PRIVATE pthread util)
-add_dependencies(test_cli smolmux-cli)
+add_dependencies(test_cli smolmux-cli smolmux)
 
 # Broker/monitor tests need pthreads and util (openpty)
 if(SM_ENABLE_UART)
@@ -356,13 +358,22 @@ endif()
 if(SM_ENABLE_SINK_WS AND SM_ENABLE_UART)
     target_link_libraries(test_ws PRIVATE pthread util)
 endif()
+if(EXISTS "${CMAKE_SOURCE_DIR}/cmake/private-tests.cmake")
+    include("${CMAKE_SOURCE_DIR}/cmake/private-tests.cmake")
+endif()
 endif() # BUILD_TESTING
 
+# UART=n GDB=y must still link (ACT-019):
+#   cmake -B build-uartn -DSM_ENABLE_UART=OFF -DSM_ENABLE_GDB=ON
+#   cmake --build build-uartn
 # ========================================================================
 # Install
 # ========================================================================
 set(_INSTALL_TARGETS smolmux smolmux-monitor smolmux-cli smolmux-mcp)
 if(SM_ENABLE_WATCHER)
     list(APPEND _INSTALL_TARGETS smolmux-watcher)
+endif()
+if(SM_ENABLE_GDB)
+    list(APPEND _INSTALL_TARGETS smolmux-gdb-mcp)
 endif()
 install(TARGETS ${_INSTALL_TARGETS} DESTINATION bin)

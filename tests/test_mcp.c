@@ -3,6 +3,7 @@
 #include "links/uart.h"
 #include "protocol.h"
 #include "sinks/mcp.h"
+#include "client.h"
 #include "util/json_helpers.h"
 #include "cJSON.h"
 
@@ -706,6 +707,216 @@ static void test_serial_send_command_eol_cr(void)
     teardown(&ctx);
 }
 
+static void test_mcp_status_fat_names(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    size_t n = ctx.broker.client_cap;
+    if (n > 32) n = 32;
+    for (size_t i = 0; i < n; i++) {
+        sm_client_t *c = calloc(1, sizeof(*c));
+        ASSERT_NOT_NULL(c);
+        c->fd = -1;
+        snprintf(c->name, sizeof(c->name),
+                 "FAT%02d-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", (int)i);
+        snprintf(c->role, sizeof(c->role), "observer");
+        ctx.broker.clients[i] = c;
+    }
+    ctx.broker.client_count = n;
+
+    cJSON *init_params = cJSON_CreateObject();
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    char buf[16384];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    cJSON *call_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(call_params, "name", "serial_port_status");
+    cJSON_AddItemToObject(call_params, "arguments", cJSON_CreateObject());
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "tools/call",
+                                                      call_params));
+    usleep(100000);
+    memset(buf, 0, sizeof(buf));
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    for (size_t i = 0; i < n; i++) {
+        char tag[16];
+        snprintf(tag, sizeof(tag), "FAT%02d-", (int)i);
+        ASSERT(strstr(buf, tag) != NULL, "fat client name in status");
+    }
+
+    teardown(&ctx);
+}
+
+static void test_mcp_takeover_blocks_mutate(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    sm_client_t holder;
+    memset(&holder, 0, sizeof(holder));
+    snprintf(holder.name, sizeof(holder.name), "other-controller");
+    ctx.broker.takeover_client = &holder;
+
+    cJSON *init_params = cJSON_CreateObject();
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    char buf[4096];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    cJSON *call_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(call_params, "name", "serial_write");
+    cJSON *tool_args = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool_args, "data", "should-not-tx");
+    cJSON_AddItemToObject(call_params, "arguments", tool_args);
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "tools/call",
+                                                      call_params));
+    usleep(80000);
+    memset(buf, 0, sizeof(buf));
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(strstr(buf, "takeover") != NULL, "mutate refused during takeover");
+
+    char dev[64];
+    memset(dev, 0, sizeof(dev));
+    int fl = fcntl(ctx.master, F_GETFL, 0);
+    fcntl(ctx.master, F_SETFL, fl | O_NONBLOCK);
+    ssize_t dn = read(ctx.master, dev, sizeof(dev) - 1);
+    if (dn < 0) dn = 0;
+    ASSERT(strstr(dev, "should-not-tx") == NULL, "no TX while takeover held");
+
+    ctx.broker.takeover_client = NULL;
+    teardown(&ctx);
+}
+
+static void test_mcp_write_as_is_backslash(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    cJSON *init_params = cJSON_CreateObject();
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    char buf[4096];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    cJSON *call_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(call_params, "name", "serial_write");
+    cJSON *tool_args = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool_args, "data", "x\\ry");
+    cJSON_AddItemToObject(call_params, "arguments", tool_args);
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "tools/call",
+                                                      call_params));
+    usleep(80000);
+    char dev[64];
+    memset(dev, 0, sizeof(dev));
+    int fl = fcntl(ctx.master, F_GETFL, 0);
+    fcntl(ctx.master, F_SETFL, fl | O_NONBLOCK);
+    ssize_t dn = 0;
+    for (int i = 0; i < 50 && dn <= 0; i++) {
+        dn = read(ctx.master, dev, sizeof(dev) - 1);
+        if (dn <= 0) usleep(10000);
+    }
+    if (dn < 0) dn = 0;
+    ASSERT(dn == 4 && memcmp(dev, "x\\ry", 4) == 0,
+           "sink serial_write is JSON-parsed bytes as-is");
+
+    teardown(&ctx);
+}
+
+static int tools_list_has_name(cJSON *tools, const char *name)
+{
+    cJSON *t;
+    cJSON_ArrayForEach(t, tools) {
+        cJSON *nm = cJSON_GetObjectItemCaseSensitive(t, "name");
+        if (cJSON_IsString(nm) && nm->valuestring &&
+            strcmp(nm->valuestring, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void test_tools_list_mutate_off(void)
+{
+    unsetenv("SMOLMUX_MCP_MUTATE");
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    cJSON *init_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(init_params, "protocolVersion", "2024-11-05");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    usleep(100000);
+    char buf[16384];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "tools/list", NULL));
+    usleep(100000);
+    int n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(n > 0, "got tools/list response");
+
+    cJSON *resp = cJSON_Parse(buf);
+    ASSERT_NOT_NULL(resp);
+    cJSON *tools = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(resp, "result"), "tools");
+    ASSERT(cJSON_IsArray(tools), "tools is array");
+    ASSERT_INT_EQ(cJSON_GetArraySize(tools), 9);
+    ASSERT(tools_list_has_name(tools, "serial_read"), "serial_read listed");
+    ASSERT(!tools_list_has_name(tools, "serial_write"),
+           "serial_write omitted when mutate off");
+    ASSERT(!tools_list_has_name(tools, "serial_send_command"),
+           "serial_send_command omitted");
+    ASSERT(!tools_list_has_name(tools, "serial_sysrq"), "sysrq omitted");
+    ASSERT(!tools_list_has_name(tools, "serial_pin_control"), "pin omitted");
+    cJSON_Delete(resp);
+    teardown(&ctx);
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+}
+
+static void test_serial_write_mutate_off_refused(void)
+{
+    unsetenv("SMOLMUX_MCP_MUTATE");
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    cJSON *init_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(init_params, "protocolVersion", "2024-11-05");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    usleep(100000);
+    char buf[8192];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    cJSON *call_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(call_params, "name", "serial_write");
+    cJSON *tool_args = cJSON_CreateObject();
+    cJSON_AddStringToObject(tool_args, "data", "mutate-off-tx");
+    cJSON_AddItemToObject(call_params, "arguments", tool_args);
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "tools/call",
+                                                      call_params));
+    usleep(80000);
+    int n = read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    ASSERT(n > 0, "got tools/call response");
+    cJSON *resp = cJSON_Parse(buf);
+    ASSERT_NOT_NULL(resp);
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(resp, "result");
+    cJSON *content = cJSON_GetObjectItemCaseSensitive(result, "content");
+    cJSON *first = cJSON_GetArrayItem(content, 0);
+    const char *text = sm_json_get_string(first, "text");
+    ASSERT(text && strstr(text, "mutate tools disabled") != NULL,
+           "dispatch refuses serial_write when mutate off");
+    cJSON_Delete(resp);
+
+    char dev[64];
+    memset(dev, 0, sizeof(dev));
+    int fl = fcntl(ctx.master, F_GETFL, 0);
+    fcntl(ctx.master, F_SETFL, fl | O_NONBLOCK);
+    ssize_t dn = read(ctx.master, dev, sizeof(dev) - 1);
+    ASSERT(dn <= 0, "no TX on device when mutate off");
+
+    teardown(&ctx);
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+}
+
 int main(void)
 {
     setenv("SMOLMUX_MCP_MUTATE", "1", 1);
@@ -723,6 +934,11 @@ int main(void)
     RUN_TEST(test_serial_send_command_eol_cr);
     RUN_TEST(test_method_not_found);
     RUN_TEST(test_serial_pin_control_rejects_non_pin_keys);
+    RUN_TEST(test_mcp_status_fat_names);
+    RUN_TEST(test_mcp_takeover_blocks_mutate);
+    RUN_TEST(test_mcp_write_as_is_backslash);
+    RUN_TEST(test_tools_list_mutate_off);
+    RUN_TEST(test_serial_write_mutate_off_refused);
 
     TEST_REPORT();
 }

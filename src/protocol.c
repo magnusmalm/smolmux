@@ -64,6 +64,7 @@ static sm_msg_type_t lookup_type(const char *name)
 
 char *sm_msg_encode(cJSON *msg, size_t *out_len)
 {
+    if (!msg) return NULL;
     char *json = cJSON_PrintUnformatted(msg);
     if (!json) return NULL;
     size_t jlen = strlen(json);

@@ -3,6 +3,8 @@
 
 #include <unistd.h>
 #include <pty.h>
+#include <time.h>
+#include <string.h>
 
 static void test_open_close(void)
 {
@@ -13,9 +15,7 @@ static void test_open_close(void)
 
     sm_link_t *link = sm_uart_new(slave_name, 115200, 0);
     ASSERT_NOT_NULL(link);
-    /* UART silence is suspicious (cable/device gone) — idle link_health
-     * degraded reporting must stay enabled. */
-    ASSERT(link->silence_normal == 0, "uart keeps idle health reporting");
+    ASSERT(link->silence_normal == 0, "uart is not a GDB silence_normal link");
     ASSERT_INT_EQ(link->open(link), 0);
     ASSERT(link->read_fd(link) >= 0, "has read fd");
 
@@ -106,6 +106,51 @@ static void test_send_break(void)
     close(slave);
 }
 
+static void test_pin_pulse(void)
+{
+    int master, slave;
+    ASSERT(openpty(&master, &slave, NULL, NULL, NULL) == 0, "openpty");
+    char *slave_name = ttyname(slave);
+    sm_link_t *link = sm_uart_new(slave_name, 115200, 0);
+    ASSERT_INT_EQ(link->open(link), 0);
+    /* PTY often rejects TIOCM*; pulse must not crash (same bar as break). */
+    (void)link->set_param(link, "dtr", "pulse");
+    (void)link->set_param(link, "rts", "send");
+    ASSERT(1, "pulse/send pin actions did not crash");
+    link->close(link);
+    link->destroy(link);
+    close(master);
+    close(slave);
+}
+
+/* ACT-014: TCSANOW must not wait for a full tty drain on the caller. */
+static void test_set_param_tcsanow_does_not_block(void)
+{
+    int master, slave;
+    ASSERT(openpty(&master, &slave, NULL, NULL, NULL) == 0, "openpty");
+    char *slave_name = ttyname(slave);
+    sm_link_t *link = sm_uart_new(slave_name, 115200, 0);
+    ASSERT_INT_EQ(link->open(link), 0);
+
+    char blob[4096];
+    memset(blob, 'X', sizeof(blob));
+    for (int i = 0; i < 16; i++)
+        (void)link->write_data(link, (const uint8_t *)blob, sizeof(blob));
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ASSERT_INT_EQ(link->set_param(link, "baud", "9600"), 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (double)(t1.tv_sec - t0.tv_sec) +
+                (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    ASSERT(dt < 0.5, "set_param baud returns without TCSADRAIN stall");
+
+    link->close(link);
+    link->destroy(link);
+    close(master);
+    close(slave);
+}
+
 int main(void)
 {
     printf("test_uart\n");
@@ -114,6 +159,8 @@ int main(void)
     RUN_TEST(test_write_read);
     RUN_TEST(test_get_status);
     RUN_TEST(test_send_break);
+    RUN_TEST(test_pin_pulse);
+    RUN_TEST(test_set_param_tcsanow_does_not_block);
 
     TEST_REPORT();
 }

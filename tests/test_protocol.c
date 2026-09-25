@@ -250,6 +250,12 @@ static void test_type_name(void)
     ASSERT_STR_EQ(sm_msg_type_name(SM_MSG_UNKNOWN), "unknown");
 }
 
+static void test_encode_null_msg(void)
+{
+    size_t len = 99;
+    ASSERT_NULL(sm_msg_encode(NULL, &len));
+}
+
 static void test_decode_invalid(void)
 {
     sm_msg_t msg = sm_msg_decode("not json", 8);
@@ -278,6 +284,7 @@ int main(void)
     RUN_TEST(test_encode_decode_history);
     RUN_TEST(test_encode_decode_anomaly);
     RUN_TEST(test_type_name);
+    RUN_TEST(test_encode_null_msg);
     RUN_TEST(test_decode_invalid);
 
     TEST_REPORT();

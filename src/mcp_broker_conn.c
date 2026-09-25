@@ -225,17 +225,21 @@ int sm_broker_conn_pump(sm_broker_conn_t *c, int timeout_ms)
         return errno == EINTR ? 0 : -1;
     if (ret == 0)
         return 0;
-    if (pfd.revents & (POLLHUP | POLLERR)) {
-        c->running = 0;
-        return -1;
-    }
+    /* POLLIN then HUP: same kernel IN|HUP together case as wait().
+     * Checking hangup first dropped the final line unread. */
     if (pfd.revents & POLLIN) {
         /* read() delivers OUTPUT to on_output and may return a stray
          * welcome/id-matched message; we drive correlation ourselves, so
          * drop anything it hands back. */
         cJSON *stray = sm_broker_conn_read(c, NULL);
         if (stray) cJSON_Delete(stray);
-        return c->running ? 1 : -1;
+        if (!c->running)
+            return -1;
+        return 1;
+    }
+    if (pfd.revents & (POLLHUP | POLLERR)) {
+        c->running = 0;
+        return -1;
     }
     return 0;
 }

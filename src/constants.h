@@ -2,7 +2,7 @@
 #define SM_CONSTANTS_H
 
 #define SM_NAME "smolmux"
-#define SM_VERSION "0.2.0"
+#define SM_VERSION "0.3.0"
 #define SM_PROTOCOL_VERSION 1
 
 /* Limits */
@@ -10,6 +10,10 @@
 #define SM_MAX_EXPECT_PENDING 256
 #define SM_MAX_EXPECT_PER_CLIENT 16
 #define SM_MAX_EXPECT_TIMEOUT_MS 3600000  /* 1 hour */
+/* listen_expect is cheap to register and can pin 256KiB each. Burst-limit
+ * new patterns per client so a wedged agent cannot fill the engine. */
+#define SM_LISTEN_EXPECT_RATE          8
+#define SM_LISTEN_EXPECT_RATE_WINDOW_S 1.0
 #define SM_MAX_ANOMALY_PATTERNS 64
 #define SM_MAX_ANOMALY_INCIDENTS 1024
 #define SM_MAX_ANOMALY_WINDOW 65536
@@ -72,6 +76,8 @@
 #define SM_RB_POOL_SLOTS              16
 #define SM_EXPECT_BUF_INITIAL 4096
 #define SM_MAX_EXPECT_BUF_SIZE (256 * 1024)
+/* gdb-mcp MI line assembler: cap so a missing newline cannot grow forever. */
+#define SM_GDB_MCP_MI_BUF_MAX  (256 * 1024)
 #define SM_ANOMALY_CONTEXT_SIZE 1024
 #define SM_MAX_PROFILE_FILE_BYTES (1024 * 1024)  /* reject larger profile files */
 

@@ -42,8 +42,25 @@ typedef struct sm_expect_engine {
 void sm_expect_init(sm_expect_engine_t *eng);
 void sm_expect_destroy(sm_expect_engine_t *eng);
 
+/* 0 ok; negative = SM_EXPECT_ERR_* (distinct so callers can name the cause). */
+#define SM_EXPECT_ERR_FULL        -1
+#define SM_EXPECT_ERR_PER_CLIENT  -2
+#define SM_EXPECT_ERR_BAD_PATTERN -3
+#define SM_EXPECT_ERR_NOMEM       -4
+
 int sm_expect_add(sm_expect_engine_t *eng, const char *id,
                   const char *pattern, double timeout_s, const char *client_id);
+
+static inline const char *sm_expect_add_errstr(int rc)
+{
+    switch (rc) {
+    case SM_EXPECT_ERR_FULL:        return "too many pending expects";
+    case SM_EXPECT_ERR_PER_CLIENT:  return "too many expects for this client";
+    case SM_EXPECT_ERR_NOMEM:       return "out of memory";
+    case SM_EXPECT_ERR_BAD_PATTERN:
+    default:                        return "invalid regex pattern";
+    }
+}
 
 void sm_expect_feed(sm_expect_engine_t *eng, const uint8_t *data, size_t len);
 

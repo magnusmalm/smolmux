@@ -387,49 +387,18 @@ static char *tool_serial_read(void)
     return text ? text : strdup("(no output)");
 }
 
-static size_t unescape_c_escapes(const char *in, uint8_t *out, size_t out_cap)
-{
-    size_t n = 0;
-    for (const char *p = in; *p && n + 1 < out_cap; p++) {
-        if (*p == '\\' && p[1]) {
-            p++;
-            uint8_t ch;
-            switch (*p) {
-            case 'r': ch = '\r'; break;
-            case 'n': ch = '\n'; break;
-            case 't': ch = '\t'; break;
-            case '0': ch = '\0'; break;
-            case '\\': ch = '\\'; break;
-            default:
-                out[n++] = '\\';
-                if (n + 1 >= out_cap)
-                    return n;
-                ch = (uint8_t)*p;
-                break;
-            }
-            out[n++] = ch;
-        } else {
-            out[n++] = (uint8_t)*p;
-        }
-    }
-    return n;
-}
-
 static char *tool_serial_write(cJSON *args)
 {
     const char *data_str = sm_json_get_string(args, "data");
     if (!data_str) return strdup("[ERROR] missing 'data' argument");
 
-    size_t cap = strlen(data_str) + 1;
-    uint8_t *raw = malloc(cap);
-    if (!raw) return strdup("[ERROR] out of memory");
-    size_t n = unescape_c_escapes(data_str, raw, cap);
-
+    /* JSON-parsed bytes as-is (same as the --mcp sink). Do not apply a
+     * second C-escape pass — "\\r" after parse is backslash+r, not CR. */
+    size_t n = strlen(data_str);
     char wire_id[64];
     gen_wire_id(wire_id, sizeof(wire_id));
 
-    cJSON *msg = sm_msg_send(wire_id, raw, n);
-    free(raw);
+    cJSON *msg = sm_msg_send(wire_id, (const uint8_t *)data_str, n);
     if (broker_send(msg) < 0) return strdup("[ERROR] failed to send");
 
     /* Short wait for potential error response */
@@ -466,9 +435,11 @@ static char *tool_serial_port_status(void)
         return strdup(err);
     }
 
-    char buf[4096];
-    int off = 0;
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+    /* sm_strbuf — same M15 sibling the --mcp sink already paid: a 4096-byte
+     * stack buf with off += snprintf underflowed on fat client names. */
+    sm_strbuf_t sb;
+    sm_strbuf_init(&sb);
+    sm_strbuf_printf(&sb,
         "Port: %s\nBaud: %d\nConnected: %s\nSuspended: %s\n"
         "Link up ts: %.3f\nLast RX age ms: %d\nBytes since link up: %.0f\n"
         "Last link event: %s\nIdentity: %s\n",
@@ -484,44 +455,40 @@ static char *tool_serial_port_status(void)
             ? sm_json_get_string(resp, "identity_strength")
             : (sm_json_get_bool(resp, "identity_weak", 0) ? "WEAK" : "n/a"));
     if (sm_json_get_string(resp, "identity_by_id"))
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-            "Identity by-id: %s\n", sm_json_get_string(resp, "identity_by_id"));
+        sm_strbuf_printf(&sb, "Identity by-id: %s\n",
+                         sm_json_get_string(resp, "identity_by_id"));
     if (sm_json_get_string(resp, "identity_by_path"))
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-            "Identity by-path: %s\n",
-            sm_json_get_string(resp, "identity_by_path"));
+        sm_strbuf_printf(&sb, "Identity by-path: %s\n",
+                         sm_json_get_string(resp, "identity_by_path"));
 
     cJSON *pins = cJSON_GetObjectItemCaseSensitive(resp, "pin_states");
     if (pins) {
         char *pin_str = cJSON_PrintUnformatted(pins);
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-            "Pin states: %s\n", pin_str ? pin_str : "{}");
+        sm_strbuf_printf(&sb, "Pin states: %s\n", pin_str ? pin_str : "{}");
         free(pin_str);
     }
 
     const char *takeover = sm_json_get_string(resp, "takeover_client");
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-        "Takeover: %s\n", takeover ? takeover : "none");
+    sm_strbuf_printf(&sb, "Takeover: %s\n", takeover ? takeover : "none");
 
     const char *log_path = sm_json_get_string(resp, "log_path");
     if (log_path)
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-            "Log: %s\n", log_path);
+        sm_strbuf_printf(&sb, "Log: %s\n", log_path);
 
     cJSON *clients = cJSON_GetObjectItemCaseSensitive(resp, "clients");
     if (cJSON_IsArray(clients)) {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "Clients:\n");
+        sm_strbuf_printf(&sb, "Clients:\n");
         cJSON *ci;
         cJSON_ArrayForEach(ci, clients) {
             const char *cname = sm_json_get_string(ci, "name");
             const char *crole = sm_json_get_string(ci, "role");
-            off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-                "  - %s (%s)\n", cname ? cname : "?", crole ? crole : "?");
+            sm_strbuf_printf(&sb, "  - %s (%s)\n",
+                             cname ? cname : "?", crole ? crole : "?");
         }
     }
-    (void)off;
     cJSON_Delete(resp);
-    return strdup(buf);
+    char *out = sm_strbuf_steal(&sb);
+    return out ? out : strdup("(allocation failed)");
 }
 
 static char *tool_serial_boot_status(void)
@@ -636,6 +603,9 @@ static char *tool_serial_pin_control(cJSON *args)
     const char *action = sm_json_get_string(args, "action");
     int duration_ms = sm_json_get_int(args, "duration_ms", 250);
     if (!pin || !action) return strdup("[ERROR] missing pin or action");
+    /* CLI uses pulse; older MCP docs said send. Same meaning for dtr/rts. */
+    if (strcmp(action, "send") == 0 && strcmp(pin, "break") != 0)
+        action = "pulse";
 
     char wire_id[64];
     gen_wire_id(wire_id, sizeof(wire_id));
@@ -1690,9 +1660,9 @@ static int try_connect_broker(void)
     return 0;
 }
 
-static void usage(const char *prog)
+static void usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
+    fprintf(out,
         "Usage: %s [options] [socket_path]\n"
         "\n"
         "Standalone MCP server — connects to a running smolmux broker\n"
@@ -1707,7 +1677,14 @@ static void usage(const char *prog)
         "  -n, --name <name>      Client name (default: claude-mcp)\n"
         "  -v, --verbose          Debug logging\n"
         "  -V, --version          Show version\n"
-        "  -h, --help             Show help\n",
+        "  -h, --help             Show help\n"
+        "\n"
+        "ENVIRONMENT:\n"
+        "  SMOLMUX_MCP_MUTATE=1   List write tools (serial_write,\n"
+        "                         serial_send_command, pins, suspend, …).\n"
+        "                         Default listing is read-only.\n"
+        "  SMOLMUX_SOCKET         Broker socket if -s omitted\n"
+        "  SMOLMUX_AUTH_TOKEN     Token for --tcp hello\n",
         prog);
 }
 
@@ -1753,10 +1730,10 @@ int main(int argc, char *argv[])
             fprintf(stderr, "%s-mcp %s\n", SM_NAME, SM_VERSION);
             return 0;
         case 'h':
-            usage(argv[0]);
+            usage(stdout, argv[0]);
             return 0;
         default:
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return 1;
         }
     }
@@ -1796,8 +1773,22 @@ int main(int argc, char *argv[])
         if (!socket_path && optind < argc)
             socket_path = argv[optind];
         if (socket_path) {
+            char resolved[SM_SOCK_PATH_MAX];
+            int rrs = sm_resolve_client_socket(resolved, sizeof(resolved),
+                                               socket_path);
+            if (rrs < 0) {
+                fprintf(stderr, "Error: cannot resolve socket from '%s'\n"
+                                "  smolmux-cli brokers\n", socket_path);
+                return 1;
+            }
+            if (rrs == 1) {
+                fprintf(stderr,
+                        "note: '%s' is a device node; using socket %s\n"
+                        "  smolmux-cli brokers lists live brokers\n",
+                        socket_path, resolved);
+            }
             snprintf(ctx.socket_path, sizeof(ctx.socket_path), "%s",
-                     socket_path);
+                     resolved);
             ctx.socket_explicit = 1;
         }
     }

@@ -23,6 +23,8 @@ typedef struct sm_client {
     double connected_at;   /* CLOCK_MONOTONIC, set by broker on register */
     int peer_pid;          /* SO_PEERCRED; 0 if unknown */
     int requires_auth;     /* set for network-origin clients (TCP) */
+    double listen_expect_window_start;  /* monotonic; rate-limit window */
+    int listen_expect_window_count;
 
     uint8_t *read_buf;
     size_t read_len;

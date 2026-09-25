@@ -56,7 +56,17 @@ int sm_identity_named_board_is_ambiguous(int has_board, int weak,
  * is raised to 1000. Returns 0 if present, -1 on timeout/bad args. */
 int sm_wait_path_exists(const char *path, double timeout_s, int poll_us);
 
+/* Poll until open(O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC) succeeds, then
+ * close the probe fd. A node can exist (access OK) before the driver
+ * accepts open (ENODEV/EBUSY). timeout_s=0 is a single try. */
+int sm_wait_device_open(const char *path, double timeout_s, int poll_us);
+
+/* 1 if connect() to this Unix socket succeeds (same-uid broker).
+ * Leftover .sock files after a crash return 0. */
+int sm_socket_is_reachable(const char *path);
+
 /* Discover a smolmux broker socket path via env var or glob.
+ * Env is returned as-is (explicit pin). Globs skip unreachable leftovers.
  * Returns 0 on success, -1 if not found. */
 int sm_discover_socket(char *out, size_t out_len);
 
@@ -77,19 +87,35 @@ int sm_discover_socket(char *out, size_t out_len);
  * Returns 0, or -1 if out_len is too small or device_or_label is empty. */
 int sm_derive_socket_path(char *out, size_t out_len, const char *device_or_label);
 
+/* Client -s / positional: if arg is a char device (or a missing
+ * /dev/ttyUSB, /dev/ttyACM, or /dev/serial/by-id path), derive the
+ * broker socket (return 1). Otherwise copy arg as a socket path
+ * (return 0). -1 on bad args. First-run monitor -s $PORT with
+ * PORT=/dev/ttyACM0 must not AF_UNIX the TTY. */
+int sm_resolve_client_socket(char *out, size_t out_len, const char *arg);
+
+/* Read a one-line secret (auth token). Fail-closed: O_NOFOLLOW, regular
+ * file, euid owner, nlink==1, mode 0600, no silent truncate. 0 or -1. */
+int sm_read_owner_secret_file(const char *path, char *out, size_t out_len);
+
 /* Same layout as sm_derive_socket_path, but the tag is "board-role"
  * (board manifests). */
 int sm_derive_board_socket_path(char *out, size_t out_len,
                                 const char *board, const char *role);
 
-/* Enumerate all active broker sockets: $SMOLMUX_SOCKET (if set),
+/* Enumerate broker socket paths: $SMOLMUX_SOCKET (if set),
  * $XDG_RUNTIME_DIR/smolmux-*.sock, and /tmp/smolmux-*.sock, de-duplicated.
+ * Includes leftover files that no longer accept connect.
  * Fills up to max entries into out[][SM_SOCK_PATH_MAX]; returns the count found
  * (which may exceed max — only the first max are written). */
 size_t sm_discover_all_sockets(char (*out)[SM_SOCK_PATH_MAX], size_t max);
 
-/* 1 = first-glob would be a guess (several sockets, no explicit pin).
- * explicit_pin is -s / positional / SMOLMUX_SOCKET. */
+/* Same glob, but only paths that accept connect. Use this for first-glob. */
+size_t sm_discover_reachable_sockets(char (*out)[SM_SOCK_PATH_MAX], size_t max);
+
+/* 1 = first-glob would be a guess (several *live* brokers, no explicit pin).
+ * Leftover unreachable sockets do not count. explicit_pin is -s /
+ * positional / SMOLMUX_SOCKET. */
 int sm_autodiscover_should_refuse(int explicit_pin);
 
 /* 1 if this hello name is an MCP stdio server (claude-mcp, *-mcp). */

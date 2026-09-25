@@ -8,10 +8,12 @@ they connect to a **running broker** over its Unix socket and expose tools to
 the agent over stdio JSON-RPC. The broker keeps running when the agent
 disconnects; several agents and humans can share the same port.
 
-| Binary            | Exposes         | Needs broker            |
-|-------------------|-----------------|-------------------------|
-| `smolmux-mcp`     | 16 serial tools | UART or serial-over-TCP |
-| `smolmux-gdb-mcp` | 21 GDB tools    | `--gdb --gdb-target ...`|
+| Binary            | Exposes              | Broker link        |
+| ----------------- | -------------------- | ------------------ |
+| `smolmux-mcp`     | 9 serial (17 mutate) | UART or serial-tcp |
+| `smolmux-gdb-mcp` | 21 GDB tools         | `--gdb` target     |
+
+serial-tcp = serial-over-TCP link (ser2net), not the TCP client sink.
 
 Also: gdb-mcp adds 2 resources + 3 prompts. Example brokers:
 
@@ -61,26 +63,31 @@ claude mcp add gdb     -- /path/to/smolmux/build/smolmux-gdb-mcp -s /tmp/smolmux
 }
 ```
 
-Adjust `/path/to/smolmux` to your checkout (Pro zip users: see the paths in
-`MCP-SETUP-FULL.md` included in the bundle).
+Adjust `/path/to/smolmux` to your checkout. Pro zip: host installer puts
+tools in `~/.local/bin`, see `MCP-SETUP-FULL.md`. Do not `sudo install` to
+`/usr/local/bin` if you used that installer.
 
 ## 3. What the agent gets
 
-**Serial (`smolmux-mcp`) — 17 tools:**
-`serial_read`, `serial_write`, `serial_send_command`, `serial_wait_for`,
-`serial_monitor`, `serial_output_history`, `serial_port_status`,
-`serial_boot_status`, `serial_list_ports`, `serial_pin_control`,
-`serial_sysrq`, `serial_suspend`, `serial_resume`, `serial_get_incidents`,
-`serial_generate_report`, `serial_add_watchdog`, `serial_add_autoresponder`
+**Serial (`smolmux-mcp`), 9 tools by default:**
+`serial_read`, `serial_wait_for`, `serial_monitor`,
+`serial_output_history`, `serial_port_status`, `serial_boot_status`,
+`serial_list_ports`, `serial_get_incidents`, `serial_generate_report`
+
+**With `SMOLMUX_MCP_MUTATE=1` (8 more, 17 total):**
+`serial_write`, `serial_send_command`, `serial_pin_control`,
+`serial_sysrq`, `serial_suspend`, `serial_resume`,
+`serial_add_watchdog`, `serial_add_autoresponder`
 
 **Capture notes:** `serial_read` drains the MCP session buffer only.
 Lossless paging: `serial_output_history` with `since_seq` (JSON
 `cursor`/`dropped`/`has_more`/`chunks`); pass `cursor` back as
 `since_seq`. Listen-only wait: `serial_wait_for` (no TX; observers OK).
 
-On `initialize`, the serial MCP also sends short **instructions** (workflow
-for status, history, incidents, suspend/resume, multi-client). Guided
-**prompts** (slash commands in clients that support them):
+On `initialize`, the serial MCP also sends short **instructions**
+(status, history, incidents; write/suspend tools only when
+`SMOLMUX_MCP_MUTATE=1`). Guided **prompts** (slash commands in
+clients that support them):
 
 | Prompt         | Purpose                                      |
 | -------------- | -------------------------------------------- |
@@ -129,7 +136,7 @@ automatically:
 {
   "mcpServers": {
     "serial": {
-      "command": "/usr/local/bin/smolmux-mcp",
+      "command": "/absolute/path/to/.local/bin/smolmux-mcp",
       "args": ["--tcp", "127.0.0.1:5555"],
       "env": { "SMOLMUX_AUTH_TOKEN": "the-same-token-the-broker-uses" }
     }
@@ -137,7 +144,7 @@ automatically:
 }
 ```
 
-Get it wrong and the tool result says so — `broker rejected this client:
+Get it wrong and the tool result says so, `broker rejected this client:
 authentication failed`, with a hint naming the variable.
 
 The TCP sink binds `127.0.0.1` by default, and smolmux refuses to serve a

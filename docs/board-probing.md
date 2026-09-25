@@ -39,8 +39,6 @@ link itself is architecture-agnostic (it is a byte pipe to gdb); the
 - **Cortex-M0/M0+** have no CFSR/HFSR-style configurable fault registers;
   fault tools report an empty set instead of reading reserved addresses.
 - Chip-ID path was validated on a **SAM C21 Xplained Pro** (EDBG + OpenOCD).
-- For matrix of what is proven on silicon, see
-  [hw-validation.md](hw-validation.md).
 
 ## Related
 

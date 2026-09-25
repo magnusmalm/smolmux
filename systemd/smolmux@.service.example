@@ -7,26 +7,21 @@
 #
 # The instance name (%i) is the device under /dev - smolmux@ttyUSB0 opens
 # /dev/ttyUSB0. For stable names use a udev alias (see
-# docs/persistent-serial-devices.md) and e.g.:
-#   systemctl --user enable --now smolmux@serial-rpi-console
-# (systemd escapes '/' as '-'; %I un-escapes it back.)
-#
-# Adjust ExecStart flags: -b baud, -p profile, log dirs. Binaries installed
-# to /usr/local/bin assumed.
+# docs/persistent-serial-devices.md). systemd escapes '/' as '-'; %I
+# un-escapes it. %t is the user runtime dir (XDG_RUNTIME_DIR).
+# ExecStart matches the Pro zip host installer (~/.local/bin). Edit the
+# path if you installed somewhere else.
 
 [Unit]
 Description=smolmux broker on /dev/%I
-# Start when the device appears, stop when it goes away:
-#   BindsTo=dev-%i.device
-#   After=dev-%i.device
-# (leave commented for USB dongles you re-plug a lot - the broker's own
-# auto-reconnect with backoff handles that more gracefully)
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/smolmux /dev/%I -b 115200
+ExecStart=%h/.local/bin/smolmux /dev/%I -b 115200 -s %t/smolmux-%i.sock
 Restart=on-failure
 RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=default.target

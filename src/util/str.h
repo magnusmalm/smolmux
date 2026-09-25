@@ -20,6 +20,8 @@ void sm_strbuf_append_str(sm_strbuf_t *sb, const char *s);
 void sm_strbuf_printf(sm_strbuf_t *sb, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 char *sm_strbuf_steal(sm_strbuf_t *sb);
+/* If len > max, drop oldest bytes and keep the tail. No-op if max==0. */
+void sm_strbuf_cap(sm_strbuf_t *sb, size_t max);
 void sm_strbuf_destroy(sm_strbuf_t *sb);
 
 #endif /* SM_STR_H */

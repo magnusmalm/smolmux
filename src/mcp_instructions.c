@@ -1,4 +1,5 @@
 #include "mcp_instructions.h"
+#include "sinks/mcp_schemas.h"
 #include "util/str.h"
 #include "util/json_helpers.h"
 
@@ -10,7 +11,28 @@
  * Wave 1 transfer from Arduino-Agent agent-UX patterns (re-implemented, not
  * copied). Keep short: clients inject this on every initialize.
  */
-static const char SM_SERIAL_INSTRUCTIONS[] =
+static const char SM_SERIAL_INSTRUCTIONS_RO[] =
+    "smolmux serial MCP — multiplexed access to a live device console held "
+    "open by a smolmux broker. Prefer these tools over pasting serial "
+    "traffic by hand.\n"
+    "\n"
+    "Recommended workflow:\n"
+    "1. serial_port_status and serial_boot_status before sending traffic.\n"
+    "2. serial_wait_for for listen-only regex (no TX); serial_monitor for "
+    "a timed listen window; serial_output_history with since_seq for "
+    "lossless pages (cursor/dropped/has_more). serial_read only drains "
+    "the session buffer — not lossless across turns.\n"
+    "3. Crashes: serial_get_incidents plus history. wait_for may return "
+    "[ABORTED anomaly:…] on critical panics — not silence.\n"
+    "4. Multi-client: observers can wait and read. Controllers write only "
+    "when write tools are listed.\n"
+    "5. Baud must match firmware and the broker profile; garbage text is "
+    "often the wrong baud or the wrong port (list_ports, by-id paths).\n"
+    "6. Write tools (serial_write, serial_send_command, pins, SysRq, "
+    "suspend, autoresponder add) are listed only when SMOLMUX_MCP_MUTATE=1. "
+    "Default tools/list is read-only.\n";
+
+static const char SM_SERIAL_INSTRUCTIONS_RW[] =
     "smolmux serial MCP — multiplexed access to a live device console held "
     "open by a smolmux broker. Prefer these tools over pasting serial "
     "traffic by hand.\n"
@@ -30,11 +52,13 @@ static const char SM_SERIAL_INSTRUCTIONS[] =
     "6. Multi-client: another controller may hold write rights; if writes "
     "fail, check status / takeover.\n"
     "7. Baud must match firmware and the broker profile; garbage text is "
-    "often the wrong baud or the wrong port (list_ports, by-id paths).\n";
+    "often the wrong baud or the wrong port (list_ports, by-id paths).\n"
+    "8. Write tools are listed because SMOLMUX_MCP_MUTATE=1 is set.\n";
 
 const char *sm_mcp_serial_instructions(void)
 {
-    return SM_SERIAL_INSTRUCTIONS;
+    return sm_mcp_mutate_enabled() ? SM_SERIAL_INSTRUCTIONS_RW
+                                   : SM_SERIAL_INSTRUCTIONS_RO;
 }
 
 static const char *const PROMPT_NAMES[SM_MCP_SERIAL_PROMPT_COUNT] = {

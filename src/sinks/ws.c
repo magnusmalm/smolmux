@@ -669,6 +669,7 @@ static void ws_destroy(sm_sink_t *self)
 sm_sink_t *sm_ws_sink_new(int port)
 {
     sm_ws_sink_t *ws = calloc(1, sizeof(*ws));
+    if (!ws) return NULL;
     ws->base.name = "ws";
     ws->base.fd = -1;
     ws->base.start = ws_start;

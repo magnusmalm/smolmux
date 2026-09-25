@@ -197,6 +197,27 @@ cJSON *sm_broker_info_to_json(const sm_broker_info_t *info)
     return o;
 }
 
+cJSON *sm_serial_port_info_to_json(const sm_serial_port_info_t *info)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (!info)
+        return o;
+    cJSON_AddStringToObject(o, "path", info->path);
+    if (info->by_id[0])
+        cJSON_AddStringToObject(o, "by_id", info->by_id);
+    if (info->by_path[0])
+        cJSON_AddStringToObject(o, "by_path", info->by_path);
+    cJSON_AddStringToObject(o, "vid", info->vid);
+    cJSON_AddStringToObject(o, "pid", info->pid);
+    cJSON_AddStringToObject(o, "manufacturer", info->manufacturer);
+    cJSON_AddStringToObject(o, "product", info->product);
+    const char *id = info->by_id[0] ? info->by_id : info->path;
+    const char *st = sm_serial_by_id_is_weak(id) ? "WEAK"
+                     : (strstr(id, "by-id") ? "STRONG" : "n/a");
+    cJSON_AddStringToObject(o, "identity", st);
+    return o;
+}
+
 cJSON *sm_identity_ambiguous_json(const char *board, const char *device,
                                   const char *reason)
 {
@@ -208,21 +229,24 @@ cJSON *sm_identity_ambiguous_json(const char *board, const char *device,
     cJSON *cands = cJSON_CreateArray();
     sm_serial_port_info_t infos[SM_SERIAL_PORT_INFO_MAX];
     size_t n = sm_list_serial_ports_info(infos, SM_SERIAL_PORT_INFO_MAX);
-    for (size_t i = 0; i < n; i++) {
-        cJSON *c = cJSON_CreateObject();
-        cJSON_AddStringToObject(c, "path", infos[i].path);
-        if (infos[i].by_id[0])
-            cJSON_AddStringToObject(c, "by_id", infos[i].by_id);
-        if (infos[i].by_path[0])
-            cJSON_AddStringToObject(c, "by_path", infos[i].by_path);
-        const char *id = infos[i].by_id[0] ? infos[i].by_id : infos[i].path;
-        const char *st = sm_serial_by_id_is_weak(id) ? "WEAK"
-                         : (strstr(id, "by-id") ? "STRONG" : "n/a");
-        cJSON_AddStringToObject(c, "identity", st);
-        cJSON_AddItemToArray(cands, c);
-    }
+    for (size_t i = 0; i < n; i++)
+        cJSON_AddItemToArray(cands, sm_serial_port_info_to_json(&infos[i]));
     cJSON_AddItemToObject(o, "candidates", cands);
     return o;
+}
+
+void sm_identity_ambiguous_fprint(FILE *out, const char *board,
+                                  const char *device, const char *reason)
+{
+    fprintf(out,
+            "error: identity_ambiguous\n"
+            "  board=%s device=%s\n"
+            "  %s\n"
+            "  smolmux --list-ports\n"
+            "  smolmux-cli --json board up <manifest>   # candidate list\n",
+            board ? board : "",
+            device ? device : "",
+            reason ? reason : "");
 }
 
 size_t sm_broker_discover(sm_broker_info_t *out, size_t max, int timeout_ms)

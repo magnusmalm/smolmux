@@ -3,6 +3,7 @@
 #include "sinks/mcp_schemas.h"
 #include "cJSON.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +20,18 @@ static int list_has(cJSON *tools, const char *name)
     return 0;
 }
 
+static const char *const k_ro_tools[] = {
+    "serial_read", "serial_wait_for", "serial_monitor",
+    "serial_output_history", "serial_port_status", "serial_boot_status",
+    "serial_list_ports", "serial_get_incidents", "serial_generate_report",
+};
+
+static const char *const k_mutate_tools[] = {
+    "serial_write", "serial_send_command", "serial_sysrq",
+    "serial_pin_control", "serial_add_autoresponder", "serial_suspend",
+    "serial_resume", "serial_add_watchdog",
+};
+
 static void test_default_hides_sysrq(void)
 {
     unsetenv("SMOLMUX_MCP_MUTATE");
@@ -28,9 +41,13 @@ static void test_default_hides_sysrq(void)
 
     cJSON *tools = sm_mcp_build_tools_list();
     ASSERT_NOT_NULL(tools);
+    ASSERT_INT_EQ(cJSON_GetArraySize(tools), 9);
     ASSERT(list_has(tools, "serial_read"), "read-only listed");
-    ASSERT(!list_has(tools, "serial_sysrq"), "sysrq hidden by default");
-    ASSERT(!list_has(tools, "serial_pin_control"), "pin hidden by default");
+    for (size_t i = 0; i < sizeof(k_ro_tools) / sizeof(k_ro_tools[0]); i++)
+        ASSERT(list_has(tools, k_ro_tools[i]), "default lists read tool");
+    for (size_t i = 0; i < sizeof(k_mutate_tools) / sizeof(k_mutate_tools[0]); i++)
+        ASSERT(!list_has(tools, k_mutate_tools[i]),
+               "mutate tool hidden by default");
     cJSON_Delete(tools);
 }
 
@@ -40,7 +57,9 @@ static void test_opt_in_lists_sysrq(void)
     ASSERT(sm_mcp_mutate_enabled(), "mutate on");
     cJSON *tools = sm_mcp_build_tools_list();
     ASSERT_NOT_NULL(tools);
+    ASSERT_INT_EQ(cJSON_GetArraySize(tools), 17);
     ASSERT(list_has(tools, "serial_sysrq"), "sysrq listed when opted in");
+    ASSERT(list_has(tools, "serial_write"), "write listed when opted in");
     ASSERT(list_has(tools, "serial_read"), "read still listed");
     cJSON_Delete(tools);
     unsetenv("SMOLMUX_MCP_MUTATE");

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -112,6 +113,119 @@ int sm_derive_socket_path(char *out, size_t out_len, const char *device_or_label
                                SM_SOCK_FINAL_MAX);
 }
 
+/* First-run docs used to pass PORT=/dev/ttyACM0 to monitor -s. That is a
+ * char device, not an AF_UNIX path. Derive the broker socket instead. */
+static int arg_looks_like_device_node(const char *arg)
+{
+    struct stat st;
+
+    if (stat(arg, &st) == 0)
+        return S_ISCHR(st.st_mode) ? 1 : 0;
+    /* Missing path: still treat typical serial nodes as devices so
+     * -s /dev/ttyACM0 with the board unplugged does not AF_UNIX the TTY. */
+    if (strncmp(arg, "/dev/tty", 8) == 0)
+        return 1;
+    if (strncmp(arg, "/dev/pts/", 9) == 0)
+        return 1;
+    if (strstr(arg, "/serial/") != NULL)
+        return 1;
+    return 0;
+}
+
+int sm_read_owner_secret_file(const char *path, char *out, size_t out_len)
+{
+    if (!path || !path[0] || !out || out_len < 2)
+        return -1;
+
+    /* O_NONBLOCK: a FIFO must not hang the broker; fstat then rejects
+     * non-regular files. */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "Error: cannot read %s: %s%s\n", path, strerror(errno),
+                errno == ELOOP ? " (symlink, refusing)" : "");
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "Error: cannot stat %s: %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Error: %s is not a regular file\n", path);
+        close(fd);
+        return -1;
+    }
+    if (st.st_uid != geteuid()) {
+        fprintf(stderr, "Error: %s is not owned by this user\n", path);
+        close(fd);
+        return -1;
+    }
+    if (st.st_nlink != 1) {
+        fprintf(stderr, "Error: %s has extra hard links\n", path);
+        close(fd);
+        return -1;
+    }
+    if ((st.st_mode & 0777) != 0600) {
+        fprintf(stderr, "Error: %s must be mode 0600 (is %03o)\n", path,
+                (unsigned)(st.st_mode & 0777));
+        close(fd);
+        return -1;
+    }
+
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        fprintf(stderr, "Error: fdopen %s: %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (!fgets(out, (int)out_len, f)) {
+        fprintf(stderr, "Error: %s is empty\n", path);
+        fclose(f);
+        return -1;
+    }
+    int extra = fgetc(f);
+    if (extra == '\r') {
+        int n = fgetc(f);
+        if (n == '\n')
+            extra = fgetc(f);
+        else
+            extra = (n == EOF) ? EOF : n;
+    } else if (extra == '\n') {
+        extra = fgetc(f);
+    }
+    fclose(f);
+    out[strcspn(out, "\r\n")] = '\0';
+    if (!out[0]) {
+        fprintf(stderr, "Error: %s is empty\n", path);
+        return -1;
+    }
+    if (extra != EOF) {
+        fprintf(stderr, "Error: token in %s exceeds %zu bytes\n", path,
+                out_len - 1);
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+int sm_resolve_client_socket(char *out, size_t out_len, const char *arg)
+{
+    if (!out || out_len == 0 || !arg || !arg[0])
+        return -1;
+    if (arg_looks_like_device_node(arg)) {
+        if (sm_derive_socket_path(out, out_len, arg) != 0)
+            return -1;
+        return 1;
+    }
+    if (strlen(arg) >= out_len)
+        return -1;
+    memcpy(out, arg, strlen(arg) + 1);
+    return 0;
+}
+
 int sm_derive_board_socket_path(char *out, size_t out_len,
                                 const char *board, const char *role)
 {
@@ -124,9 +238,38 @@ int sm_derive_board_socket_path(char *out, size_t out_len,
                                SM_SOCK_FINAL_MAX);
 }
 
+int sm_socket_is_reachable(const char *path)
+{
+    if (!path || !path[0])
+        return 0;
+    int fd = sm_connect_unix(path);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    return 1;
+}
+
+static int first_reachable_glob(const char *pattern, char *out, size_t out_len)
+{
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    int rc = -1;
+    if (glob(pattern, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            if (sm_socket_is_reachable(g.gl_pathv[i])) {
+                snprintf(out, out_len, "%s", g.gl_pathv[i]);
+                rc = 0;
+                break;
+            }
+        }
+    }
+    globfree(&g);
+    return rc;
+}
+
 int sm_discover_socket(char *out, size_t out_len)
 {
-    /* 1. Environment variable */
+    /* 1. Environment variable (explicit pin, even if currently down) */
     const char *env = getenv(SM_SOCKET_ENV);
     if (env && env[0]) {
         snprintf(out, out_len, "%s", env);
@@ -138,27 +281,12 @@ int sm_discover_socket(char *out, size_t out_len)
     if (runtime_dir && runtime_dir[0]) {
         char xdg_pattern[256];
         snprintf(xdg_pattern, sizeof(xdg_pattern), SM_SOCKET_GLOB_XDG_FMT, runtime_dir);
-        glob_t g;
-        memset(&g, 0, sizeof(g));
-        if (glob(xdg_pattern, 0, NULL, &g) == 0 && g.gl_pathc > 0) {
-            snprintf(out, out_len, "%s", g.gl_pathv[0]);
-            globfree(&g);
+        if (first_reachable_glob(xdg_pattern, out, out_len) == 0)
             return 0;
-        }
-        globfree(&g);
     }
 
     /* 3. Fall back to /tmp glob */
-    glob_t g;
-    memset(&g, 0, sizeof(g));
-    if (glob(SM_SOCKET_GLOB, 0, NULL, &g) == 0 && g.gl_pathc > 0) {
-        snprintf(out, out_len, "%s", g.gl_pathv[0]);
-        globfree(&g);
-        return 0;
-    }
-    globfree(&g);
-
-    return -1;
+    return first_reachable_glob(SM_SOCKET_GLOB, out, out_len);
 }
 
 /* Append path to out[] if not already present and room remains. Always bumps
@@ -204,12 +332,28 @@ size_t sm_discover_all_sockets(char (*out)[SM_SOCK_PATH_MAX], size_t max)
     return count;
 }
 
+size_t sm_discover_reachable_sockets(char (*out)[SM_SOCK_PATH_MAX], size_t max)
+{
+    char all[64][SM_SOCK_PATH_MAX];
+    size_t n = sm_discover_all_sockets(all, 64);
+    size_t shown = n < 64 ? n : 64;
+    size_t live = 0;
+    for (size_t i = 0; i < shown; i++) {
+        if (!sm_socket_is_reachable(all[i]))
+            continue;
+        if (live < max)
+            memcpy(out[live], all[i], SM_SOCK_PATH_MAX);
+        live++;
+    }
+    return live;
+}
+
 int sm_autodiscover_should_refuse(int explicit_pin)
 {
     if (explicit_pin)
         return 0;
     char socks[32][SM_SOCK_PATH_MAX];
-    return sm_discover_all_sockets(socks, 32) > 1;
+    return sm_discover_reachable_sockets(socks, 32) > 1;
 }
 
 int sm_client_name_is_mcp(const char *name)
@@ -825,6 +969,28 @@ int sm_wait_path_exists(const char *path, double timeout_s, int poll_us)
         usleep((useconds_t)poll_us);
     }
     return 0;
+}
+
+int sm_wait_device_open(const char *path, double timeout_s, int poll_us)
+{
+    if (!path || !path[0])
+        return -1;
+    if (timeout_s < 0)
+        timeout_s = 0;
+    if (poll_us < 1000)
+        poll_us = 1000;
+
+    double deadline = sm_now_monotonic() + timeout_s;
+    for (;;) {
+        int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) {
+            close(fd);
+            return 0;
+        }
+        if (sm_now_monotonic() >= deadline)
+            return -1;
+        usleep((useconds_t)poll_us);
+    }
 }
 
 char *sm_format_serial_ports_text(void)

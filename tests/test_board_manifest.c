@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "find_shipped.h"
 
 static void test_valid_manifest(void)
 {
@@ -142,30 +143,30 @@ static void test_load_from_file(void)
     ASSERT_INT_EQ(sm_board_manifest_load("/nonexistent/x.board.json", &m), -1);
 }
 
-/* Every shipped example manifest must parse (guards configs/ against schema
- * drift and typos in new board examples). */
+static int parse_shipped_manifest(const char *name, int required)
+{
+    char rel[128], path[512];
+    snprintf(rel, sizeof(rel), "configs/%s", name);
+    if (test_find_shipped(path, sizeof(path), rel) != 0) {
+        if (required)
+            ASSERT(0, "required public manifest missing");
+        return -1;
+    }
+
+    sm_board_manifest_t m;
+    ASSERT_INT_EQ(sm_board_manifest_load(path, &m), 0);
+    ASSERT(m.board[0], "manifest names its board");
+    ASSERT(m.wire_count >= 1, "manifest has at least one wire");
+    return 0;
+}
+
 static void test_shipped_manifests_parse(void)
 {
-    const char *names[] = {
-        "esp32-uart.board.json",
-        "newboard.board.json",
-        "samc21.board.json",
-        "esp32-s3-touch-lcd-1.28.board.json",
-        "ft2232-dual.board.json",
-        NULL
-    };
-    for (int i = 0; names[i]; i++) {
-        char path[256];
-        snprintf(path, sizeof(path), "configs/%s", names[i]);
-        if (access(path, R_OK) != 0)
-            snprintf(path, sizeof(path), "../configs/%s", names[i]);
-        ASSERT(access(path, R_OK) == 0, "shipped manifest found");
-
-        sm_board_manifest_t m;
-        ASSERT_INT_EQ(sm_board_manifest_load(path, &m), 0);
-        ASSERT(m.board[0], "manifest names its board");
-        ASSERT(m.wire_count >= 1, "manifest has at least one wire");
-    }
+    ASSERT_INT_EQ(parse_shipped_manifest("newboard.board.json", 1), 0);
+    parse_shipped_manifest("esp32-uart.board.json", 0);
+    parse_shipped_manifest("samc21.board.json", 0);
+    parse_shipped_manifest("esp32-s3-touch-lcd-1.28.board.json", 0);
+    parse_shipped_manifest("ft2232-dual.board.json", 0);
 }
 
 /* Dual-role wires must get distinct sockets (multi-wire board model). */

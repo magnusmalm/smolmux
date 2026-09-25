@@ -227,6 +227,10 @@ static int uart_pin_control(int fd, int tiocm_bit, const char *action)
     int bits = tiocm_bit;
     if (strcmp(action, "set") == 0 || strcmp(action, "1") == 0)
         return ioctl(fd, TIOCMBIS, &bits);
+    if (strcmp(action, "pulse") == 0 || strcmp(action, "send") == 0) {
+        if (ioctl(fd, TIOCMBIS, &bits) < 0) return -1;
+        return ioctl(fd, TIOCMBIC, &bits);
+    }
     if (strcmp(action, "toggle") == 0) {
         int modem = 0;
         if (ioctl(fd, TIOCMGET, &modem) < 0) return -1;
@@ -236,13 +240,16 @@ static int uart_pin_control(int fd, int tiocm_bit, const char *action)
     return ioctl(fd, TIOCMBIC, &bits);  /* clear */
 }
 
-/* Reapply serial config after changing a line parameter. */
+/* Reapply serial config after changing a line parameter.
+ * TCSANOW, not TCSADRAIN: drain waits for the kernel output queue on
+ * the broker/epoll thread. A full tty buffer plus unplug stalled the
+ * loop for seconds. Apply immediately. */
 static int uart_reapply_config(uart_data_t *ud)
 {
     struct termios tty;
     if (tcgetattr(ud->fd, &tty) < 0) return -1;
     apply_serial_config(&tty, ud);
-    return tcsetattr(ud->fd, TCSADRAIN, &tty);
+    return tcsetattr(ud->fd, TCSANOW, &tty);
 }
 
 static int uart_set_param(sm_link_t *self, const char *key, const char *value)
@@ -262,7 +269,7 @@ static int uart_set_param(sm_link_t *self, const char *key, const char *value)
         if (tcgetattr(ud->fd, &tty) < 0) return -1;
         cfsetispeed(&tty, speed);
         cfsetospeed(&tty, speed);
-        if (tcsetattr(ud->fd, TCSADRAIN, &tty) < 0) return -1;
+        if (tcsetattr(ud->fd, TCSANOW, &tty) < 0) return -1;
         ud->baud = baud;
         SM_LOG_INFO(LOG_TAG, "baud changed to %d", baud);
         return 0;

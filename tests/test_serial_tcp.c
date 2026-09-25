@@ -11,6 +11,7 @@
 #include "test_main.h"
 #include "links/serial_tcp.h"
 #include "links/link.h"
+#include "util/json_helpers.h"
 
 #include <string.h>
 #include <unistd.h>
@@ -428,6 +429,49 @@ static void test_async_connect_fails(void)
     link->destroy(link);
 }
 
+/* ACT-015: reconnect uses the cached addr; getaddrinfo is not called again. */
+static void test_reconnect_uses_cached_addr(void)
+{
+    int port, lfd = make_listener(&port);
+    ASSERT(lfd >= 0, "listener created");
+    sm_link_t *link = sm_serial_tcp_new("127.0.0.1", port);
+    ASSERT_NOT_NULL(link);
+    ASSERT_INT_EQ(link->open(link), 0);
+    int sfd = accept(lfd, NULL, NULL);
+    ASSERT(sfd >= 0, "accepted");
+
+    cJSON *st = cJSON_CreateObject();
+    link->get_status(link, st);
+    int first = sm_json_get_int(st, "resolve_count", 0);
+    ASSERT(first >= 1, "first open resolved once");
+    cJSON_Delete(st);
+
+    link->close(link);
+    int rc = link->connect_begin(link);
+    ASSERT(rc >= 0, "reconnect begin");
+    if (rc == 1) {
+        int done = 0;
+        for (int i = 0; i < 100 && !done; i++) {
+            int p = link->connect_poll(link);
+            if (p == 1) done = 1;
+            else if (p < 0) break;
+            else usleep(5000);
+        }
+        ASSERT(done, "reconnect completed");
+    }
+    int sfd2 = accept(lfd, NULL, NULL);
+    if (sfd2 >= 0) close(sfd2);
+
+    st = cJSON_CreateObject();
+    link->get_status(link, st);
+    int second = sm_json_get_int(st, "resolve_count", -1);
+    ASSERT_INT_EQ(second, first);
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItem(st, "addr_cached")), "cache held");
+    cJSON_Delete(st);
+
+    close(sfd); close(lfd); link->destroy(link);
+}
+
 static void test_connect_refused(void)
 {
     /* Bind+listen to grab a port, then close it so nothing listens there. */
@@ -464,6 +508,7 @@ int main(void)
     RUN_TEST(test_rfc2217_line_controls);
     RUN_TEST(test_async_connect_success);
     RUN_TEST(test_async_connect_fails);
+    RUN_TEST(test_reconnect_uses_cached_addr);
     RUN_TEST(test_connect_refused);
     TEST_REPORT();
 }

@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -295,7 +296,14 @@ static int wait_for_response(sm_msg_type_t expected_type, const char *expected_i
 
 /* --- Connection and handshake --- */
 
-static int connect_and_hello(const char *socket_path, const char *role)
+void cli_hello_name(char *out, size_t n, const char *cmd)
+{
+    snprintf(out, n, "smolmux-cli-%s-%d", cmd && cmd[0] ? cmd : "cli",
+             (int)getpid());
+}
+
+static int connect_and_hello(const char *socket_path, const char *role,
+                              const char *cmd)
 {
     cli.sock_fd = sm_connect_unix(socket_path);
     if (cli.sock_fd < 0) {
@@ -304,8 +312,9 @@ static int connect_and_hello(const char *socket_path, const char *role)
         return -1;
     }
 
-    /* Send hello */
-    send_msg(sm_msg_hello("smolmux-cli", role));
+    char name[64];
+    cli_hello_name(name, sizeof(name), cmd);
+    send_msg(sm_msg_hello(name, role));
 
     /* Wait for welcome */
     cJSON *welcome = NULL;
@@ -346,6 +355,60 @@ static int cli_trailing_option_after(int argc, char **argv, int first)
 int cli_test_trailing_option_after(int argc, char **argv, int first)
 {
     return cli_trailing_option_after(argc, argv, first);
+}
+
+/* wait-for: POSIX getopt '+' stops at the pattern. Honor --timeout on
+ * either side. Leftover flags are not the pattern and are not sent. */
+static int wait_for_parse(int argc, char **argv, int default_timeout,
+                          const char **pattern, int *timeout)
+{
+    if (!argv || !pattern || !timeout)
+        return -1;
+    *pattern = NULL;
+    *timeout = default_timeout;
+
+    static const struct option opts[] = {
+        {"timeout", required_argument, NULL, 't'},
+        {NULL, 0, NULL, 0}
+    };
+    int opt;
+    optind = 1;
+    while ((opt = getopt_long(argc, argv, "+t:", opts, NULL)) != -1) {
+        switch (opt) {
+        case 't':
+            *timeout = atoi(optarg);
+            break;
+        default:
+            return -1;
+        }
+    }
+    if (optind >= argc || !argv[optind])
+        return -1;
+    *pattern = argv[optind];
+    for (int i = optind + 1; i < argc; i++) {
+        if (!argv[i] || strcmp(argv[i], "--") == 0)
+            break;
+        if (strcmp(argv[i], "--timeout") == 0 || strcmp(argv[i], "-t") == 0) {
+            if (i + 1 >= argc || !argv[i + 1])
+                return -1;
+            *timeout = atoi(argv[++i]);
+            continue;
+        }
+        if (strncmp(argv[i], "--timeout=", 10) == 0) {
+            *timeout = atoi(argv[i] + 10);
+            continue;
+        }
+        if (argv[i][0] == '-' && argv[i][1] != '\0')
+            return -1;
+    }
+    return 0;
+}
+
+int cli_test_wait_for_parse(int argc, char **argv, int default_timeout_ms,
+                            const char **pattern_out, int *timeout_out)
+{
+    return wait_for_parse(argc, argv, default_timeout_ms, pattern_out,
+                          timeout_out);
 }
 
 static int cmd_send(int argc, char **argv)
@@ -622,6 +685,9 @@ static int cmd_status(int argc, char **argv)
         const char *log_path = sm_json_get_string(result, "log_path");
         if (log_path)
             printf("Log:       %s\n", log_path);
+        const char *tlog = sm_json_get_string(result, "text_log_path");
+        if (tlog)
+            printf("Text log:  %s\n", tlog);
 
         /* Boot-stage progress (present only when the profile declares stages) */
         cJSON *boot = cJSON_GetObjectItem(result, "boot");
@@ -677,19 +743,22 @@ static int cmd_history(int argc, char **argv)
 {
     int last_bytes = 0;
     double seconds = 0.0;
+    long long since_seq = -1;
 
     static const struct option opts[] = {
         {"last-bytes", required_argument, NULL, 'n'},
         {"seconds",    required_argument, NULL, 's'},
+        {"since-seq",  required_argument, NULL, 'q'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
     optind = 1;
-    while ((opt = getopt_long(argc, argv, "n:s:", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "n:s:q:", opts, NULL)) != -1) {
         switch (opt) {
         case 'n': last_bytes = atoi(optarg); break;
         case 's': seconds = atof(optarg); break;
+        case 'q': since_seq = atoll(optarg); break;
         default: break;
         }
     }
@@ -701,7 +770,11 @@ static int cmd_history(int argc, char **argv)
         since_ts = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9 - seconds;
     }
 
-    send_msg(sm_msg_history_request("cli-hist", since_ts, last_bytes));
+    if (since_seq >= 0)
+        send_msg(sm_msg_history_request_seq("cli-hist",
+                                            (uint64_t)since_seq, last_bytes));
+    else
+        send_msg(sm_msg_history_request("cli-hist", since_ts, last_bytes));
 
     cJSON *result = NULL;
     int rc = wait_for_response(SM_MSG_HISTORY_RESPONSE, "cli-hist",
@@ -806,26 +879,17 @@ static int cmd_incidents(int argc, char **argv)
 
 static int cmd_list_ports(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0)
+            cli.json_output = 1;
+    }
 
     if (cli.json_output) {
         sm_serial_port_info_t infos[SM_SERIAL_PORT_INFO_MAX];
         size_t n = sm_list_serial_ports_info(infos, SM_SERIAL_PORT_INFO_MAX);
         cJSON *arr = cJSON_CreateArray();
-        for (size_t i = 0; i < n; i++) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "path", infos[i].path);
-            if (infos[i].by_id[0])
-                cJSON_AddStringToObject(o, "by_id", infos[i].by_id);
-            if (infos[i].by_path[0])
-                cJSON_AddStringToObject(o, "by_path", infos[i].by_path);
-            const char *id = infos[i].by_id[0] ? infos[i].by_id
-                                               : infos[i].path;
-            const char *st = sm_serial_by_id_is_weak(id) ? "WEAK"
-                             : (strstr(id, "by-id") ? "STRONG" : "n/a");
-            cJSON_AddStringToObject(o, "identity", st);
-            cJSON_AddItemToArray(arr, o);
-        }
+        for (size_t i = 0; i < n; i++)
+            cJSON_AddItemToArray(arr, sm_serial_port_info_to_json(&infos[i]));
         char *s = cJSON_PrintUnformatted(arr);
         if (s) { printf("%s\n", s); free(s); }
         cJSON_Delete(arr);
@@ -1076,7 +1140,7 @@ int cli_test_with_port(const char *sock_path, int argc, char **argv,
     cli.interrupted = 0;
     cli.json_output = 0;
     cli.timeout_ms = timeout_ms;
-    if (connect_and_hello(sock_path, "controller") != 0)
+    if (connect_and_hello(sock_path, "controller", "with-port") != 0)
         return -1;
     int rc = cmd_with_port(argc, argv);
     if (cli.sock_fd >= 0) {
@@ -1525,9 +1589,9 @@ static int cmd_report(int argc, char **argv)
 
 /* --- Help and usage --- */
 
-static void usage(const char *prog)
+static void usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
+    fprintf(out,
         "%s — command-line client for smolmux broker\n"
         "\n"
         "Connects to a running smolmux broker and executes commands.\n"
@@ -1537,21 +1601,21 @@ static void usage(const char *prog)
         "  %s [options] <command> [args...]\n"
         "\n"
         "GLOBAL OPTIONS:\n"
-        "  -s, --socket <path>     Broker Unix socket (auto-discover if omitted)\n"
+        "  -s, --socket <path>     Broker Unix socket (not a TTY; not -t)\n"
         "  -j, --json              Output in JSON format\n"
-        "  -t, --timeout <ms>      Response timeout in milliseconds\n"
+        "  -t, --timeout <ms>      Response timeout (not a text-log dir)\n"
         "  -v, --verbose           Debug output to stderr\n"
         "  -V, --version           Show version\n"
         "  -h, --help              Show this help\n"
         "\n",
         prog, prog);
-    fprintf(stderr,
+    fprintf(out,
         "COMMANDS:\n"
         "  send <command>          Send a command and wait for response\n"
         "    --expect <pattern>    Regex to match end of response (default: shell prompt)\n"
         "    --timeout <ms>        Per-command timeout (default: 5000)\n"
         "\n"
-        "  read                    Read recent output from ring buffer\n"
+        "  read                    Alias of history (recent ring-buffer bytes)\n"
         "    --bytes <n>           Number of bytes to read (default: 8192)\n"
         "\n"
         "  write <data>            Write raw data without waiting for response\n"
@@ -1564,6 +1628,9 @@ static void usage(const char *prog)
         "  history                 Get timestamped output history\n"
         "    --last-bytes <n>      Return last N bytes\n"
         "    --seconds <n>         Return output from last N seconds\n"
+        "    --since-seq <n>       Return output after ring sequence n\n"
+        "  wait-for <pattern>      listen_expect until match or timeout\n"
+        "    --timeout <ms>        Per-wait timeout (default: 5000)\n"
         "\n"
         "  incidents               Show detected anomalies/crashes\n"
         "    --seconds <n>         Only incidents from last N seconds\n"
@@ -1620,8 +1687,9 @@ static void usage(const char *prog)
         "[--cooldown <ms>]\n"
         "    (--send interprets \\n \\r \\t \\0 escapes; e.g. --send 'y\\n')\n"
         "\n"
-        "  monitor                 Stream output for a duration\n"
+        "  monitor                 Stream output for a duration (CLI, not TUI)\n"
         "    --duration <seconds>  How long to monitor (default: 30, max: 300)\n"
+        "                          Interactive TUI is smolmux-monitor.\n"
         "\n"
         "  report                  Generate a status report\n"
         "\n"
@@ -1639,8 +1707,11 @@ static void usage(const char *prog)
         "SOCKET DISCOVERY:\n"
         "  1. --socket <path> flag\n"
         "  2. $SMOLMUX_SOCKET environment variable\n"
-        "  3. Glob $XDG_RUNTIME_DIR/smolmux-*.sock\n"
-        "  4. Glob /tmp/smolmux-*.sock\n"
+        "  3. Glob $XDG_RUNTIME_DIR/smolmux-*.sock (live sockets only)\n"
+        "  4. Glob /tmp/smolmux-*.sock (live sockets only)\n"
+        "  Leftover .sock files do not count. Two live brokers: pass -s.\n"
+        "  smolmux-cli brokers lists leftover sockets.\n"
+        "  --json may go before or after the subcommand (status --json).\n"
         "\n"
         "ENVIRONMENT:\n"
         "  SMOLMUX_SOCKET    Override broker socket path\n",
@@ -1779,7 +1850,8 @@ static pid_t spawn_wire(const char *path, char *const argv[],
     if (pid < 0) return -1;
     if (pid == 0) {
         if (!foreground) setsid();
-        int fd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        int fd = open(logfile, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+                      S_IRUSR | S_IWUSR);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
         int nul = open("/dev/null", O_RDONLY);
         if (nul >= 0) { dup2(nul, 0); if (nul > 0) close(nul); }
@@ -1817,16 +1889,60 @@ static int build_wire_argv(const char *broker, const sm_board_manifest_t *m,
     }
     argv[a++] = "--board"; argv[a++] = (char *)m->board;
     argv[a++] = "--role";  argv[a++] = (char *)w->role;
+    if (w->policy[0]) {
+        argv[a++] = "--identity-policy";
+        argv[a++] = (char *)w->policy;
+    }
+    if (w->by_path[0]) {
+        argv[a++] = "--by-path";
+        argv[a++] = (char *)w->by_path;
+    }
     argv[a++] = "-s";      argv[a++] = (char *)sock;
     argv[a] = NULL;
     return a;
+}
+
+static void cli_print_json_line(cJSON *o)
+{
+    char *s = cJSON_PrintUnformatted(o);
+    printf("%s\n", s ? s : "{}");
+    free(s);
+}
+
+static void board_up_add_wire_json(cJSON *wires, const char *role,
+                                   const char *status, const char *socket,
+                                   const char *log, const char *err)
+{
+    if (!wires)
+        return;
+    cJSON *w = cJSON_CreateObject();
+    if (role)
+        cJSON_AddStringToObject(w, "role", role);
+    if (status)
+        cJSON_AddStringToObject(w, "status", status);
+    if (socket && socket[0])
+        cJSON_AddStringToObject(w, "socket", socket);
+    if (log && log[0])
+        cJSON_AddStringToObject(w, "log", log);
+    if (err && err[0])
+        cJSON_AddStringToObject(w, "error", err);
+    cJSON_AddItemToArray(wires, w);
 }
 
 static int board_up(const char *manifest_path, int foreground, int identity_ok)
 {
     sm_board_manifest_t m;
     if (sm_board_manifest_load(manifest_path, &m) != 0) {
-        fprintf(stderr, "error: failed to load manifest %s\n", manifest_path);
+        if (cli.json_output) {
+            cJSON *err = cJSON_CreateObject();
+            cJSON_AddStringToObject(err, "error", "manifest_load");
+            cJSON_AddStringToObject(err, "path", manifest_path);
+            cli_print_json_line(err);
+            cJSON_Delete(err);
+        } else {
+            fprintf(stderr, "error: failed to load manifest %s\n",
+                    manifest_path);
+        }
         return 1;
     }
 
@@ -1848,14 +1964,18 @@ static int board_up(const char *manifest_path, int foreground, int identity_ok)
         if (sm_identity_named_board_is_ambiguous(1, weak, w->policy,
                                                  w->by_path, now,
                                                  identity_ok)) {
-            cJSON *err = sm_identity_ambiguous_json(m.board, w->device,
+            const char *reason =
                 "named board + weak by-id; pin by_path (policy=seat) "
-                "or pass --identity-ok / SMOLMUX_IDENTITY_OK=1");
-            char *s = cJSON_PrintUnformatted(err);
-            fprintf(stderr, "%s\n",
-                    s ? s : "{\"error\":\"identity_ambiguous\"}");
-            free(s);
-            cJSON_Delete(err);
+                "or pass --identity-ok / SMOLMUX_IDENTITY_OK=1";
+            if (cli.json_output) {
+                cJSON *err = sm_identity_ambiguous_json(m.board, w->device,
+                                                       reason);
+                cli_print_json_line(err);
+                cJSON_Delete(err);
+            } else {
+                sm_identity_ambiguous_fprint(stderr, m.board, w->device,
+                                             reason);
+            }
             return 1;
         }
     }
@@ -1866,8 +1986,11 @@ static int board_up(const char *manifest_path, int foreground, int identity_ok)
     char broker[4096];
     resolve_broker_path(broker, sizeof(broker));
 
-    printf("Bringing up board '%s' (%zu wire%s)%s\n", m.board, m.wire_count,
-           m.wire_count == 1 ? "" : "s", foreground ? " [foreground]" : "");
+    cJSON *wires_json = cli.json_output ? cJSON_CreateArray() : NULL;
+    if (!cli.json_output)
+        printf("Bringing up board '%s' (%zu wire%s)%s\n", m.board,
+               m.wire_count, m.wire_count == 1 ? "" : "s",
+               foreground ? " [foreground]" : "");
 
     pid_t pids[SM_BOARD_MAX_WIRES];
     char  socks[SM_BOARD_MAX_WIRES][SM_SOCK_PATH_MAX];
@@ -1877,15 +2000,21 @@ static int board_up(const char *manifest_path, int foreground, int identity_ok)
     for (size_t i = 0; i < m.wire_count; i++) {
         sm_board_wire_t *w = &m.wires[i];
         if (sm_board_wire_socket(&m, w, socks[i], sizeof(socks[i])) != 0) {
-            printf("  %-8s ERROR: socket path too long — set an explicit "
-                   "\"socket\"\n", w->role);
+            if (!cli.json_output)
+                printf("  %-8s ERROR: socket path too long — set an explicit "
+                       "\"socket\"\n", w->role);
+            board_up_add_wire_json(wires_json, w->role, "error", NULL, NULL,
+                                   "socket path too long");
             continue;
         }
 
         /* Idempotent: skip a wire whose broker is already answering. */
         sm_broker_info_t info;
         if (sm_broker_probe(socks[i], &info, 400) == 0 && info.reachable) {
-            printf("  %-8s already up  (%s)\n", w->role, socks[i]);
+            if (!cli.json_output)
+                printf("  %-8s already up  (%s)\n", w->role, socks[i]);
+            board_up_add_wire_json(wires_json, w->role, "already_up",
+                                   socks[i], NULL, NULL);
             continue;
         }
 
@@ -1897,7 +2026,10 @@ static int board_up(const char *manifest_path, int foreground, int identity_ok)
         wire_logfile(&m, w, logf, sizeof(logf));
         pid_t pid = spawn_wire(broker, argv, foreground, logf);
         if (pid < 0) {
-            printf("  %-8s ERROR: fork failed\n", w->role);
+            if (!cli.json_output)
+                printf("  %-8s ERROR: fork failed\n", w->role);
+            board_up_add_wire_json(wires_json, w->role, "error", socks[i],
+                                   logf, "fork failed");
             continue;
         }
         pids[npids++] = pid;
@@ -1915,19 +2047,38 @@ static int board_up(const char *manifest_path, int foreground, int identity_ok)
             else
                 usleep(100000);
         }
-        printf("  %-8s %s  (%s)\n", m.wires[i].role,
-               up ? "up" : "FAILED — see log", socks[i]);
+        char logf[4096];
+        wire_logfile(&m, &m.wires[i], logf, sizeof(logf));
+        if (!cli.json_output)
+            printf("  %-8s %s  (%s)  log %s\n", m.wires[i].role,
+                   up ? "up" : "FAILED — see log", socks[i], logf);
+        board_up_add_wire_json(wires_json, m.wires[i].role,
+                               up ? "up" : "failed", socks[i], logf, NULL);
     }
 
-    if (!foreground)
+    if (cli.json_output) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "board", m.board);
+        cJSON_AddBoolToObject(o, "foreground", foreground);
+        cJSON_AddItemToObject(o, "wires", wires_json);
+        wires_json = NULL;
+        cli_print_json_line(o);
+        cJSON_Delete(o);
+        if (!foreground)
+            return 0;
+    } else if (!foreground) {
         return 0;
+    }
 
     /* Foreground: lifetime tied to this run. Wait for a signal, then stop all
      * wires we started (Ctrl-C in a terminal also signals them directly). */
-    printf("Board '%s' up in foreground. Ctrl-C to stop all wires.\n", m.board);
+    if (!cli.json_output)
+        printf("Board '%s' up in foreground. Ctrl-C to stop all wires.\n",
+               m.board);
     while (!cli.interrupted)
         pause();
-    printf("\nStopping board '%s'...\n", m.board);
+    if (!cli.json_output)
+        printf("\nStopping board '%s'...\n", m.board);
     for (int i = 0; i < npids; i++)
         kill(pids[i], SIGTERM);
     for (int i = 0; i < npids; i++) {
@@ -2105,6 +2256,8 @@ static int cmd_board(int argc, char **argv)
                 foreground = 1;
             else if (strcmp(argv[i], "--identity-ok") == 0)
                 identity_ok = 1;
+            else if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0)
+                continue; /* already recorded on cli.json_output */
             else
                 manifest = argv[i];
         }
@@ -2227,10 +2380,19 @@ static int cmd_shutdown(int argc, char *argv[])
         snprintf(sock, sizeof(sock), "%s", g_socket_arg);
     } else {
         char paths[16][SM_SOCK_PATH_MAX];
-        size_t n = sm_discover_all_sockets(paths, 16);
+        size_t n = sm_discover_reachable_sockets(paths, 16);
         if (n == 0) {
-            fprintf(stderr, "error: no broker socket found\n"
-                    "  Use -s <path> or start a broker first\n");
+            char leftover[16][SM_SOCK_PATH_MAX];
+            size_t nall = sm_discover_all_sockets(leftover, 16);
+            if (nall > 0)
+                fprintf(stderr,
+                        "error: no live broker socket found\n"
+                        "  %zu leftover socket(s); smolmux-cli brokers lists them\n"
+                        "  Use -s <path> or start a broker first\n",
+                        nall);
+            else
+                fprintf(stderr, "error: no broker socket found\n"
+                        "  Use -s <path> or start a broker first\n");
             return 1;
         }
         if (n > 1) {
@@ -2391,9 +2553,36 @@ static int cmd_gc(int argc, char **argv)
     return 0;
 }
 
+static int cmd_wait_for(int argc, char **argv)
+{
+    int timeout = 0;
+    const char *pattern = NULL;
+    int default_timeout = cli.timeout_ms > 0 ? cli.timeout_ms : 5000;
+    if (wait_for_parse(argc, argv, default_timeout, &pattern, &timeout) != 0) {
+        fprintf(stderr,
+                "usage: smolmux-cli wait-for [--timeout <ms>] <pattern>\n");
+        return 1;
+    }
+    send_msg(sm_msg_listen_expect("cli-wait", pattern, timeout));
+    cJSON *result = NULL;
+    int rc = wait_for_response(SM_MSG_EXPECT_RESULT, "cli-wait",
+                               timeout + 2000, &result, NULL);
+    if (rc != 0) return 1;
+    int matched = result ? sm_json_get_bool(result, "matched", 0) : 0;
+    if (cli.json_output && result) {
+        char *s = cJSON_PrintUnformatted(result);
+        if (s) { printf("%s\n", s); free(s); }
+    } else if (!matched) {
+        fprintf(stderr, "[timeout — pattern not matched]\n");
+    }
+    if (result) cJSON_Delete(result);
+    return matched ? 0 : 1;
+}
+
 static const subcmd_t subcmds[] = {
     {"send",       cmd_send,       1, "controller"},
     {"read",       cmd_read,       1, "observer"},
+    {"wait-for",   cmd_wait_for,   1, "observer"},
     {"write",      cmd_write,      1, "controller"},
     {"status",     cmd_status,     1, "observer"},
     {"boot-status", cmd_boot_status, 1, "observer"},
@@ -2451,17 +2640,17 @@ int main(int argc, char *argv[])
             printf("%s-cli %s\n", SM_NAME, SM_VERSION);
             return 0;
         case 'h':
-            usage(argv[0]);
+            usage(stdout, argv[0]);
             return 0;
         default:
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return 1;
         }
     }
 
     if (optind >= argc) {
         fprintf(stderr, "error: no command specified\n\n");
-        usage(argv[0]);
+        usage(stderr, argv[0]);
         return 1;
     }
 
@@ -2477,8 +2666,17 @@ int main(int argc, char *argv[])
 
     if (!cmd) {
         fprintf(stderr, "error: unknown command '%s'\n\n", cmd_name);
-        usage(argv[0]);
+        usage(stderr, argv[0]);
         return 1;
+    }
+
+    /* Honor --json/-j after the verb. Help shows `status --json`.
+     * send still refuses flags after the UART command. */
+    for (int i = optind + 1; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0)
+            break;
+        if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "-j") == 0)
+            cli.json_output = 1;
     }
 
     /* Set up signal handling */
@@ -2505,14 +2703,40 @@ int main(int argc, char *argv[])
             if (sm_discover_socket(discovered, sizeof(discovered)) == 0) {
                 socket_path = discovered;   /* g_socket_arg stays NULL: explicit -s only */
             } else {
-                fprintf(stderr, "error: no broker socket found\n"
-                        "  Use -s <path>, set $SMOLMUX_SOCKET, or start a broker\n");
+                char leftover[16][SM_SOCK_PATH_MAX];
+                size_t nall = sm_discover_all_sockets(leftover, 16);
+                if (nall > 0)
+                    fprintf(stderr,
+                            "error: no live broker socket found\n"
+                            "  %zu leftover socket(s); smolmux-cli brokers lists them\n"
+                            "  Use -s <path>, set $SMOLMUX_SOCKET, or start a broker\n",
+                            nall);
+                else
+                    fprintf(stderr, "error: no broker socket found\n"
+                            "  Use -s <path>, set $SMOLMUX_SOCKET, or start a broker\n");
                 return 1;
             }
         }
 
-        if (connect_and_hello(socket_path, cmd->role) != 0)
-            return 1;
+        {
+            char resolved[SM_SOCK_PATH_MAX];
+            int rrs = sm_resolve_client_socket(resolved, sizeof(resolved),
+                                               socket_path);
+            if (rrs < 0) {
+                fprintf(stderr, "error: cannot resolve socket from '%s'\n"
+                                "  smolmux-cli brokers\n", socket_path);
+                return 1;
+            }
+            if (rrs == 1) {
+                fprintf(stderr,
+                        "note: '%s' is a device node; using socket %s\n"
+                        "  smolmux-cli brokers lists live brokers\n",
+                        socket_path, resolved);
+            }
+            socket_path = resolved;
+            if (connect_and_hello(socket_path, cmd->role, cmd->name) != 0)
+                return 1;
+        }
     }
 
     /* Dispatch — pass subcommand args (argv starting at the subcommand) */

@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <time.h>
 #include <pty.h>
 
 /* Non-static test hooks from cli.c (main renamed to cli_main via the object
@@ -40,6 +41,12 @@ extern int cli_test_with_port(const char *sock_path, int argc, char **argv,
 extern int cli_test_board_up(const char *manifest_path);
 extern int cli_test_board_down(const char *board_name);
 extern int cli_test_trailing_option_after(int argc, char **argv, int first);
+extern int cli_test_wait_for_parse(int argc, char **argv, int default_timeout_ms,
+                                   const char **pattern_out, int *timeout_out);
+extern void cli_hello_name(char *out, size_t n, const char *cmd);
+
+static int capture_out_err(char *const argv[], char *out, size_t on,
+                           char *err, size_t en);
 
 typedef struct {
     int count;
@@ -147,6 +154,45 @@ static void test_two_small_responses(void)
     free(s1);
     free(s2);
     cli_test_reset();
+}
+
+static const char *find_smolmux_cli(char *buf, size_t len)
+{
+    const char *env = getenv("SMOLMUX_CLI");
+    if (env && env[0]) {
+        snprintf(buf, len, "%s", env);
+        return buf;
+    }
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0)
+        return NULL;
+    exe[n] = '\0';
+    char *slash = strrchr(exe, '/');
+    if (!slash)
+        return NULL;
+    *slash = '\0';
+    snprintf(buf, len, "%s/smolmux-cli", exe);
+    if (access(buf, X_OK) != 0)
+        return NULL;
+    return buf;
+}
+
+static const char *find_smolmux(char *buf, size_t len)
+{
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0)
+        return NULL;
+    exe[n] = '\0';
+    char *slash = strrchr(exe, '/');
+    if (!slash)
+        return NULL;
+    *slash = '\0';
+    snprintf(buf, len, "%s/smolmux", exe);
+    if (access(buf, X_OK) != 0)
+        return NULL;
+    return buf;
 }
 
 /* --- with-port: broker-driven tests (PTY + broker-in-thread) ---
@@ -307,7 +353,29 @@ static void test_board_up_down_two_wires(void)
         fclose(fp);
     }
 
+    fflush(stdout);
+    int outp[2];
+    ASSERT_INT_EQ(pipe(outp), 0);
+    int saved_out = dup(STDOUT_FILENO);
+    ASSERT(saved_out >= 0, "dup stdout");
+    ASSERT_INT_EQ(dup2(outp[1], STDOUT_FILENO), STDOUT_FILENO);
+    close(outp[1]);
     int up_rc = cli_test_board_up(manpath);
+    fflush(stdout);
+    dup2(saved_out, STDOUT_FILENO);
+    close(saved_out);
+    int fl = fcntl(outp[0], F_GETFL, 0);
+    fcntl(outp[0], F_SETFL, fl | O_NONBLOCK);
+    char up_out[4096];
+    memset(up_out, 0, sizeof(up_out));
+    size_t up_got = 0;
+    while (up_got < sizeof(up_out) - 1) {
+        ssize_t nr = read(outp[0], up_out + up_got, sizeof(up_out) - 1 - up_got);
+        if (nr <= 0)
+            break;
+        up_got += (size_t)nr;
+    }
+    close(outp[0]);
     sm_board_manifest_t plan;
     memset(&plan, 0, sizeof(plan));
     char sock0[SM_SOCK_PATH_MAX] = "";
@@ -379,6 +447,16 @@ static void test_board_up_down_two_wires(void)
     ASSERT_INT_EQ(up_rc, 0);
     ASSERT(ok0, "console wire broker up after board up");
     ASSERT(ok1, "aux wire broker up after board up");
+    char expect_log[320];
+    snprintf(expect_log, sizeof(expect_log),
+             "%s/smolmux-%s-console.log", rundir, board);
+    ASSERT(strstr(up_out, "log ") != NULL, "board up prints log label");
+    ASSERT(strstr(up_out, expect_log) != NULL,
+           "board up names the console wire log path");
+    snprintf(expect_log, sizeof(expect_log),
+             "%s/smolmux-%s-aux.log", rundir, board);
+    ASSERT(strstr(up_out, expect_log) != NULL,
+           "board up names the aux wire log path");
 }
 
 /* D3: board up of a named board on a WEAK by-id must not spawn. */
@@ -403,26 +481,46 @@ static void test_board_up_weak_by_id_refuses(void)
     ASSERT_INT_EQ(rc, 1);
 }
 
-static const char *find_smolmux_cli(char *buf, size_t len)
+/* ACT-051: argv policy=seat + mismatched by_path refuses before open. */
+static void test_argv_policy_seat_refuses_mismatch(void)
 {
-    const char *env = getenv("SMOLMUX_CLI");
-    if (env && env[0]) {
-        snprintf(buf, len, "%s", env);
-        return buf;
+    unsetenv("SMOLMUX_IDENTITY_OK");
+    char bin[4096];
+    const char *sm = find_smolmux(bin, sizeof(bin));
+    ASSERT_NOT_NULL(sm);
+
+    int errp[2];
+    ASSERT_INT_EQ(pipe(errp), 0);
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        close(errp[0]);
+        dup2(errp[1], STDERR_FILENO);
+        dup2(errp[1], STDOUT_FILENO);
+        close(errp[1]);
+        execl(sm, "smolmux",
+              "/dev/serial/by-id/usb-fake-noserial-if00",
+              "--board", "seatcam",
+              "--identity-policy", "seat",
+              "--by-path", "/dev/ttySEAT-NOT-THIS",
+              "-s", "/tmp/smolmux-argv-seat.sock",
+              (char *)NULL);
+        _exit(127);
     }
-    char exe[4096];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n <= 0)
-        return NULL;
-    exe[n] = '\0';
-    char *slash = strrchr(exe, '/');
-    if (!slash)
-        return NULL;
-    *slash = '\0';
-    snprintf(buf, len, "%s/smolmux-cli", exe);
-    if (access(buf, X_OK) != 0)
-        return NULL;
-    return buf;
+    close(errp[1]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    char err[2048];
+    memset(err, 0, sizeof(err));
+    ssize_t en = read(errp[0], err, sizeof(err) - 1);
+    if (en < 0) en = 0;
+    err[en] = '\0';
+    close(errp[0]);
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+    ASSERT_INT_EQ(code, 1);
+    ASSERT(strstr(err, "identity_ambiguous") != NULL,
+           "argv seat mismatch refuses before open");
+    ASSERT(strstr(err, "listening on") == NULL, "broker did not bind");
 }
 
 /* I2 e2e: real smolmux-cli vs PTY — trailing --expect must not hit the wire. */
@@ -476,6 +574,196 @@ static void test_send_trailing_flags_real_cli_pty(void)
     ASSERT(strstr(got, "--expect") == NULL, "PTY must not contain --expect");
 }
 
+/* Trailing --timeout must bound listen_expect, not the 5s default. */
+static void test_wait_for_trailing_timeout_pty(void)
+{
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    wp_ctx_t ctx;
+    wp_setup(&ctx);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        execl(cli, "smolmux-cli", "-s", WP_SOCK,
+              "wait-for", "READY", "--timeout", "250", (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    wp_teardown(&ctx);
+
+    ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 1, "no READY match");
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    ASSERT(ms < 2000.0, "trailing --timeout 250 finishes under 2s");
+    ASSERT(ms >= 150.0, "waited at least the timeout");
+
+    wp_setup(&ctx);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pid = fork();
+    ASSERT(pid >= 0, "fork leading");
+    if (pid == 0) {
+        execl(cli, "smolmux-cli", "-s", WP_SOCK,
+              "wait-for", "--timeout", "250", "READY", (char *)NULL);
+        _exit(127);
+    }
+    st = 0;
+    waitpid(pid, &st, 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    wp_teardown(&ctx);
+    ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 1, "leading: no READY match");
+    ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+         (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    ASSERT(ms < 2000.0, "leading --timeout 250 finishes under 2s");
+    ASSERT(ms >= 150.0, "leading waited at least the timeout");
+}
+
+static void test_weak_by_id_warn_cites_packed_doc(void)
+{
+    char bin[4096];
+    const char *sm = find_smolmux(bin, sizeof(bin));
+    ASSERT_NOT_NULL(sm);
+
+    char out[4096], err[8192];
+    /* Class-only by-id that cannot exist — do not open a live hub port. */
+    char *argv[] = {
+        bin,
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0-smolmux-test-missing",
+        "-s", "/tmp/smolmux-weak-warn-test.sock",
+        NULL
+    };
+    int rc = capture_out_err(argv, out, sizeof(out), err, sizeof(err));
+    ASSERT(rc != 0, "missing weak by-id fails to open");
+    ASSERT(strstr(err, "docs/PERSISTENT-SERIAL.md") != NULL,
+           "WEAK warn cites packed doc");
+    ASSERT(strstr(err, "source tree") == NULL,
+           "WEAK warn has no source-tree parenthetical");
+}
+
+/* ACT-066 CTL-1: wait-for is listen_expect in the CLI owning phase. */
+static void test_wait_for_matches_listen_expect(void)
+{
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    wp_ctx_t ctx;
+    wp_setup(&ctx);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        execl(cli, "smolmux-cli", "-s", WP_SOCK, "-t", "3000",
+              "wait-for", "READY", (char *)NULL);
+        _exit(127);
+    }
+    usleep(250000);
+    write(ctx.master, "boot READY now\n", 15);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    wp_teardown(&ctx);
+    ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 0, "wait-for matched READY");
+}
+
+static void test_history_since_seq_cli_e2e(void)
+{
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    wp_ctx_t ctx;
+    wp_setup(&ctx);
+    write(ctx.master, "A4-since-seq-early\n", 19);
+    write(ctx.master, "A4-since-seq-late\n", 18);
+    usleep(250000);
+
+    int outp[2];
+    ASSERT_INT_EQ(pipe(outp), 0);
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        close(outp[0]);
+        dup2(outp[1], STDOUT_FILENO);
+        close(outp[1]);
+        /* Seq far past the ring: ignoring --since-seq would still dump both
+         * markers; a working filter returns neither. */
+        execl(cli, "smolmux-cli", "-s", WP_SOCK, "-t", "3000",
+              "history", "--since-seq", "999999999", (char *)NULL);
+        _exit(127);
+    }
+    close(outp[1]);
+    char out[4096];
+    memset(out, 0, sizeof(out));
+    size_t got = 0;
+    while (got < sizeof(out) - 1) {
+        ssize_t n = read(outp[0], out + got, sizeof(out) - 1 - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    close(outp[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    wp_teardown(&ctx);
+    ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 0, "history --since-seq exits 0");
+    ASSERT(strstr(out, "A4-since-seq-early") == NULL,
+           "--since-seq must drop earlier bytes");
+    ASSERT(strstr(out, "A4-since-seq-late") == NULL,
+           "--since-seq 999999999 is past the ring");
+}
+
+static void test_cli_s_device_node_prints_derive(void)
+{
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    int errp[2];
+    ASSERT_INT_EQ(pipe(errp), 0);
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        close(errp[0]);
+        dup2(errp[1], STDERR_FILENO);
+        dup2(errp[1], STDOUT_FILENO);
+        close(errp[1]);
+        execl(cli, "smolmux-cli", "-s", "/dev/null", "status", (char *)NULL);
+        _exit(127);
+    }
+    close(errp[1]);
+    char err[2048];
+    memset(err, 0, sizeof(err));
+    size_t got = 0;
+    while (got < sizeof(err) - 1) {
+        ssize_t n = read(errp[0], err + got, sizeof(err) - 1 - got);
+        if (n <= 0)
+            break;
+        got += (size_t)n;
+    }
+    close(errp[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    ASSERT(WIFEXITED(st) && WEXITSTATUS(st) != 0,
+           "CLI exits nonzero with no broker");
+    ASSERT(strstr(err, "is a device node; using socket") != NULL,
+           "CLI -s /dev/null prints derive note");
+    ASSERT(strstr(err, "smolmux-null.sock") != NULL,
+           "CLI names the derived socket");
+    ASSERT(strstr(err, "cannot connect to /dev/null") == NULL,
+           "connect target is not AF_UNIX /dev/null");
+    {
+        const char *cc = strstr(err, "cannot connect to ");
+        ASSERT(cc && strstr(cc, "smolmux-null.sock") != NULL,
+               "connect error names the derived sock");
+    }
+}
+
 #endif /* SM_ENABLE_UART */
 
 static void test_identity_ambiguous_json(void)
@@ -491,6 +779,373 @@ static void test_identity_ambiguous_json(void)
     cJSON_Delete(err);
 }
 
+static int drain_fd(int fd, char *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n - 1) {
+        ssize_t nrd = read(fd, buf + got, n - 1 - got);
+        if (nrd <= 0)
+            break;
+        got += (size_t)nrd;
+    }
+    buf[got] = '\0';
+    return (int)got;
+}
+
+static char *capture_cli_stdout(char *const argv[])
+{
+    int outp[2];
+    if (pipe(outp) != 0)
+        return NULL;
+    pid_t pid = fork();
+    if (pid < 0)
+        return NULL;
+    if (pid == 0) {
+        close(outp[0]);
+        dup2(outp[1], STDOUT_FILENO);
+        close(outp[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(outp[1]);
+    char buf[4096];
+    memset(buf, 0, sizeof(buf));
+    ssize_t n = read(outp[0], buf, sizeof(buf) - 1);
+    close(outp[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || n < 0)
+        return NULL;
+    return strdup(buf);
+}
+
+static int capture_out_err(char *const argv[], char *out, size_t on,
+                            char *err, size_t en)
+{
+    int op[2], ep[2];
+    if (pipe(op) != 0 || pipe(ep) != 0)
+        return -1;
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        close(op[0]);
+        close(ep[0]);
+        dup2(op[1], STDOUT_FILENO);
+        dup2(ep[1], STDERR_FILENO);
+        close(op[1]);
+        close(ep[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(op[1]);
+    close(ep[1]);
+    drain_fd(op[0], out, on);
+    drain_fd(ep[0], err, en);
+    close(op[0]);
+    close(ep[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st))
+        return -1;
+    return (int)WEXITSTATUS(st);
+}
+
+static char *capture_cli_merged(char *const argv[], int *code)
+{
+    int p[2];
+    if (pipe(p) != 0)
+        return NULL;
+    pid_t pid = fork();
+    if (pid < 0)
+        return NULL;
+    if (pid == 0) {
+        close(p[0]);
+        dup2(p[1], STDOUT_FILENO);
+        dup2(p[1], STDERR_FILENO);
+        close(p[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(p[1]);
+    char buf[8192];
+    memset(buf, 0, sizeof(buf));
+    size_t got = 0;
+    while (got < sizeof(buf) - 1) {
+        ssize_t nrd = read(p[0], buf + got, sizeof(buf) - 1 - got);
+        if (nrd <= 0)
+            break;
+        got += (size_t)nrd;
+    }
+    close(p[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (code)
+        *code = WIFEXITED(st) ? (int)WEXITSTATUS(st) : -1;
+    return strdup(buf);
+}
+
+static void test_cli_hello_name_format(void)
+{
+    char name[64];
+    cli_hello_name(name, sizeof(name), "status");
+    ASSERT(strncmp(name, "smolmux-cli-status-", 19) == 0, "hello prefix");
+    ASSERT(strlen(name) < sizeof(name), "fits name[64]");
+    char want[64];
+    snprintf(want, sizeof(want), "smolmux-cli-status-%d", (int)getpid());
+    ASSERT_STR_EQ(name, want);
+}
+
+static void test_help_on_stdout(void)
+{
+    char bin[4096], clipath[4096];
+    const char *sm = find_smolmux(bin, sizeof(bin));
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(sm);
+    ASSERT_NOT_NULL(cli);
+
+    char out[4096], err[4096];
+    char *argv_sm[] = { bin, "--help", NULL };
+    ASSERT_INT_EQ(capture_out_err(argv_sm, out, sizeof(out), err, sizeof(err)),
+                  0);
+    ASSERT(strlen(out) > 0, "smolmux --help writes stdout");
+    ASSERT(err[0] == '\0', "smolmux --help leaves stderr empty");
+
+    char *argv_cli[] = { clipath, "-h", NULL };
+    ASSERT_INT_EQ(capture_out_err(argv_cli, out, sizeof(out), err, sizeof(err)),
+                  0);
+    ASSERT(strlen(out) > 0, "smolmux-cli -h writes stdout");
+    ASSERT(err[0] == '\0', "smolmux-cli -h leaves stderr empty");
+
+    char *argv_bad[] = { bin, "--not-a-real-option", NULL };
+    ASSERT_INT_EQ(capture_out_err(argv_bad, out, sizeof(out), err, sizeof(err)),
+                  1);
+    ASSERT(out[0] == '\0', "unknown option leaves stdout empty");
+    ASSERT(err[0] != '\0', "unknown option writes usage on stderr");
+}
+
+static void test_identity_ambiguous_cli_human_and_json(void)
+{
+    unsetenv("SMOLMUX_IDENTITY_OK");
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    char manpath[256];
+    snprintf(manpath, sizeof(manpath), "%s/smolmux-weak-json-%d.board.json",
+             tmpdir, (int)getpid());
+    FILE *fp = fopen(manpath, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("{\"board\":\"weakcam\",\"wires\":[{"
+          "\"role\":\"console\",\"link\":\"uart\","
+          "\"device\":\"/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0\","
+          "\"baud\":115200}]}", fp);
+    fclose(fp);
+
+    char *argv_h[] = { clipath, "board", "up", manpath, NULL };
+    int rc = -1;
+    char *merged = capture_cli_merged(argv_h, &rc);
+    ASSERT_NOT_NULL(merged);
+    ASSERT_INT_EQ(rc, 1);
+    ASSERT(strstr(merged, "identity_ambiguous") != NULL, "human names error");
+    ASSERT(strstr(merged, "\"candidates\"") == NULL,
+           "human has no candidates JSON");
+    ASSERT(strstr(merged, "smolmux --list-ports") != NULL,
+           "human names list-ports");
+    free(merged);
+
+    char *argv_j[] = { clipath, "--json", "board", "up", manpath, NULL };
+    merged = capture_cli_merged(argv_j, &rc);
+    ASSERT_NOT_NULL(merged);
+    ASSERT_INT_EQ(rc, 1);
+    {
+        const char *brace = strchr(merged, '{');
+        ASSERT(brace != NULL, "--json prints a JSON object");
+        cJSON *j = cJSON_Parse(brace);
+        ASSERT_NOT_NULL(j);
+        ASSERT_STR_EQ(sm_json_get_string(j, "error"), "identity_ambiguous");
+        ASSERT(cJSON_IsArray(cJSON_GetObjectItem(j, "candidates")),
+               "--json has candidates");
+        cJSON_Delete(j);
+    }
+    free(merged);
+    unlink(manpath);
+}
+
+#if SM_ENABLE_UART
+static char *capture_stdout_in(char *const argv[], const char *cwd, const char *home)
+{
+    int outp[2];
+    if (pipe(outp) != 0)
+        return NULL;
+    pid_t pid = fork();
+    if (pid < 0)
+        return NULL;
+    if (pid == 0) {
+        close(outp[0]);
+        dup2(outp[1], STDOUT_FILENO);
+        close(outp[1]);
+        if (home)
+            setenv("HOME", home, 1);
+        unsetenv("SMOLMUX_DEVICE_PROFILE");
+        if (cwd && chdir(cwd) != 0)
+            _exit(127);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(outp[1]);
+    char buf[4096];
+    memset(buf, 0, sizeof(buf));
+    size_t got = 0;
+    while (got < sizeof(buf) - 1) {
+        ssize_t nrd = read(outp[0], buf + got, sizeof(buf) - 1 - got);
+        if (nrd <= 0)
+            break;
+        got += (size_t)nrd;
+    }
+    close(outp[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0 || got == 0)
+        return NULL;
+    return strdup(buf);
+}
+
+static void write_tiny_profile(const char *path, const char *name, const char *desc)
+{
+    FILE *fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "{\"name\":\"%s\",\"description\":\"%s\"}\n", name, desc);
+    fclose(fp);
+}
+
+static void test_list_profiles_skips_cwd_configs(void)
+{
+    char bin[4096];
+    const char *sm = find_smolmux(bin, sizeof(bin));
+    ASSERT_NOT_NULL(sm);
+
+    char root[128];
+    snprintf(root, sizeof(root), "/tmp/smlp-%d", (int)getpid());
+    ASSERT_INT_EQ(mkdir(root, 0700), 0);
+    char home[160], cfg[200], cwd[160], configs[180], profiles[180], cfgdir[220];
+    snprintf(home, sizeof(home), "%s/home", root);
+    snprintf(cfg, sizeof(cfg), "%s/.config", home);
+    snprintf(cfgdir, sizeof(cfgdir), "%s/smolmux", cfg);
+    snprintf(cwd, sizeof(cwd), "%s/work", root);
+    snprintf(configs, sizeof(configs), "%s/configs", cwd);
+    snprintf(profiles, sizeof(profiles), "%s/profiles", cwd);
+    ASSERT_INT_EQ(mkdir(home, 0700), 0);
+    ASSERT_INT_EQ(mkdir(cfg, 0700), 0);
+    ASSERT_INT_EQ(mkdir(cfgdir, 0700), 0);
+    ASSERT_INT_EQ(mkdir(cwd, 0700), 0);
+    ASSERT_INT_EQ(mkdir(configs, 0700), 0);
+    ASSERT_INT_EQ(mkdir(profiles, 0700), 0);
+
+    char p_home[256], p_leak[256], p_zip[256], p_home_dup[256], p_dup[256];
+    snprintf(p_home, sizeof(p_home), "%s/homeok.smolmux-profile.json", cfgdir);
+    snprintf(p_home_dup, sizeof(p_home_dup), "%s/shared.smolmux-profile.json",
+             cfgdir);
+    snprintf(p_leak, sizeof(p_leak), "%s/leak.smolmux-profile.json", configs);
+    snprintf(p_zip, sizeof(p_zip), "%s/zipok.smolmux-profile.json", profiles);
+    snprintf(p_dup, sizeof(p_dup), "%s/dup.smolmux-profile.json", profiles);
+    write_tiny_profile(p_home, "home-config-ok", "from HOME");
+    write_tiny_profile(p_home_dup, "dup-in-both", "from HOME");
+    write_tiny_profile(p_leak, "cwd-configs-leak", "must not list");
+    write_tiny_profile(p_zip, "cwd-profiles-ok", "from zip profiles");
+    write_tiny_profile(p_dup, "dup-in-both", "from zip profiles");
+
+    char *argv[] = { bin, "--list-profiles", NULL };
+    char *out = capture_stdout_in(argv, cwd, home);
+    ASSERT_NOT_NULL(out);
+    ASSERT(strstr(out, "home-config-ok") != NULL, "lists ~/.config");
+    ASSERT(strstr(out, "cwd-profiles-ok") != NULL, "lists cwd profiles/");
+    ASSERT(strstr(out, "cwd-configs-leak") == NULL, "does not list cwd configs/");
+    ASSERT(strstr(out, "(bundled)") == NULL, "does not label bundled");
+    {
+        const char *hit = strstr(out, "dup-in-both");
+        ASSERT(hit != NULL, "lists shared name");
+        ASSERT(strstr(hit + 1, "dup-in-both") == NULL, "shared name once");
+        const char *eol = strchr(hit, '\n');
+        size_t ln = eol ? (size_t)(eol - hit) : strlen(hit);
+        char line[256];
+        if (ln >= sizeof(line))
+            ln = sizeof(line) - 1;
+        memcpy(line, hit, ln);
+        line[ln] = '\0';
+        ASSERT(strstr(line, "(profiles/)") == NULL,
+               "HOME config wins, no profiles/ tag");
+    }
+    free(out);
+
+    unlink(p_home);
+    unlink(p_home_dup);
+    unlink(p_leak);
+    unlink(p_zip);
+    unlink(p_dup);
+    rmdir(cfgdir);
+    rmdir(cfg);
+    rmdir(home);
+    rmdir(configs);
+    rmdir(profiles);
+    rmdir(cwd);
+    rmdir(root);
+}
+#endif /* SM_ENABLE_UART */
+
+static void test_list_ports_json_flag_before_or_after(void)
+{
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    char *argv_before[] = { clipath, "--json", "list-ports", NULL };
+    char *out_b = capture_cli_stdout(argv_before);
+    ASSERT_NOT_NULL(out_b);
+    ASSERT(out_b[0] == '[', "--json list-ports starts a JSON array");
+    free(out_b);
+
+    char *argv_after[] = { clipath, "list-ports", "--json", NULL };
+    char *out_a = capture_cli_stdout(argv_after);
+    ASSERT_NOT_NULL(out_a);
+    ASSERT(out_a[0] == '[', "list-ports --json starts a JSON array");
+    free(out_a);
+
+    char *argv_brokers[] = { clipath, "brokers", "--json", NULL };
+    char *out_br = capture_cli_stdout(argv_brokers);
+    ASSERT_NOT_NULL(out_br);
+    ASSERT(out_br[0] == '[', "brokers --json starts a JSON array");
+    free(out_br);
+}
+
+static void test_serial_port_info_json_includes_usb_ids(void)
+{
+    sm_serial_port_info_t info;
+    memset(&info, 0, sizeof(info));
+    snprintf(info.path, sizeof(info.path), "/dev/ttyUSB2");
+    snprintf(info.by_id, sizeof(info.by_id),
+             "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_DPAZb137C01-if00-port0");
+    snprintf(info.by_path, sizeof(info.by_path),
+             "/dev/serial/by-path/pci-0000:00:14.0-usb-0:9.3.4:1.0-port0");
+    snprintf(info.vid, sizeof(info.vid), "067b");
+    snprintf(info.pid, sizeof(info.pid), "23a3");
+    snprintf(info.manufacturer, sizeof(info.manufacturer), "Prolific");
+    snprintf(info.product, sizeof(info.product), "USB-Serial Controller");
+
+    cJSON *o = sm_serial_port_info_to_json(&info);
+    ASSERT_NOT_NULL(o);
+    ASSERT_STR_EQ(sm_json_get_string(o, "path"), "/dev/ttyUSB2");
+    ASSERT_STR_EQ(sm_json_get_string(o, "vid"), "067b");
+    ASSERT_STR_EQ(sm_json_get_string(o, "pid"), "23a3");
+    ASSERT_STR_EQ(sm_json_get_string(o, "manufacturer"), "Prolific");
+    ASSERT_STR_EQ(sm_json_get_string(o, "product"), "USB-Serial Controller");
+    ASSERT_STR_EQ(sm_json_get_string(o, "identity"), "STRONG");
+    cJSON_Delete(o);
+}
+
 /* I2: flags after the command must be detected (owning phase = cmd_send). */
 static void test_send_trailing_options_rejected(void)
 {
@@ -502,6 +1157,159 @@ static void test_send_trailing_options_rejected(void)
     ASSERT_INT_EQ(cli_test_trailing_option_after(3, dash, 2), 0);
 }
 
+/* Honor --timeout on either side of the wait-for pattern (owning parse). */
+static void test_wait_for_timeout_either_side(void)
+{
+    const char *pat = NULL;
+    int to = -1;
+    char *trail[] = {"wait-for", "READY", "--timeout", "250", NULL};
+    ASSERT_INT_EQ(cli_test_wait_for_parse(4, trail, 5000, &pat, &to), 0);
+    ASSERT_STR_EQ(pat, "READY");
+    ASSERT_INT_EQ(to, 250);
+
+    pat = NULL;
+    to = -1;
+    char *lead[] = {"wait-for", "--timeout", "250", "READY", NULL};
+    ASSERT_INT_EQ(cli_test_wait_for_parse(4, lead, 5000, &pat, &to), 0);
+    ASSERT_STR_EQ(pat, "READY");
+    ASSERT_INT_EQ(to, 250);
+
+    pat = NULL;
+    to = -1;
+    char *def[] = {"wait-for", "READY", NULL};
+    ASSERT_INT_EQ(cli_test_wait_for_parse(2, def, 5000, &pat, &to), 0);
+    ASSERT_STR_EQ(pat, "READY");
+    ASSERT_INT_EQ(to, 5000);
+
+    char *none[] = {"wait-for", NULL};
+    ASSERT_INT_EQ(cli_test_wait_for_parse(1, none, 5000, &pat, &to), -1);
+}
+
+static void write_weak_board_manifest(char *manpath, size_t n)
+{
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0])
+        tmpdir = "/tmp";
+    snprintf(manpath, n, "%s/smolmux-weak-json-%d.board.json",
+             tmpdir, (int)getpid());
+    FILE *fp = fopen(manpath, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("{\"board\":\"weakcam\",\"wires\":[{"
+          "\"role\":\"console\",\"link\":\"uart\","
+          "\"device\":\"/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0\","
+          "\"baud\":115200}]}", fp);
+    fclose(fp);
+}
+
+/* --json board up: one JSON object on stdout; stderr is not that object. */
+static void test_json_board_up_stdout_not_stderr(void)
+{
+    unsetenv("SMOLMUX_IDENTITY_OK");
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    char manpath[256];
+    write_weak_board_manifest(manpath, sizeof(manpath));
+
+    char out[8192], err[8192];
+    char *argv_before[] = { clipath, "--json", "board", "up", manpath, NULL };
+    int rc = capture_out_err(argv_before, out, sizeof(out), err, sizeof(err));
+    ASSERT_INT_EQ(rc, 1);
+    ASSERT(out[0] == '{', "--json board up JSON on stdout");
+    cJSON *j = cJSON_Parse(out);
+    ASSERT_NOT_NULL(j);
+    ASSERT_STR_EQ(sm_json_get_string(j, "error"), "identity_ambiguous");
+    cJSON_Delete(j);
+    ASSERT(strchr(err, '{') == NULL,
+           "stderr is not the identity_ambiguous JSON object");
+
+    memset(out, 0, sizeof(out));
+    memset(err, 0, sizeof(err));
+    char *argv_after[] = { clipath, "board", "up", "--json", manpath, NULL };
+    rc = capture_out_err(argv_after, out, sizeof(out), err, sizeof(err));
+    ASSERT_INT_EQ(rc, 1);
+    ASSERT(out[0] == '{', "board up --json JSON on stdout");
+    j = cJSON_Parse(out);
+    ASSERT_NOT_NULL(j);
+    ASSERT_STR_EQ(sm_json_get_string(j, "error"), "identity_ambiguous");
+    cJSON_Delete(j);
+    ASSERT(strchr(err, '{') == NULL,
+           "board up --json stderr is not the JSON object");
+
+    unlink(manpath);
+}
+
+#if SM_ENABLE_UART
+/* Success-path --json board up: stdout is one JSON object, not human lines. */
+static void test_json_board_up_success_stdout(void)
+{
+    int m0 = -1, s0 = -1, m1 = -1, s1 = -1;
+    char rundir[128] = "";
+    char board[64];
+    snprintf(board, sizeof(board), "jsond%d", (int)getpid());
+
+    ASSERT(openpty(&m0, &s0, NULL, NULL, NULL) == 0, "pty0");
+    ASSERT(openpty(&m1, &s1, NULL, NULL, NULL) == 0, "pty1");
+    char p0[64], p1[64];
+    {
+        char *t = ttyname(s0);
+        ASSERT_NOT_NULL(t);
+        snprintf(p0, sizeof(p0), "%s", t);
+        t = ttyname(s1);
+        ASSERT_NOT_NULL(t);
+        snprintf(p1, sizeof(p1), "%s", t);
+    }
+
+    snprintf(rundir, sizeof(rundir), "/tmp/smj1-XXXXXX");
+    ASSERT_NOT_NULL(mkdtemp(rundir));
+    setenv("XDG_RUNTIME_DIR", rundir, 1);
+
+    char clipath[4096];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+
+    char manpath[160];
+    snprintf(manpath, sizeof(manpath), "%s/dual.board.json", rundir);
+    FILE *fp = fopen(manpath, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp,
+            "{\"board\":\"%s\",\"wires\":["
+            "{\"role\":\"console\",\"link\":\"uart\",\"device\":\"%s\","
+            "\"baud\":115200},"
+            "{\"role\":\"aux\",\"link\":\"uart\",\"device\":\"%s\","
+            "\"baud\":115200}"
+            "]}",
+            board, p0, p1);
+    fclose(fp);
+
+    char out[8192], err[8192];
+    char *argv[] = { clipath, "--json", "board", "up", manpath, NULL };
+    int rc = capture_out_err(argv, out, sizeof(out), err, sizeof(err));
+    cli_test_board_down(board);
+
+    close(m0); close(s0); close(m1); close(s1);
+    unlink(manpath);
+    char logp[320];
+    snprintf(logp, sizeof(logp), "%s/smolmux-%s-console.log", rundir, board);
+    unlink(logp);
+    snprintf(logp, sizeof(logp), "%s/smolmux-%s-aux.log", rundir, board);
+    unlink(logp);
+    unsetenv("XDG_RUNTIME_DIR");
+    rmdir(rundir);
+
+    ASSERT_INT_EQ(rc, 0);
+    ASSERT(strstr(out, "Bringing up board") == NULL,
+           "JSON mode keeps human banner off stdout");
+    cJSON *j = cJSON_Parse(out);
+    ASSERT_NOT_NULL(j);
+    ASSERT_STR_EQ(sm_json_get_string(j, "board"), board);
+    ASSERT(cJSON_IsArray(cJSON_GetObjectItem(j, "wires")), "wires array");
+    cJSON_Delete(j);
+    ASSERT(strchr(err, '{') == NULL, "stderr is not the JSON object");
+}
+#endif
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -509,15 +1317,32 @@ int main(void)
     RUN_TEST(test_large_response_line);
     RUN_TEST(test_two_small_responses);
     RUN_TEST(test_send_trailing_options_rejected);
+    RUN_TEST(test_wait_for_timeout_either_side);
+    RUN_TEST(test_json_board_up_stdout_not_stderr);
     RUN_TEST(test_identity_ambiguous_json);
+    RUN_TEST(test_cli_hello_name_format);
+    RUN_TEST(test_help_on_stdout);
+    RUN_TEST(test_identity_ambiguous_cli_human_and_json);
+    RUN_TEST(test_serial_port_info_json_includes_usb_ids);
+#if SM_ENABLE_UART
+    RUN_TEST(test_list_profiles_skips_cwd_configs);
+#endif
+    RUN_TEST(test_list_ports_json_flag_before_or_after);
 #if SM_ENABLE_UART
     RUN_TEST(test_with_port_success_resumes);
     RUN_TEST(test_with_port_propagates_exit_code);
     RUN_TEST(test_with_port_exec_failure);
     RUN_TEST(test_with_port_missing_command);
     RUN_TEST(test_board_up_down_two_wires);
+    RUN_TEST(test_json_board_up_success_stdout);
     RUN_TEST(test_board_up_weak_by_id_refuses);
+    RUN_TEST(test_argv_policy_seat_refuses_mismatch);
     RUN_TEST(test_send_trailing_flags_real_cli_pty);
+    RUN_TEST(test_wait_for_trailing_timeout_pty);
+    RUN_TEST(test_weak_by_id_warn_cites_packed_doc);
+    RUN_TEST(test_wait_for_matches_listen_expect);
+    RUN_TEST(test_history_since_seq_cli_e2e);
+    RUN_TEST(test_cli_s_device_node_prints_derive);
 #endif
     TEST_REPORT();
 }

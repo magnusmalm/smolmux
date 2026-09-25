@@ -13,11 +13,11 @@ it in as you work through the steps below.
 - **One broker per wire, grouped into a board.** A smolmux broker holds exactly
   one link (one UART, or one GDB/SWD session). A board with SWD + two UARTs is
   three brokers on three sockets. Tag each broker with `--board <name> --role
-  <label>` (e.g. `--board samc21-bench --role console`) so discovery can present
+  <label>` (e.g. `--board myboard --role console`) so discovery can present
   them as one board: `smolmux-cli boards` groups the wires, and `--json` gives an
   agent the board -> wires structure. Still name sockets sensibly and keep the
   template's wiring table as the canonical record. **One USB dual-interface
-  cable is still two wires** (by-id pair + OpenOCD ownership per interface) —
+  cable is still two wires** (by-id pair + OpenOCD ownership per interface), 
   see `docs/dual-service-usb-cable.md`.
 - **Read facts, don't guess them.** Confirm the silicon from the chip itself
   (CPUID, vendor ID registers, boot banner) before trusting the datasheet, and
@@ -39,16 +39,20 @@ Write two smolmux profiles while you're here (both optional but useful):
   console you expect (U-Boot, Linux, RTOS shell);
 - a **GDB target profile** (`*.gdb-profile.json`): `arch`, `important_registers`,
   `fault_registers`, `peripheral_map` (name -> base address), `rtos`,
-  `gdb_init_commands`. See `configs/nrf9151.gdb-profile.json` for the shape.
+  `gdb_init_commands`. A filled M33 example is `nrf9151.gdb-profile.json` in
+  the Pro zip `profiles/` directory.
 
 ## Step 1 - Bring up the wires
 
 **UART console** (repeat per UART):
 
 ```bash
-smolmux /dev/ttyUSB0 -b 115200 -p configs/<board>.smolmux-profile.json \
+smolmux /dev/ttyUSB0 -b 115200 -p configs/linux-shell.smolmux-profile.json \
         -s /tmp/smolmux-<board>-console.sock
 ```
+
+U-Boot consoles use `configs/uboot.smolmux-profile.json`. Named MCU serial
+profiles ship in the Pro zip `profiles/` directory.
 
 Verify it's alive: `smolmux-monitor /tmp/smolmux-<board>-console.sock` (Ctrl-] to
 exit) and power-cycle or reset the board - you should see the boot banner. Use
@@ -80,21 +84,20 @@ of the wiring table) and let smolmux start every wire:
 
 ```json
 {
-  "board": "samc21-bench",
+  "board": "newboard",
   "wires": [
-    {"role": "console", "link": "uart", "device": "/dev/ttyACM1", "baud": 115200,
-     "profile": "configs/linux-shell.smolmux-profile.json"},
-    {"role": "swd", "link": "gdb", "gdb_path": "gdb-multiarch", "target": "localhost:3333",
-     "profile": "configs/samc21.gdb-profile.json"}
+    {"role": "console", "link": "uart", "device": "/dev/serial/by-id/usb-REPLACE-ME", "baud": 115200,
+     "profile": "linux-shell"},
+    {"role": "swd", "link": "gdb", "gdb_path": "gdb-multiarch", "target": "localhost:3333"}
   ]
 }
 ```
 
 ```bash
 smolmux-cli board list                           # manifests in ~/.config/smolmux + which are up
-smolmux-cli board up configs/samc21.board.json   # start all wires (detached daemons)
-smolmux-cli board status samc21-bench            # what's up
-smolmux-cli board down samc21-bench              # stop all wires
+smolmux-cli board up configs/newboard.board.json # start all wires (detached daemons)
+smolmux-cli board status newboard                # what's up
+smolmux-cli board down newboard                  # stop all wires
 ```
 
 Keep your manifests in `~/.config/smolmux/*.board.json` (or point `board list`
@@ -108,14 +111,15 @@ bench up for days. It is idempotent (re-running skips wires already up). Use
 exits (Ctrl-C stops them all). Per-wire logs go to
 `$XDG_RUNTIME_DIR|/tmp/smolmux-<board>-<role>.log`. `board down` finds the wires
 by their `--board` label via live discovery and their pid via `SO_PEERCRED` - no
-pidfile, nothing to go stale. See `configs/samc21.board.json` for a sample.
+pidfile, nothing to go stale. See `configs/newboard.board.json` for a sample.
+Named MCU manifests ship in the Pro zip `profiles/` directory.
 
 ## Step 2 - Identify the silicon over SWD
 
 Point the GDB MCP server at the SWD broker:
 
 ```bash
-smolmux-gdb-mcp -s /tmp/smolmux-<board>-gdb.sock -p configs/<board>.gdb-profile.json
+smolmux-gdb-mcp -s /tmp/smolmux-<board>-gdb.sock
 ```
 
 Then, via the `gdb_*` tools:
@@ -160,7 +164,7 @@ Then, via the `gdb_*` tools:
 Point the serial MCP server at the console broker:
 
 ```bash
-smolmux-mcp -s /tmp/smolmux-<board>-console.sock -p configs/<board>.smolmux-profile.json
+smolmux-mcp -s /tmp/smolmux-<board>-console.sock -p configs/linux-shell.smolmux-profile.json
 ```
 
 - **Boot log** - reset the board, then `serial_output_history` for the full boot

@@ -8,6 +8,7 @@
  * argv[1] = path to smolmux-gdb-mcp, argv[2] = path to fake_gdb.
  */
 #include "test_main.h"
+#include "gdb_mcp_tool_names.h"
 #include "broker.h"
 #include "links/gdb.h"
 #include "protocol.h"
@@ -17,6 +18,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <string.h>
 #include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -184,20 +186,35 @@ static void test_gdb_mcp_e2e(void)
         cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"), "tools");
         /* Base GDB tools + gdb_interrupt (HW dogfooding) +
          * gdb_identify_target + gdb_generate_profile (unknown-board probing). */
-        ASSERT_INT_EQ(cJSON_GetArraySize(tools), 21);
-        int found_fault = 0, found_interrupt = 0, found_identify = 0, found_gen = 0;
+        ASSERT_INT_EQ(cJSON_GetArraySize(tools), SM_GDB_MCP_TOOL_NAME_COUNT);
+        int listed[SM_GDB_MCP_TOOL_NAME_COUNT];
+        memset(listed, 0, sizeof(listed));
         cJSON *t;
         cJSON_ArrayForEach(t, tools) {
             const char *nm = sm_json_get_string(t, "name");
-            if (strcmp(nm, "gdb_read_fault_registers") == 0) found_fault = 1;
-            if (strcmp(nm, "gdb_interrupt") == 0) found_interrupt = 1;
-            if (strcmp(nm, "gdb_identify_target") == 0) found_identify = 1;
-            if (strcmp(nm, "gdb_generate_profile") == 0) found_gen = 1;
+            int hit = 0;
+            for (int i = 0; i < SM_GDB_MCP_TOOL_NAME_COUNT; i++) {
+                if (nm && strcmp(nm, sm_gdb_mcp_tool_names[i]) == 0) {
+                    listed[i] = 1;
+                    hit = 1;
+                    break;
+                }
+            }
+            ASSERT(hit, "listed tool is in sm_gdb_mcp_tool_names");
         }
-        ASSERT(found_fault, "gdb_read_fault_registers advertised");
-        ASSERT(found_interrupt, "gdb_interrupt advertised");
-        ASSERT(found_identify, "gdb_identify_target advertised");
-        ASSERT(found_gen, "gdb_generate_profile advertised");
+        for (int i = 0; i < SM_GDB_MCP_TOOL_NAME_COUNT; i++)
+            ASSERT(listed[i], "table name appears in tools/list");
+        cJSON_Delete(resp);
+    }
+
+    resp = rpc_call(&fx, 21,
+        "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"gdb_not_a_tool\",\"arguments\":{}}}", 500);
+    ASSERT_NOT_NULL(resp);
+    if (resp) {
+        const char *text = tool_text(resp);
+        ASSERT(text && strstr(text, "unknown tool") != NULL,
+               "dispatch rejects names not in gdb_tool_names");
         cJSON_Delete(resp);
     }
 
@@ -647,6 +664,27 @@ static void test_gdb_breakpoint_long_condition(void)
     teardown(&fx);
 }
 
+static void test_option_after_socket_errors(void)
+{
+    pid_t pid = fork();
+    ASSERT(pid >= 0, "fork");
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            close(nullfd);
+        }
+        execl(g_gdbmcp_bin, g_gdbmcp_bin, "/tmp/smolmux-does-not.sock",
+              "-n", "x", (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    ASSERT(WIFEXITED(st) && WEXITSTATUS(st) == 1,
+           "option after socket exits 1 (POSIX getopt)");
+}
+
 int main(int argc, char *argv[])
 {
     printf("test_gdb_mcp\n");
@@ -660,6 +698,7 @@ int main(int argc, char *argv[])
     g_gdbmcp_bin = argv[1];
     g_fake_gdb = argv[2];
 
+    RUN_TEST(test_option_after_socket_errors);
     RUN_TEST(test_gdb_mcp_e2e);
     RUN_TEST(test_gdb_breakpoint_long_condition);
     TEST_REPORT();

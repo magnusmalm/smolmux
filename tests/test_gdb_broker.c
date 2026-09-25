@@ -19,6 +19,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -27,6 +30,7 @@
 #define STARTUP_DELAY 150000  /* 150ms */
 
 static char g_fake_gdb[512];
+static char g_fake_gdb_quiet[512];
 
 /* --- Helpers (pattern from test_broker.c) --- */
 
@@ -44,6 +48,21 @@ static void write_fake_gdb_script(void)
           "exec cat\n", fp);
     fclose(fp);
     chmod(g_fake_gdb, 0755);
+}
+
+static void write_fake_gdb_quiet_script(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    snprintf(g_fake_gdb_quiet, sizeof(g_fake_gdb_quiet),
+             "%s/smolmux-test-fake-gdb-quiet.sh",
+             tmp && tmp[0] ? tmp : "/tmp");
+
+    FILE *fp = fopen(g_fake_gdb_quiet, "w");
+    ASSERT_NOT_NULL(fp);
+    if (!fp) return;
+    fputs("#!/bin/sh\nexec cat >/dev/null\n", fp);
+    fclose(fp);
+    chmod(g_fake_gdb_quiet, 0755);
 }
 
 static void *broker_thread(void *arg)
@@ -189,16 +208,22 @@ typedef struct test_ctx {
     pthread_t tid;
 } test_ctx_t;
 
-static void setup(test_ctx_t *ctx, const char *target_spec, int silence_normal)
+static void setup_gdb(test_ctx_t *ctx, const char *gdb_bin,
+                     const char *target_spec, int silence_normal)
 {
     memset(&ctx->broker, 0, sizeof(ctx->broker));
-    ctx->link = sm_gdb_new(g_fake_gdb, target_spec);
+    ctx->link = sm_gdb_new(gdb_bin, target_spec);
     ctx->link->silence_normal = silence_normal;
     sm_broker_init(&ctx->broker, ctx->link, TEST_SOCK);
     snprintf(ctx->broker.port, sizeof(ctx->broker.port), "fake-gdb");
 
     pthread_create(&ctx->tid, NULL, broker_thread, &ctx->broker);
     usleep(STARTUP_DELAY);
+}
+
+static void setup(test_ctx_t *ctx, const char *target_spec, int silence_normal)
+{
+    setup_gdb(ctx, g_fake_gdb, target_spec, silence_normal);
 }
 
 static void teardown(test_ctx_t *ctx)
@@ -294,17 +319,12 @@ static void test_send_and_break_roundtrip(void)
     teardown(&ctx);
 }
 
-/* The silence_normal broker guard (01e8e12): a quiet GDB link must NOT
- * degrade link health, while the same idle link without the flag must.
- * Health timing is shrunk via the test hooks so both cases run in ~1s. */
-static void test_silence_normal_suppresses_idle_health(void)
+static void test_idle_link_does_not_broadcast_degraded(void)
 {
     sm_broker_test_health_period_s = 0.05;
     sm_broker_test_idle_degraded_s = 0.2;
     sm_broker_test_idle_recovered_s = 0.1;
 
-    /* GDB link (silence_normal=1): banner arrives, then silence well past
-     * the degraded threshold — no link_health message may show up. */
     test_ctx_t ctx;
     setup(&ctx, NULL, 1);
 
@@ -313,7 +333,6 @@ static void test_silence_normal_suppresses_idle_health(void)
     ASSERT(fd >= 0, "controller connected");
     if (fd >= 0) {
         int saw_health = 0;
-        /* ~800ms = 4x the degraded threshold */
         for (int i = 0; i < 80; i++) {
             char *l = lr_next(&lr, 1);
             if (l && strstr(l, "\"link_health\""))
@@ -324,20 +343,37 @@ static void test_silence_normal_suppresses_idle_health(void)
     }
     teardown(&ctx);
 
-    /* Control: identical setup with silence_normal cleared must broadcast
-     * degraded — proves the guard (not slow timing) kept the case above
-     * quiet. */
     setup(&ctx, NULL, 0);
     fd = hello(&lr);
-    ASSERT(fd >= 0, "controller connected (control)");
+    ASSERT(fd >= 0, "controller connected (after RX)");
     if (fd >= 0) {
         int saw_health = 0;
-        for (int i = 0; i < 100 && !saw_health; i++) {
+        for (int i = 0; i < 80; i++) {
             char *l = lr_next(&lr, 1);
-            if (l && strstr(l, "\"link_health\"") && strstr(l, "degraded"))
+            if (l && strstr(l, "\"link_health\""))
                 saw_health = 1;
         }
-        ASSERT(saw_health, "link without silence_normal degrades when idle");
+        ASSERT(!saw_health, "after RX, idle does not degrade");
+        close(fd);
+    }
+    teardown(&ctx);
+
+    setup_gdb(&ctx, g_fake_gdb_quiet, NULL, 0);
+    fd = -1;
+    for (int i = 0; i < 40 && fd < 0; i++) {
+        fd = hello(&lr);
+        if (fd < 0)
+            usleep(25000);
+    }
+    ASSERT(fd >= 0, "controller connected (never-RX)");
+    if (fd >= 0) {
+        int saw_health = 0;
+        for (int i = 0; i < 80; i++) {
+            char *l = lr_next(&lr, 1);
+            if (l && strstr(l, "\"link_health\""))
+                saw_health = 1;
+        }
+        ASSERT(!saw_health, "never-RX idle does not degrade");
         close(fd);
     }
     teardown(&ctx);
@@ -354,11 +390,13 @@ int main(void)
     unlink(TEST_SOCK);
 
     write_fake_gdb_script();
+    write_fake_gdb_quiet_script();
 
     RUN_TEST(test_spawn_sends_miasync_before_target);
     RUN_TEST(test_send_and_break_roundtrip);
-    RUN_TEST(test_silence_normal_suppresses_idle_health);
+    RUN_TEST(test_idle_link_does_not_broadcast_degraded);
 
     unlink(g_fake_gdb);
+    unlink(g_fake_gdb_quiet);
     TEST_REPORT();
 }

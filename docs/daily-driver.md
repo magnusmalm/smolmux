@@ -3,6 +3,24 @@
 Recommended build and runtime configuration for daily embedded work (U-Boot
 bring-up, Zephyr, Linux, YMODEM, MCP clients).
 
+## If you installed the Pro zip
+
+The host installer puts the six tools in `~/.local/bin`. Use those names on
+`PATH`. Do not `sudo install` into `/usr/local/bin`. The `./build/smolmux`
+commands below are for a source checkout, not the zip.
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+smolmux --list-ports
+smolmux "$PORT" -b 115200 -p esp-idf-uart
+smolmux-cli brokers          # leftover .sock files still list here
+smolmux-cli status           # one live broker is enough
+smolmux-cli status --json    # same as: smolmux-cli --json status
+```
+
+`--list-profiles` lists `~/.config/smolmux/` and, if you `cd` into an unpacked
+zip, `./profiles/`. It does not scan `./configs/`.
+
 ## Recommended Build (UART + MCP + Watcher only)
 
 ```bash
@@ -222,7 +240,7 @@ is a standing broker rule that keeps answering.
 ```bash
 ./build/smolmux --gdb \
   --gdb-target localhost:3333 \
-  -p configs/nrf9151-zephyr.smolmux-profile.json
+  -p configs/gdb.smolmux-profile.json
 ```
 
 Optional: `--gdb-path /path/to/gdb` if not on `PATH`.
@@ -283,8 +301,12 @@ serial `smolmux-mcp`:
 
 ```bash
 ./build/smolmux-gdb-mcp -s /tmp/smolmux-gdb.sock \
-  -p configs/nrf9151.gdb-profile.json
+  -p ~/.config/smolmux/<board>.gdb-profile.json
 ```
+
+Write that file with `gdb_generate_profile`, or copy a named MCU profile from
+the Pro zip `profiles/` directory. A public clone does not ship those JSON files
+under `configs/`.
 
 It exposes 21 tools - `gdb_breakpoint`,
 `gdb_continue`, `gdb_interrupt`, `gdb_step`, `gdb_backtrace`,
@@ -307,8 +329,8 @@ client-side (the link's guard also blocks them).
 - On a Cortex-M0+ there are no configurable fault registers (CFSR/HFSR are
   M3/M4/M7). Use a profile with `"fault_registers": []` - `gdb_read_fault_registers`
   then reports "No fault_registers in target profile" instead of reading
-  reserved addresses. The bundled `configs/nrf9151.gdb-profile.json` is for the
-  M33-class nRF9151, where they apply.
+  reserved addresses. The Pro zip file `profiles/nrf9151.gdb-profile.json` is
+  an M33-class example where those registers apply.
 - `gdb_step {mode:"next"}` over a line that loops/calls (e.g. a UART-print
   busy-loop) can take a long time on a slow SWD link because gdb effectively
   single-steps it - `gdb_wait_stop` may time out with the target still running.
@@ -353,29 +375,31 @@ smolmux-monitor -L           # human listing (no-arg monitor also lists when >1 
 The `smolmux-cli` variants take `--json` for agents.
 
 **Group a board's wires** by tagging each broker at start with `--board`/`--role`.
-Use the **same board name** as in the manifest (`samc21-bench`, not a short
+Use the **same board name** as in the manifest (`newboard`, not a short
 alias that will not match `board down`):
 
 ```bash
-smolmux /dev/ttyACM1 --board samc21-bench --role console \
-  -s /tmp/smolmux-samc21-bench-console.sock
-smolmux --gdb --gdb-target localhost:3333 --board samc21-bench --role swd \
-  -s /tmp/smolmux-samc21-bench-gdb.sock
+smolmux /dev/ttyACM1 --board newboard --role console \
+  -s /tmp/smolmux-newboard-console.sock
+smolmux --gdb --gdb-target localhost:3333 --board newboard --role swd \
+  -s /tmp/smolmux-newboard-gdb.sock
 ```
 
 **One USB cable, two services** (FT2232 UART + OpenOCD on the other
-interface): still two brokers — see [dual-service-usb-cable.md](dual-service-usb-cable.md)
-and `configs/ft2232-dual.board.json`. Pin each MCP with an explicit `-s`.
+interface) is still two brokers. See
+[dual-service-usb-cable.md](dual-service-usb-cable.md).
+Named two-wire manifests ship in the Pro zip `profiles/` directory. Pin each
+MCP with an explicit `-s`.
 
 **Or bring up the whole board with one command** from a `*.board.json` manifest
-(the machine-readable wiring table - see `configs/samc21.board.json` and the
+(the machine-readable wiring table. See `configs/newboard.board.json` and the
 format in `docs/board-exploration-workflow.md`):
 
 ```bash
 smolmux-cli board list                           # manifests in ~/.config/smolmux + which are up
-smolmux-cli board up   configs/samc21.board.json # start all wires (detached daemons)
-smolmux-cli board status samc21-bench            # what's up
-smolmux-cli board down   samc21-bench            # stop all wires (SIGTERM)
+smolmux-cli board up   configs/newboard.board.json # start all wires (detached daemons)
+smolmux-cli board status newboard                  # what's up
+smolmux-cli board down   newboard                # stop all wires (SIGTERM)
 ```
 
 `board up` is **detached by default** - each wire is an independent daemon that
@@ -480,7 +504,7 @@ a shell prompt - do not treat it as a critical disconnect by default.
 ### Checklist: agent attach to a Linux factory console
 
 1. Identify wires (`smolmux --list-ports`, by-id). Prefer **`[STRONG]`** by-id
-   (USB serial present). Treat **`[WEAK]`** class-only by-id as a seat risk —
+   (USB serial present). Treat **`[WEAK]`** class-only by-id as a seat risk, 
    see `docs/persistent-serial-devices.md`.
    For late USB/gadget attach: `smolmux … --wait-device 120` (or
    `SMOLMUX_WAIT_DEVICE_S`). Note which path shows login vs U-Boot.
@@ -512,7 +536,8 @@ device path as a *hint* to find the matching socket).
 smolmux /dev/ttyUSB0 -b 115200 -p configs/linux-shell.smolmux-profile.json
 # Auto socket: $XDG_RUNTIME_DIR/smolmux-ttyUSB0.sock (or /tmp/…)
 
-smolmux-cli status                          # discovery when exactly one broker
+smolmux-cli status                          # discovery when exactly one *live* broker
+smolmux-cli status --json                  # --json may follow the subcommand
 smolmux-cli gc --dry-run                    # leftover MCP clients
 smolmux-cli gc --mcp                        # SIGTERM every *-mcp on all brokers
 smolmux-cli -s /run/user/$UID/smolmux-ttyUSB0.sock status
@@ -589,13 +614,18 @@ Useful serial tools include `serial_send_command`, `serial_read`,
 
 ## Device Profiles Strategy
 
-Keep one high-quality profile per major target family:
+Keep one high-quality profile per major target family.
+
+Public clone (generic Linux):
 
 - `uboot.smolmux-profile.json` (critical for `bootdelay=0` work)
 - `linux-shell.smolmux-profile.json`
-- `nrf9151-zephyr.smolmux-profile.json` (generic Zephyr/nRF9151-style console)
-- Board manifests: `samc21.board.json`, `newboard.board.json`,
-  `ft2232-dual.board.json` (one-cable dual service example)
+- `gdb.smolmux-profile.json`
+- Board manifest: `newboard.board.json`
+
+Pro zip `profiles/` adds named MCU and FPGA JSON (ESP-IDF UART, nRF9151,
+SAM C21, FT2232 dual, and related files). Copy those from the zip. A public
+clone does not ship them under `configs/`.
 
 Put target-specific prompt patterns, common commands, and anomaly patterns in the profile so your daily command line stays short.
 

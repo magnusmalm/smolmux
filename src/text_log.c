@@ -41,16 +41,24 @@ static void open_file(sm_text_log_t *log, time_t now)
 {
     struct tm tm;
     localtime_r(&now, &tm);
-    log->current_day = tm.tm_yday;
-    log->current_year = tm.tm_year;
 
     char path[512];
     snprintf(path, sizeof(path), "%s/%s-%04d%02d%02d.log",
              log->dir, log->port_name,
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 
+    FILE *nfp = open_append_private(path);
+    if (!nfp) {
+        /* Keep the previous fp so post-reconnect / failed-rotate writes
+         * are not silently dropped (I3). Leave current_day unchanged so
+         * the next write retries rotation. */
+        return;
+    }
     if (log->fp) fclose(log->fp);
-    log->fp = open_append_private(path);
+    snprintf(log->path, sizeof(log->path), "%s", path);
+    log->fp = nfp;
+    log->current_day = tm.tm_yday;
+    log->current_year = tm.tm_year;
 }
 
 sm_text_log_t *sm_text_log_open(const char *dir, const char *port_name)
@@ -108,8 +116,11 @@ void sm_text_log_write(sm_text_log_t *log, const uint8_t *data, size_t len, doub
     if (!log->fp) return;
 
     for (size_t i = 0; i < len; i++) {
-        if (data[i] == '\n') {
-            /* Write timestamp + accumulated line */
+        if (data[i] == '\n' || data[i] == '\r') {
+            /* Bare CR is a line end (U-Boot / many UART consoles). CRLF
+             * is one line: consume the LF that follows CR in this chunk. */
+            if (data[i] == '\r' && i + 1 < len && data[i + 1] == '\n')
+                i++;
             fprintf(log->fp, "[%02d:%02d:%02d] ",
                     tm.tm_hour, tm.tm_min, tm.tm_sec);
             if (log->line_len > 0)
@@ -121,7 +132,7 @@ void sm_text_log_write(sm_text_log_t *log, const uint8_t *data, size_t len, doub
              * 0-byte files on disk while JSONL already had data, until exit.
              * fflush so still-running brokers show live .log content. */
             fflush(log->fp);
-        } else if (data[i] != '\r') {
+        } else {
             if (log->line_len < sizeof(log->line_buf) - 1)
                 log->line_buf[log->line_len++] = (char)data[i];
         }

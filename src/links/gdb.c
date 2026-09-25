@@ -42,9 +42,9 @@ typedef struct gdb_data {
 /* "eval" is here because it formats its argument and runs the result as a
  * command, so eval "shel%s", "l id" reaches a shell without the word "shell"
  * ever appearing contiguously — a demonstrated bypass of everything below it.
- * Like the others it is also matched as a substring inside -interpreter-exec,
- * which can false-positive on an unrelated console command containing "eval";
- * --gdb-allow-shell is the escape hatch when that bites. */
+ * Matching is prefix-of-word (word_is_code_exec), not substring-anywhere, on
+ * both the first word and -interpreter-exec arguments. That false-positives
+ * on "evaluation"; --gdb-allow-shell is the escape hatch. */
 static const char *const gdb_code_exec_cmds[] = {
     "shell", "pipe", "python", "guile", "make", "eval",
 };
@@ -65,7 +65,7 @@ static int word_is_code_exec(const uint8_t *word, size_t wlen)
     return 0;
 }
 
-static int line_invokes_shell(const uint8_t *line, size_t len)
+int sm_gdb_line_invokes_shell(const uint8_t *line, size_t len)
 {
     size_t j = 0;
     while (j < len && line[j] >= '0' && line[j] <= '9') j++;  /* MI token */
@@ -82,18 +82,28 @@ static int line_invokes_shell(const uint8_t *line, size_t len)
     if (word_is_code_exec(line + j, wend - j))
         return 1;
 
-    /* -interpreter-exec <interp> "<cmd>" smuggles a console command; scan the
-     * argument for any code-exec verb or shell metacharacter. */
+    /* -interpreter-exec <interp> "<cmd>" smuggles a console command; scan
+     * words with the same word_is_code_exec rule as the first-word path
+     * (guard-rail, not a jail). k must always advance: wend stops on \n
+     * but the skip path did not, which livelocked the broker thread. */
     if (line[j] == '-' && len - j >= 17 &&
         memcmp(line + j, "-interpreter-exec", 17) == 0) {
-        for (size_t k = j + 17; k < len; k++) {
+        size_t k = j + 17;
+        while (k < len) {
             if (line[k] == '!' || line[k] == '|') return 1;
-            for (size_t d = 0;
-                 d < sizeof(gdb_code_exec_cmds) / sizeof(gdb_code_exec_cmds[0]); d++) {
-                size_t n = strlen(gdb_code_exec_cmds[d]);
-                if (k + n <= len && memcmp(line + k, gdb_code_exec_cmds[d], n) == 0)
-                    return 1;
+            if (line[k] == ' ' || line[k] == '\t' || line[k] == '"' ||
+                line[k] == '\n' || line[k] == '\r') {
+                k++;
+                continue;
             }
+            size_t wend = k;
+            while (wend < len && line[wend] != ' ' && line[wend] != '\t' &&
+                   line[wend] != '"' && line[wend] != '\n' &&
+                   line[wend] != '\r')
+                wend++;
+            if (word_is_code_exec(line + k, wend - k))
+                return 1;
+            k = (wend > k) ? wend : k + 1;
         }
     }
     return 0;
@@ -105,7 +115,7 @@ static int contains_shell_command(const uint8_t *data, size_t len)
     while (i < len) {
         size_t eol = i;
         while (eol < len && data[eol] != '\n') eol++;
-        if (line_invokes_shell(data + i, eol - i)) return 1;
+        if (sm_gdb_line_invokes_shell(data + i, eol - i)) return 1;
         i = eol + 1;
     }
     return 0;
@@ -116,9 +126,27 @@ static int gdb_write_str(sm_link_t *self, const char *s)
     return self->write_data(self, (const uint8_t *)s, strlen(s));
 }
 
-static int gdb_open(sm_link_t *self)
+/* Reap a leftover GDB child without blocking the broker thread.
+ * A process-wide SIGCHLD handler would steal waitpid from tests and
+ * --exec children, so we WNOHANG here and on the next open/close. */
+static void gdb_reap(gdb_data_t *gd)
+{
+    if (!gd || gd->pid <= 0)
+        return;
+    int status;
+    pid_t r = waitpid(gd->pid, &status, WNOHANG);
+    if (r > 0 || (r < 0 && errno == ECHILD))
+        gd->pid = -1;
+}
+
+static void gdb_bootstrap_mi(sm_link_t *self, int wait_ms);
+
+static int gdb_spawn(sm_link_t *self)
 {
     gdb_data_t *gd = self->data;
+
+    gdb_reap(gd);
+    sm_link_wq_clear(&gd->wq);
 
     /* Validate target_spec before forking — failing after the fork would
      * leak the child process and pipe fds (M14) */
@@ -188,23 +216,34 @@ static int gdb_open(sm_link_t *self)
         fcntl(gd->stdin_fd, F_SETFL, flags | O_NONBLOCK);
 
     SM_LOG_INFO(LOG_TAG, "started %s (pid %d)", gd->gdb_path, (int)pid);
+    return 0;
+}
 
-    /* Stagger MI bootstrap without consuming GDB stdout (broker history and
-     * tests must still see the banner). Fire-and-forget of both mi-async and
-     * CLI "target remote" raced on real OpenOCD; short delays + MI
-     * extended-remote are enough in practice and keep open() < ~300ms.
-     * mi-async must be set BEFORE attach. */
-    {
+static int gdb_open(sm_link_t *self)
+{
+    if (gdb_spawn(self) != 0)
+        return -1;
+    /* broker_setup only: short poll so mi-async precedes attach. */
+    gdb_bootstrap_mi(self, 150);
+    return 0;
+}
+
+/* Startup open() may wait briefly so mi-async lands before attach.
+ * Resume/reconnect (connect_begin) must not poll on the broker thread. */
+static void gdb_bootstrap_mi(sm_link_t *self, int wait_ms)
+{
+    gdb_data_t *gd = self->data;
+    if (gd->stdin_fd < 0)
+        return;
+    if (wait_ms > 0) {
         struct pollfd pfd = { .fd = gd->stdout_fd, .events = POLLIN };
-        (void)poll(&pfd, 1, 150); /* wait up to 150ms for GDB to start */
+        (void)poll(&pfd, 1, wait_ms);
     }
-
     gdb_write_str(self, "-gdb-set mi-async on\n");
-    {
+    if (wait_ms > 0) {
         struct pollfd pfd = { .fd = gd->stdout_fd, .events = POLLIN };
-        (void)poll(&pfd, 1, 80); /* let mi-async complete before attach */
+        (void)poll(&pfd, 1, 80);
     }
-
     if (gd->target_spec[0]) {
         char cmd[512];
         snprintf(cmd, sizeof(cmd),
@@ -213,15 +252,20 @@ static int gdb_open(sm_link_t *self)
         SM_LOG_INFO(LOG_TAG, "queued: -target-select extended-remote %s",
                     gd->target_spec);
     }
+}
 
+/* Resume/reconnect: spawn GDB without polling the broker thread. */
+static int gdb_connect_begin(sm_link_t *self)
+{
+    if (gdb_spawn(self) != 0)
+        return -1;
+    gdb_bootstrap_mi(self, 0);
     return 0;
 }
 
 static void gdb_close(sm_link_t *self)
 {
     gdb_data_t *gd = self->data;
-
-    sm_link_wq_clear(&gd->wq);
 
     if (gd->stdin_fd >= 0) {
         gdb_write_str(self, "-gdb-exit\n");
@@ -230,27 +274,20 @@ static void gdb_close(sm_link_t *self)
     }
 
     if (gd->pid > 0) {
-        /* Wait up to 2 seconds for GDB to exit */
-        int status;
-        int waited = 0;
-
-        while (waited < 20) {
-            pid_t ret = waitpid(gd->pid, &status, WNOHANG);
-            if (ret > 0 || (ret < 0 && errno == ECHILD))
-                break;
-            struct timespec ts = {0, 100000000L};  /* 100ms */
-            nanosleep(&ts, NULL);
-            waited++;
+        /* Never nanosleep on the broker thread (ACT-012). SIGTERM then
+         * SIGKILL, each followed by WNOHANG. If still alive, leave pid
+         * for gdb_reap on the next open/close/destroy. */
+        gdb_reap(gd);
+        if (gd->pid > 0) {
+            kill(gd->pid, SIGTERM);
+            gdb_reap(gd);
         }
-
-        if (waited >= 20) {
+        if (gd->pid > 0) {
             SM_LOG_WARN(LOG_TAG, "GDB pid %d not exiting, sending SIGKILL",
                         (int)gd->pid);
             kill(gd->pid, SIGKILL);
-            waitpid(gd->pid, &status, 0);
+            gdb_reap(gd);
         }
-
-        gd->pid = -1;
     }
 
     if (gd->stdout_fd >= 0) {
@@ -258,6 +295,7 @@ static void gdb_close(sm_link_t *self)
         gd->stdout_fd = -1;
     }
 
+    sm_link_wq_clear(&gd->wq);
     SM_LOG_INFO(LOG_TAG, "closed");
 }
 
@@ -362,6 +400,11 @@ static void gdb_destroy(sm_link_t *self)
     gdb_data_t *gd = self->data;
     if (gd->stdin_fd >= 0 || gd->stdout_fd >= 0)
         gdb_close(self);
+    gdb_reap(gd);
+    if (gd->pid > 0) {
+        kill(gd->pid, SIGKILL);
+        gdb_reap(gd);
+    }
     free(gd);
     free(self);
 }
@@ -382,6 +425,7 @@ sm_link_t *sm_gdb_new(const char *gdb_path, const char *target_spec)
 
     link->name = "gdb";
     link->open = gdb_open;
+    link->connect_begin = gdb_connect_begin;
     link->close = gdb_close;
     link->read_fd = gdb_read_fd;
     link->write_fd = gdb_write_fd_vt;

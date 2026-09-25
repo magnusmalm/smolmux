@@ -2,6 +2,8 @@
 #include "broker.h"
 #include "client.h"
 #include "links/uart.h"
+#include "links/serial_tcp.h"
+#include "sm_features.h"
 #include "protocol.h"
 #include "broker_info.h"
 #include "util/base64.h"
@@ -10,6 +12,8 @@
 #include "util/sock_util.h"
 #include "constants.h"
 
+#include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <pty.h>
@@ -20,6 +24,10 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <glob.h>
+#include <time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define TEST_SOCK "/tmp/smolmux-test.sock"
 #define STARTUP_DELAY 150000  /* 150ms */
@@ -1077,6 +1085,17 @@ static void test_suspend_resume(void)
     sm_msg_t err = recv_json(fd);
     ASSERT_NOT_NULL(err.root);
     ASSERT_INT_EQ(err.type, SM_MSG_ERROR);
+    ASSERT_STR_EQ(sm_json_get_string(err.root, "message"),
+                  "serial port is suspended");
+    sm_msg_free(&err);
+
+    send_json(fd, sm_msg_send_expect("e-susp", (const uint8_t *)"data", 4,
+                                     "never", 1000));
+    err = recv_json(fd);
+    ASSERT_NOT_NULL(err.root);
+    ASSERT_INT_EQ(err.type, SM_MSG_ERROR);
+    ASSERT_STR_EQ(sm_json_get_string(err.root, "message"),
+                  "serial port is suspended");
     sm_msg_free(&err);
 
     /* Resume */
@@ -1625,6 +1644,548 @@ static void test_history_fence_on_link_down(void)
     teardown(&ctx);
 }
 
+/* ACT-045: UP fence after resume (link_bring_up). */
+static void test_history_fence_on_link_up(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("hist", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    send_json(fd, sm_msg_suspend("su-up"));
+    usleep(80000);
+    for (int i = 0; i < 10; i++) {
+        sm_msg_t m = recv_json(fd);
+        int sus = m.root && m.type == SM_MSG_SUSPENDED;
+        if (m.root) sm_msg_free(&m);
+        if (sus) break;
+    }
+    send_json(fd, sm_msg_resume("re-up"));
+    usleep(150000);
+    for (int i = 0; i < 10; i++) {
+        sm_msg_t m = recv_json(fd);
+        int ok = m.root && m.type == SM_MSG_RESUMED;
+        if (m.root) sm_msg_free(&m);
+        if (ok) break;
+    }
+
+    send_json(fd, sm_msg_history_request("hu1", 0.0, 4096));
+    sm_msg_t resp = recv_json(fd);
+    ASSERT_NOT_NULL(resp.root);
+    ASSERT_INT_EQ(resp.type, SM_MSG_HISTORY_RESPONSE);
+    cJSON *chunks = cJSON_GetObjectItem(resp.root, "chunks");
+    int saw_up = 0;
+    cJSON *ch;
+    cJSON_ArrayForEach(ch, chunks) {
+        const char *b64 = sm_json_get_string(ch, "data");
+        if (!b64) continue;
+        size_t n = 0;
+        uint8_t *raw = sm_base64_decode(b64, strlen(b64), &n);
+        if (!raw) continue;
+        if (memmem(raw, n, "link up", 7))
+            saw_up = 1;
+        free(raw);
+    }
+    sm_msg_free(&resp);
+    ASSERT(saw_up, "history JSON contains link-up fence");
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* Linux discards unread slave bytes when the PTY master is closed, so
+ * that is not a faithful IN|HUP leftover. A TCP peer close delivers
+ * POLLIN|POLLHUP with the payload still readable — same shape as USB
+ * hangup with a kernel buffer. */
+#if SM_ENABLE_LINK_SERIAL_TCP
+static int loopback_listen(int *port_out)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd); return -1;
+    }
+    if (listen(fd, 1) < 0) { close(fd); return -1; }
+    socklen_t alen = sizeof(addr);
+    getsockname(fd, (struct sockaddr *)&addr, &alen);
+    *port_out = ntohs(addr.sin_port);
+    return fd;
+}
+#endif
+
+/* ACT-011: unread bytes + HUP together land in history with the down fence. */
+static void test_unread_bytes_survive_hup_together(void)
+{
+#if !SM_ENABLE_LINK_SERIAL_TCP
+    ASSERT(1, "serial-tcp disabled; leftover+HUP covered by drain tests");
+    return;
+#else
+    int port = 0;
+    int lfd = loopback_listen(&port);
+    ASSERT(lfd >= 0, "loopback listener");
+
+    const char *td = getenv("TMPDIR");
+    char hsock_buf[256];
+    snprintf(hsock_buf, sizeof(hsock_buf), "%s/smolmux-test-hup.sock",
+             (td && td[0]) ? td : "/tmp");
+    const char *hsock = hsock_buf;
+    unlink(hsock);
+    sm_link_t *link = sm_serial_tcp_new("127.0.0.1", port);
+    ASSERT_NOT_NULL(link);
+    sm_broker_t broker;
+    sm_broker_init(&broker, link, hsock);
+    snprintf(broker.port, sizeof(broker.port), "127.0.0.1:%d", port);
+    broker.reconnect = 0;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, broker_thread, &broker);
+
+    int sfd = accept(lfd, NULL, NULL);
+    ASSERT(sfd >= 0, "accepted broker connect");
+    usleep(STARTUP_DELAY);
+
+    int fd = connect_unix(hsock);
+    send_json(fd, sm_msg_hello("hup", "observer"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    const char *mark = "LEFTOVER_HUP_XYZ\n";
+    write(sfd, mark, strlen(mark));
+    close(sfd);   /* data and FIN together -> IN|HUP */
+
+    int got_down = 0;
+    for (int i = 0; i < 40; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) break;
+        int down = (msg.type == SM_MSG_LINK_DOWN);
+        sm_msg_free(&msg);
+        if (down) { got_down = 1; break; }
+    }
+    ASSERT(got_down, "link_down after peer close");
+
+    send_json(fd, sm_msg_history_request("hup1", 0.0, 8192));
+    sm_msg_t resp = recv_json(fd);
+    ASSERT_NOT_NULL(resp.root);
+    ASSERT_INT_EQ(resp.type, SM_MSG_HISTORY_RESPONSE);
+    cJSON *chunks = cJSON_GetObjectItem(resp.root, "chunks");
+    ASSERT(cJSON_IsArray(chunks), "chunks array");
+    int saw_mark = 0, saw_fence = 0;
+    cJSON *ch;
+    cJSON_ArrayForEach(ch, chunks) {
+        const char *b64 = sm_json_get_string(ch, "data");
+        if (!b64) continue;
+        size_t n = 0;
+        uint8_t *raw = sm_base64_decode(b64, strlen(b64), &n);
+        if (!raw) continue;
+        if (memmem(raw, n, "LEFTOVER_HUP_XYZ", 16))
+            saw_mark = 1;
+        if (memmem(raw, n, "link down", 9))
+            saw_fence = 1;
+        free(raw);
+    }
+    sm_msg_free(&resp);
+    ASSERT(saw_mark, "history JSON contains leftover hangup bytes");
+    ASSERT(saw_fence, "history JSON contains link-down fence");
+
+    close(fd);
+    sm_broker_stop(&broker);
+    pthread_join(tid, NULL);
+    sm_broker_destroy(&broker);
+    close(lfd);
+    unlink(hsock);
+#endif
+}
+
+/* ACT-064: burst listen_expect is rate-limited. */
+static void test_listen_expect_rate_limit(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("obs", "observer"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    /* Success is silent; only the rate-limit reject produces a message. */
+    for (int i = 0; i < SM_LISTEN_EXPECT_RATE + 1; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "rl%d", i);
+        send_json(fd, sm_msg_listen_expect(id, "NEVER_RL", 500));
+    }
+    int saw_limit = 0;
+    for (int i = 0; i < 20; i++) {
+        sm_msg_t msg = recv_json(fd);
+        if (!msg.root) break;
+        if (msg.type == SM_MSG_ERROR) {
+            const char *m = sm_json_get_string(msg.root, "message");
+            if (m && strstr(m, "rate limit"))
+                saw_limit = 1;
+        }
+        sm_msg_free(&msg);
+        if (saw_limit) break;
+    }
+    ASSERT(saw_limit, "9th listen_expect in 1s is rate-limited");
+    /* Must-fail if the error string fired but the 9th pattern still
+     * registered (count would be RATE+1). */
+    ASSERT(ctx.broker.expect.count <= (size_t)SM_LISTEN_EXPECT_RATE,
+           "rate-limited listen_expect is not registered");
+    ASSERT_INT_EQ((int)ctx.broker.expect.count, SM_LISTEN_EXPECT_RATE);
+
+    close(fd);
+    teardown(&ctx);
+}
+
+/* ACT-022 / I3: after suspend/resume reopen, -t file size must grow.
+ * Must-fail if still 0 extra bytes. Bare CR is a line end. */
+static void test_text_log_grows_after_reconnect(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char tdir[256];
+    snprintf(tdir, sizeof(tdir), "%s/smolmux-i3-%d",
+             tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
+    mkdir(tdir, 0700);
+
+    test_ctx_t ctx;
+    openpty(&ctx.master, &ctx.slave, NULL, NULL, NULL);
+    char *slave_name = ttyname(ctx.slave);
+    ctx.link = sm_uart_new(slave_name, 115200, 0);
+    sm_broker_init(&ctx.broker, ctx.link, TEST_SOCK);
+    snprintf(ctx.broker.port, sizeof(ctx.broker.port), "%s", slave_name);
+    ctx.broker.baudrate = 115200;
+    snprintf(ctx.broker.text_log_dir, sizeof(ctx.broker.text_log_dir),
+             "%s", tdir);
+    pthread_create(&ctx.tid, NULL, broker_thread, &ctx.broker);
+    usleep(STARTUP_DELAY);
+
+    write(ctx.master, "pre-reopen\n", 11);
+    usleep(200000);
+
+    glob_t g;
+    char pat[300];
+    snprintf(pat, sizeof(pat), "%s/*.log", tdir);
+    memset(&g, 0, sizeof(g));
+    ASSERT_INT_EQ(glob(pat, 0, NULL, &g), 0);
+    ASSERT(g.gl_pathc >= 1, "text log created");
+    struct stat st1;
+    ASSERT_INT_EQ(stat(g.gl_pathv[0], &st1), 0);
+    ASSERT(st1.st_size > 0, "text log non-empty before reconnect");
+    off_t size1 = st1.st_size;
+    char logpath[300];
+    snprintf(logpath, sizeof(logpath), "%s", g.gl_pathv[0]);
+    globfree(&g);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("ctl", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    send_json(fd, sm_msg_suspend("i3s"));
+    usleep(100000);
+    for (int i = 0; i < 10; i++) {
+        sm_msg_t m = recv_json(fd);
+        int sus = m.root && m.type == SM_MSG_SUSPENDED;
+        if (m.root) sm_msg_free(&m);
+        if (sus) break;
+    }
+
+    send_json(fd, sm_msg_resume("i3r"));
+    usleep(150000);
+    for (int i = 0; i < 10; i++) {
+        sm_msg_t m = recv_json(fd);
+        int ok = m.root && m.type == SM_MSG_RESUMED;
+        if (m.root) sm_msg_free(&m);
+        if (ok) break;
+    }
+
+    write(ctx.master, "post-reopen\n", 12);
+    write(ctx.master, "bare-cr-line\r", 13);
+    usleep(250000);
+
+    struct stat st2;
+    ASSERT_INT_EQ(stat(logpath, &st2), 0);
+    ASSERT(st2.st_size > size1, "text log grew after reopen (I3)");
+
+    FILE *fp = fopen(logpath, "r");
+    ASSERT_NOT_NULL(fp);
+    if (fp) {
+        char body[4096];
+        size_t n = fread(body, 1, sizeof(body) - 1, fp);
+        body[n] = '\0';
+        fclose(fp);
+        ASSERT(strstr(body, "post-reopen") != NULL,
+               "post-reopen payload in text log (not only UP fence)");
+        ASSERT(strstr(body, "bare-cr-line") != NULL,
+               "bare CR line flushed after reopen");
+    }
+
+    close(fd);
+    teardown(&ctx);
+    unlink(logpath);
+    rmdir(tdir);
+}
+
+static void test_no_io_log_and_text_log_path(void)
+{
+    const char *tmp = getenv("TMPDIR");
+    char tdir[256], sock[256];
+    snprintf(tdir, sizeof(tdir), "%s/smolmux-a49-%d",
+             tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
+    mkdir(tdir, 0700);
+    snprintf(sock, sizeof(sock), "%s/b.sock", tdir);
+    unlink(sock);
+
+    test_ctx_t ctx;
+    openpty(&ctx.master, &ctx.slave, NULL, NULL, NULL);
+    char *slave_name = ttyname(ctx.slave);
+    ctx.link = sm_uart_new(slave_name, 115200, 0);
+    sm_broker_init(&ctx.broker, ctx.link, sock);
+    snprintf(ctx.broker.port, sizeof(ctx.broker.port), "%s", slave_name);
+    ctx.broker.baudrate = 115200;
+    snprintf(ctx.broker.log_dir, sizeof(ctx.broker.log_dir), "%s", tdir);
+    snprintf(ctx.broker.text_log_dir, sizeof(ctx.broker.text_log_dir),
+             "%s", tdir);
+    ctx.broker.no_io_log = 1;
+    pthread_create(&ctx.tid, NULL, broker_thread, &ctx.broker);
+    usleep(STARTUP_DELAY);
+    write(ctx.master, "io-log-probe\n", 13);
+    usleep(150000);
+
+    glob_t g;
+    char pat[300];
+    snprintf(pat, sizeof(pat), "%s/*io.jsonl", tdir);
+    memset(&g, 0, sizeof(g));
+    int gr = glob(pat, 0, NULL, &g);
+    ASSERT(gr != 0 && g.gl_pathc == 0, "no io_log JSONL when --no-io-log");
+    if (gr == 0)
+        globfree(&g);
+
+    snprintf(pat, sizeof(pat), "%s/*.log", tdir);
+    memset(&g, 0, sizeof(g));
+    ASSERT_INT_EQ(glob(pat, 0, NULL, &g), 0);
+    ASSERT(g.gl_pathc >= 1, "text log created");
+    char logpath[300];
+    snprintf(logpath, sizeof(logpath), "%s", g.gl_pathv[0]);
+    globfree(&g);
+
+    int fd = connect_unix(sock);
+    send_json(fd, sm_msg_hello("ctl", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+    send_json(fd, sm_msg_status("st"));
+    sm_msg_t st = recv_json(fd);
+    ASSERT_INT_EQ(st.type, SM_MSG_STATUS_RESPONSE);
+    const char *tp = sm_json_get_string(st.root, "text_log_path");
+    ASSERT_NOT_NULL(tp);
+    ASSERT_STR_EQ(tp, logpath);
+    sm_msg_free(&st);
+    close(fd);
+
+    sm_broker_stop(&ctx.broker);
+    pthread_join(ctx.tid, NULL);
+    sm_broker_destroy(&ctx.broker);
+    close(ctx.master);
+    close(ctx.slave);
+    unlink(logpath);
+    unlink(sock);
+    rmdir(tdir);
+}
+
+typedef struct {
+    int fd;
+    int hold;
+} stub_conn_t;
+
+static int stub_open(sm_link_t *self)
+{
+    stub_conn_t *d = self->data;
+    int p[2];
+    if (pipe(p) != 0)
+        return -1;
+    d->fd = p[0];
+    d->hold = p[1]; /* keep writer so the link is not HUP at start */
+    return 0;
+}
+static void stub_close(sm_link_t *self)
+{
+    stub_conn_t *d = self->data;
+    if (d->fd >= 0) {
+        close(d->fd);
+        d->fd = -1;
+    }
+    if (d->hold >= 0) {
+        close(d->hold);
+        d->hold = -1;
+    }
+}
+static int stub_read_fd(sm_link_t *self)
+{
+    return ((stub_conn_t *)self->data)->fd;
+}
+static int stub_write_fd(sm_link_t *self)
+{
+    return ((stub_conn_t *)self->data)->fd;
+}
+static int stub_write_data(sm_link_t *self, const uint8_t *data, size_t len)
+{
+    (void)self; (void)data; (void)len;
+    return 0;
+}
+static int stub_has_wp(sm_link_t *self) { (void)self; return 0; }
+static int stub_flush(sm_link_t *self) { (void)self; return 0; }
+static int stub_break(sm_link_t *self, int ms) { (void)self; (void)ms; return 0; }
+static int stub_set_param(sm_link_t *self, const char *k, const char *v)
+{
+    (void)self; (void)k; (void)v;
+    return -1;
+}
+static int stub_status(sm_link_t *self, cJSON *out)
+{
+    (void)self; (void)out;
+    return 0;
+}
+static void stub_destroy(sm_link_t *self)
+{
+    stub_close(self);
+    free(self->data);
+    free(self);
+}
+static int stub_connect_begin(sm_link_t *self)
+{
+    stub_conn_t *d = self->data;
+    int p[2];
+    if (pipe(p) != 0)
+        return -1;
+    if (d->fd >= 0)
+        close(d->fd);
+    if (d->hold >= 0)
+        close(d->hold);
+    d->fd = p[0];
+    d->hold = p[1]; /* test closes hold to HUP after pending is visible */
+    return 1;
+}
+static int stub_connect_poll(sm_link_t *self)
+{
+    (void)self;
+    return -1;
+}
+
+static sm_link_t *stub_conn_new(void)
+{
+    sm_link_t *l = calloc(1, sizeof(*l));
+    stub_conn_t *d = calloc(1, sizeof(*d));
+    d->fd = -1;
+    d->hold = -1;
+    l->name = "stub-conn";
+    l->open = stub_open;
+    l->close = stub_close;
+    l->read_fd = stub_read_fd;
+    l->write_fd = stub_write_fd;
+    l->write_data = stub_write_data;
+    l->has_write_pending = stub_has_wp;
+    l->flush_write_queue = stub_flush;
+    l->send_break = stub_break;
+    l->set_param = stub_set_param;
+    l->get_status = stub_status;
+    l->destroy = stub_destroy;
+    l->connect_begin = stub_connect_begin;
+    l->connect_poll = stub_connect_poll;
+    l->data = d;
+    return l;
+}
+
+static void test_resume_connect_fail_sends_error(void)
+{
+    const char *td = getenv("TMPDIR");
+    char sock[256];
+    snprintf(sock, sizeof(sock), "%s/smolmux-a412-%d.sock",
+             td && td[0] ? td : "/tmp", (int)getpid());
+    unlink(sock);
+
+    sm_link_t *link = stub_conn_new();
+    stub_conn_t *stub = link->data;
+    sm_broker_t broker;
+    sm_broker_init(&broker, link, sock);
+    snprintf(broker.port, sizeof(broker.port), "stub");
+    broker.reconnect = 0;
+    pthread_t tid;
+    pthread_create(&tid, NULL, broker_thread, &broker);
+    usleep(STARTUP_DELAY);
+
+    recv_leftover_len = 0;
+    recv_leftover_fd = -1;
+    int fd = connect_unix(sock);
+    ASSERT(fd >= 0, "connected to stub broker");
+    send_json(fd, sm_msg_hello("ctl", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    ASSERT_NOT_NULL(welcome.root);
+    sm_msg_free(&welcome);
+
+    send_json(fd, sm_msg_suspend("su"));
+    usleep(100000);
+    for (int i = 0; i < 20; i++) {
+        sm_msg_t m = recv_json(fd);
+        if (!m.root) break;
+        int done = (m.type == SM_MSG_SUSPENDED);
+        sm_msg_free(&m);
+        if (done) break;
+    }
+
+    send_json(fd, sm_msg_resume("rs"));
+    int saw_pending = 0;
+    for (int i = 0; i < 50 && !saw_pending; i++) {
+        if (broker.pending_resume_ack)
+            saw_pending = 1;
+        else
+            usleep(10000);
+    }
+    ASSERT(saw_pending, "resume took the async connect_begin path");
+    if (stub->hold >= 0) {
+        close(stub->hold);
+        stub->hold = -1;
+    }
+
+    int saw_err = 0, saw_resumed = 0;
+    for (int i = 0; i < 80; i++) {
+        sm_msg_t m = recv_json(fd);
+        if (!m.root) {
+            usleep(20000);
+            continue;
+        }
+        if (m.type == SM_MSG_ERROR) {
+            const char *msg = sm_json_get_string(m.root, "message");
+            const char *eid = sm_json_get_string(m.root, "id");
+            if (msg && strstr(msg, "reopen") && eid && strcmp(eid, "rs") == 0)
+                saw_err = 1;
+        }
+        if (m.type == SM_MSG_RESUMED)
+            saw_resumed = 1;
+        sm_msg_free(&m);
+        if (saw_err && !broker.pending_resume_ack)
+            break;
+    }
+    ASSERT(saw_err, "async resume fail sends error");
+    ASSERT(!saw_resumed, "no resumed on connect fail");
+    ASSERT_INT_EQ(broker.pending_resume_ack, 0);
+    ASSERT_INT_EQ(broker.suspended, 1);
+
+    close(fd);
+    sm_broker_stop(&broker);
+    pthread_join(tid, NULL);
+    sm_broker_destroy(&broker);
+    unlink(sock);
+}
+
 /* Disconnect then suspend must not reconnect while suspended (TIOCEXCL seize). */
 static void test_suspend_blocks_reconnect(void)
 {
@@ -1706,6 +2267,63 @@ static void test_weak_empty_seat_refuses_reconnect_open(void)
            "must stay down when last seat is unset");
 
     ctx.link->open = g_real_open;
+    teardown(&ctx);
+}
+
+/* ACT-056: first reconnect try is immediate (not SM_RECONNECT_BASE_S). */
+static void test_first_reconnect_is_immediate(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    g_real_open = ctx.link->open;
+    ctx.link->open = spy_open;
+    g_spy_open_calls = 0;
+    ctx.broker.reconnect = 1;
+
+    close(ctx.master);
+    ctx.master = -1;
+    usleep(250000);
+
+    ASSERT(g_spy_open_calls >= 1, "first reconnect attempted within 250ms");
+    ctx.link->open = g_real_open;
+    teardown(&ctx);
+}
+
+/* ACT-025: resume uses D1; weak empty seat must not call open(). */
+static void test_resume_refuses_weak_empty_seat(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("ctl", "controller"));
+    sm_msg_t welcome = recv_json(fd);
+    sm_msg_free(&welcome);
+
+    send_json(fd, sm_msg_suspend("su-d1"));
+    usleep(80000);
+    sm_msg_t smsg = recv_json(fd);
+    if (smsg.root) sm_msg_free(&smsg);
+    ASSERT(ctx.broker.suspended == 1, "suspended");
+
+    g_real_open = ctx.link->open;
+    ctx.link->open = spy_open;
+    g_spy_open_calls = 0;
+    ctx.broker.identity_weak_by_id = 1;
+    ctx.broker.identity_by_path[0] = '\0';
+
+    send_json(fd, sm_msg_resume("re-d1"));
+    usleep(100000);
+    sm_msg_t err = recv_json(fd);
+    ASSERT_NOT_NULL(err.root);
+    ASSERT_INT_EQ(err.type, SM_MSG_ERROR);
+    sm_msg_free(&err);
+    ASSERT_INT_EQ(g_spy_open_calls, 0);
+    ASSERT(ctx.broker.suspended == 1, "still suspended after D1 refuse");
+
+    ctx.link->open = g_real_open;
+    close(fd);
     teardown(&ctx);
 }
 
@@ -2623,8 +3241,16 @@ int main(void)
     RUN_TEST(test_write_queue_overflow);
     RUN_TEST(test_link_disconnect_reconnect);
     RUN_TEST(test_history_fence_on_link_down);
+    RUN_TEST(test_history_fence_on_link_up);
+    RUN_TEST(test_unread_bytes_survive_hup_together);
+    RUN_TEST(test_listen_expect_rate_limit);
+    RUN_TEST(test_text_log_grows_after_reconnect);
+    RUN_TEST(test_no_io_log_and_text_log_path);
+    RUN_TEST(test_resume_connect_fail_sends_error);
     RUN_TEST(test_suspend_blocks_reconnect);
     RUN_TEST(test_weak_empty_seat_refuses_reconnect_open);
+    RUN_TEST(test_first_reconnect_is_immediate);
+    RUN_TEST(test_resume_refuses_weak_empty_seat);
     RUN_TEST(test_link_drain_cap_enforced);
     RUN_TEST(test_link_drain_until_eagain);
     RUN_TEST(test_break_nonblocking);

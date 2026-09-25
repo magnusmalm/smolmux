@@ -101,7 +101,8 @@ int sm_board_manifest_from_json(const char *json, sm_board_manifest_t *out)
             sm_serial_by_id_is_weak(wire->device)) {
             SM_LOG_WARN(LOG_TAG,
                         "wire %s: device is a WEAK by-id (class-only); "
-                        "prefer by_path or a unique serial",
+                        "prefer by_path or a unique serial "
+                        "(see docs/PERSISTENT-SERIAL.md)",
                         wire->role);
         }
         out->wire_count++;

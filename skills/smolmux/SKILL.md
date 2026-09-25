@@ -2,8 +2,9 @@
 name: smolmux
 description: >
   Drive live serial (and GDB) devices through smolmux brokers and MCP tools.
-  Use when debugging UART/MCU consoles, ESP32 crash loops, multi-client port
-  sharing, flash coexistence, boot stages, or smolmux-mcp / smolmux-gdb-mcp.
+  Use when debugging UART or Linux consoles, GDB/SWD sessions, multi-client
+  port sharing, flash coexistence, boot stages, or smolmux-mcp and
+  smolmux-gdb-mcp. Named MCU and FPGA JSON is Pro zip only.
 ---
 
 # smolmux — agent skill
@@ -34,10 +35,33 @@ smolmux /dev/ttyUSB0 -b 115200
 `smolmux-mcp` does **not** auto-spawn a broker. If the broker is down, MCP
 still connects; tools return offline guidance. Start the broker and retry.
 
+## Profiles (generic first)
+
+A public clone ships generic Linux files under `configs/`:
+
+- `uboot.smolmux-profile.json`
+- `linux-shell.smolmux-profile.json`
+- `gdb.smolmux-profile.json`
+- `newboard.board.json`
+
+Start there. Named MCU and FPGA JSON (ESP-IDF UART, nRF9151, SAM C21,
+FT2232 dual, ESP32 UART, and related files) lives in the Pro zip
+`profiles/` directory. Copy those into `~/.config/smolmux/` if you have
+the zip. Do not expect them under `configs/` in a public clone.
+
+For an unknown Cortex-M chip, run `gdb_generate_profile` and keep the
+file under `~/.config/smolmux/`.
+
 ## Serial workflow (preferred)
 
+Write tools (`serial_write`, `serial_send_command`, pins, SysRq,
+suspend, autoresponder add) appear in `tools/list` only when
+`SMOLMUX_MCP_MUTATE=1`. Default listing is read-only. Set that env on
+the MCP server when the agent should drive the console.
+
 1. `serial_port_status` / `serial_boot_status`
-2. Writes: `serial_send_command` (shell + expect) or `serial_write` (raw)
+2. Writes (requires MUTATE=1): `serial_send_command` (shell + expect)
+   or `serial_write` (raw)
 3. Listen-only: **`serial_wait_for`** (regex, no TX; observers OK)
 4. Lossless capture: **`serial_output_history` with `since_seq`**
    - Response is JSON: `cursor`, `dropped`, `has_more`, `chunks`
@@ -67,6 +91,7 @@ the port may re-enumerate — re-check `serial_list_ports`.
 
 Built-in anomaly patterns (no profile required): Guru Meditation, brownout,
 abort, stack smash, task WDT, `rst:0x…` (warning only; does not abort waits).
+Named ESP32 device JSON is still Pro zip only.
 
 ## Multi-client
 

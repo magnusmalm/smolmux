@@ -3,6 +3,7 @@
 #include "constants.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,6 +221,120 @@ static void test_derive_socket_long_byid_golden(void)
     unsetenv("XDG_RUNTIME_DIR");
 }
 
+static void test_read_owner_secret_file(void)
+{
+    const char *td = getenv("TMPDIR");
+    if (!td || !td[0]) td = "/tmp";
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/sm-secret-XXXXXX", td);
+    ASSERT_NOT_NULL(mkdtemp(dir));
+    char path[768];
+    snprintf(path, sizeof(path), "%s/tok", dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    ASSERT(fd >= 0, "create token file");
+    ASSERT(write(fd, "sekrit\n", 7) == 7, "write token");
+    close(fd);
+
+    char out[64];
+    ASSERT_INT_EQ(sm_read_owner_secret_file(path, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "sekrit");
+
+    chmod(path, 0644);
+    ASSERT_INT_EQ(sm_read_owner_secret_file(path, out, sizeof(out)), -1);
+
+    chmod(path, 0600);
+    {
+        char big[128];
+        memset(big, 'A', 80);
+        big[80] = '\n';
+        big[81] = '\0';
+        fd = open(path, O_WRONLY | O_TRUNC);
+        ASSERT(fd >= 0, "truncate token");
+        ASSERT(write(fd, big, 81) == 81, "write long token");
+        close(fd);
+        char small[8];
+        ASSERT_INT_EQ(sm_read_owner_secret_file(path, small, sizeof(small)), -1);
+    }
+    fd = open(path, O_WRONLY | O_TRUNC);
+    ASSERT(write(fd, "ok\n", 3) == 3, "restore short token");
+    close(fd);
+    chmod(path, 0600);
+    {
+        char exact[64];
+        memset(exact, 'B', 63);
+        exact[63] = '\n';
+        fd = open(path, O_WRONLY | O_TRUNC);
+        ASSERT(fd >= 0, "rewrite 63+NL");
+        ASSERT(write(fd, exact, 64) == 64, "write 63+NL");
+        close(fd);
+        chmod(path, 0600);
+        char got[64];
+        ASSERT_INT_EQ(sm_read_owner_secret_file(path, got, sizeof(got)), 0);
+        ASSERT(strlen(got) == 63, "63-byte token + newline accepted");
+        {
+            char junk[65];
+            memset(junk, 'B', 63);
+            junk[63] = '\n';
+            junk[64] = 'Z';
+            fd = open(path, O_WRONLY | O_TRUNC);
+            ASSERT(write(fd, junk, 65) == 65, "write 63+NL+junk");
+            close(fd);
+            chmod(path, 0600);
+            ASSERT_INT_EQ(sm_read_owner_secret_file(path, got, sizeof(got)),
+                          -1);
+        }
+        exact[63] = 'x';
+        fd = open(path, O_WRONLY | O_TRUNC);
+        ASSERT(write(fd, exact, 64) == 64, "write 63+x");
+        close(fd);
+        chmod(path, 0600);
+        ASSERT_INT_EQ(sm_read_owner_secret_file(path, got, sizeof(got)), -1);
+        fd = open(path, O_WRONLY | O_TRUNC);
+        ASSERT(write(fd, "ok\n", 3) == 3, "restore short after 63");
+        close(fd);
+        chmod(path, 0600);
+    }
+    char linkp[768];
+    snprintf(linkp, sizeof(linkp), "%s/link", dir);
+    ASSERT_INT_EQ(symlink(path, linkp), 0);
+    ASSERT_INT_EQ(sm_read_owner_secret_file(linkp, out, sizeof(out)), -1);
+
+    char fifop[768];
+    snprintf(fifop, sizeof(fifop), "%s/fifo", dir);
+    ASSERT_INT_EQ(mkfifo(fifop, 0600), 0);
+    ASSERT_INT_EQ(sm_read_owner_secret_file(fifop, out, sizeof(out)), -1);
+
+    char extra[768];
+    snprintf(extra, sizeof(extra), "%s/hard", dir);
+    ASSERT_INT_EQ(link(path, extra), 0);
+    ASSERT_INT_EQ(sm_read_owner_secret_file(path, out, sizeof(out)), -1);
+
+    unlink(extra);
+    unlink(fifop);
+    unlink(linkp);
+    unlink(path);
+    rmdir(dir);
+}
+
+static void test_resolve_client_socket_device_vs_sock(void)
+{
+    setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
+    char out[SM_SOCK_PATH_MAX];
+    /* /dev/null is a char device on Linux — derive, do not copy. */
+    ASSERT_INT_EQ(sm_resolve_client_socket(out, sizeof(out), "/dev/null"), 1);
+    ASSERT_STR_EQ(out, "/run/user/1000/smolmux-null.sock");
+    /* Missing tty still derives (first-run PORT=/dev/ttyACM0 unplugged). */
+    ASSERT_INT_EQ(sm_resolve_client_socket(out, sizeof(out), "/dev/ttyACM0"), 1);
+    ASSERT_STR_EQ(out, "/run/user/1000/smolmux-ttyACM0.sock");
+    /* Explicit broker socket is copied, not derived. */
+    ASSERT_INT_EQ(sm_resolve_client_socket(out, sizeof(out),
+                                           "/tmp/smolmux-ttyUSB0.sock"), 0);
+    ASSERT_STR_EQ(out, "/tmp/smolmux-ttyUSB0.sock");
+    ASSERT_INT_EQ(sm_resolve_client_socket(out, sizeof(out), ""), -1);
+    ASSERT_INT_EQ(sm_resolve_client_socket(out, sizeof(out), NULL), -1);
+    unsetenv("XDG_RUNTIME_DIR");
+}
+
 static void test_derive_socket_rejects_bad_args(void)
 {
     char out[SM_SOCK_PATH_MAX];
@@ -301,6 +416,32 @@ static const char *scratch_tmp(void)
     return (t && t[0]) ? t : "/tmp";
 }
 
+/* Same bind-then-rename as the broker: kernel name stays path.<pid>.tmp. */
+static int listen_unix(const char *path)
+{
+    char tmp[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    int n = snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
+    if (n < 0 || n >= (int)sizeof(tmp))
+        return -1;
+    unlink(path);
+    unlink(tmp);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    memcpy(a.sun_path, tmp, (size_t)n + 1);
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+        listen(fd, 8) != 0 ||
+        rename(tmp, path) != 0) {
+        close(fd);
+        unlink(tmp);
+        return -1;
+    }
+    return fd;
+}
+
 static void test_wait_path_exists_now(void)
 {
     char path[256];
@@ -321,6 +462,28 @@ static void test_wait_path_timeout(void)
     unlink(path);
     ASSERT_INT_EQ(sm_wait_path_exists(path, 0.0, 1000), -1);
     ASSERT_INT_EQ(sm_wait_path_exists(NULL, 1.0, 1000), -1);
+}
+
+static void test_wait_device_open_now(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/smolmux-waitopen-now-%d", scratch_tmp(),
+             (int)getpid());
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fclose(f);
+    ASSERT_INT_EQ(sm_wait_device_open(path, 0.0, 1000), 0);
+    unlink(path);
+}
+
+static void test_wait_device_open_timeout(void)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/smolmux-waitopen-miss-%d", scratch_tmp(),
+             (int)getpid());
+    unlink(path);
+    ASSERT_INT_EQ(sm_wait_device_open(path, 0.0, 1000), -1);
+    ASSERT_INT_EQ(sm_wait_device_open(NULL, 1.0, 1000), -1);
 }
 
 static void test_wait_path_appears_mid_wait(void)
@@ -344,36 +507,82 @@ static void test_wait_path_appears_mid_wait(void)
     ASSERT_INT_EQ(rc, 0);
 }
 
+static void test_socket_is_reachable(void)
+{
+    ASSERT_INT_EQ(sm_socket_is_reachable(NULL), 0);
+    ASSERT_INT_EQ(sm_socket_is_reachable(""), 0);
+    ASSERT_INT_EQ(sm_socket_is_reachable("/no/such/smolmux.sock"), 0);
+
+    char path[160];
+    snprintf(path, sizeof(path), "%s/smolmux-reach-%d.sock", scratch_tmp(),
+             (int)getpid());
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fclose(f);
+    ASSERT_INT_EQ(sm_socket_is_reachable(path), 0);
+    unlink(path);
+
+    int fd = listen_unix(path);
+    ASSERT(fd >= 0, "listen");
+    ASSERT_INT_EQ(sm_socket_is_reachable(path), 1);
+    close(fd);
+    unlink(path);
+}
+
 static void test_autodiscover_should_refuse(void)
 {
     unsetenv("SMOLMUX_SOCKET");
     ASSERT_INT_EQ(sm_autodiscover_should_refuse(1), 0);
 
-    char socks[32][SM_SOCK_PATH_MAX];
-    size_t n = sm_discover_all_sockets(socks, 32);
-    if (n > 1) {
-        ASSERT_INT_EQ(sm_autodiscover_should_refuse(0), 1);
-        return;
-    }
-
     char dir[128];
     snprintf(dir, sizeof(dir), "%s/smad-%d", scratch_tmp(), (int)getpid());
     ASSERT_INT_EQ(mkdir(dir, 0700), 0);
+
+    char saved_xdg[512] = {0};
+    const char *prev = getenv("XDG_RUNTIME_DIR");
+    if (prev)
+        snprintf(saved_xdg, sizeof(saved_xdg), "%s", prev);
     setenv("XDG_RUNTIME_DIR", dir, 1);
-    char a[160], b[160];
-    snprintf(a, sizeof(a), "%s/smolmux-a.sock", dir);
-    snprintf(b, sizeof(b), "%s/smolmux-b.sock", dir);
-    FILE *fa = fopen(a, "w");
-    FILE *fb = fopen(b, "w");
-    ASSERT_NOT_NULL(fa);
-    ASSERT_NOT_NULL(fb);
-    fclose(fa);
-    fclose(fb);
+
+    char stale[160], live[160], live2[160];
+    snprintf(stale, sizeof(stale), "%s/smolmux-aaa.sock", dir);
+    snprintf(live, sizeof(live), "%s/smolmux-zzz.sock", dir);
+    snprintf(live2, sizeof(live2), "%s/smolmux-bbb.sock", dir);
+    FILE *fs = fopen(stale, "w");
+    ASSERT_NOT_NULL(fs);
+    fclose(fs);
+
+    char before[32][SM_SOCK_PATH_MAX];
+    size_t live_before = sm_discover_reachable_sockets(before, 32);
+
+    int lfd = listen_unix(live);
+    ASSERT(lfd >= 0, "listen live");
+
+    char all[32][SM_SOCK_PATH_MAX];
+    size_t nall = sm_discover_all_sockets(all, 32);
+    ASSERT(nall >= 2, "stale and live both globbed");
+
+    if (live_before == 0) {
+        ASSERT_INT_EQ(sm_autodiscover_should_refuse(0), 0);
+        char found[SM_SOCK_PATH_MAX];
+        ASSERT_INT_EQ(sm_discover_socket(found, sizeof(found)), 0);
+        ASSERT_STR_EQ(found, live);
+    }
+
+    int lfd2 = listen_unix(live2);
+    ASSERT(lfd2 >= 0, "listen second");
     ASSERT_INT_EQ(sm_autodiscover_should_refuse(0), 1);
     ASSERT_INT_EQ(sm_autodiscover_should_refuse(1), 0);
-    unlink(a);
-    unlink(b);
-    unsetenv("XDG_RUNTIME_DIR");
+
+    close(lfd);
+    close(lfd2);
+    unlink(stale);
+    unlink(live);
+    unlink(live2);
+    if (saved_xdg[0])
+        setenv("XDG_RUNTIME_DIR", saved_xdg, 1);
+    else
+        unsetenv("XDG_RUNTIME_DIR");
     rmdir(dir);
 }
 
@@ -413,32 +622,6 @@ static void test_gc_helpers(void)
                                             "/tmp/a.sock"), 0);
     ASSERT_INT_EQ(sm_unix_sock_name_matches("", "/tmp/a.sock"), 0);
     ASSERT_INT_EQ(sm_unix_sock_name_matches(NULL, "/tmp/a.sock"), 0);
-}
-
-/* Same bind-then-rename as the broker: kernel name stays path.<pid>.tmp. */
-static int listen_unix(const char *path)
-{
-    char tmp[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    int n = snprintf(tmp, sizeof(tmp), "%s.%d.tmp", path, (int)getpid());
-    if (n < 0 || n >= (int)sizeof(tmp))
-        return -1;
-    unlink(path);
-    unlink(tmp);
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0)
-        return -1;
-    struct sockaddr_un a;
-    memset(&a, 0, sizeof(a));
-    a.sun_family = AF_UNIX;
-    memcpy(a.sun_path, tmp, (size_t)n + 1);
-    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
-        listen(fd, 8) != 0 ||
-        rename(tmp, path) != 0) {
-        close(fd);
-        unlink(tmp);
-        return -1;
-    }
-    return fd;
 }
 
 static pid_t spawn_named_unix_client(const char *comm, const char *path)
@@ -566,6 +749,8 @@ int main(void)
     RUN_TEST(test_derive_socket_tmp_fallback);
     RUN_TEST(test_derive_socket_long_byid_fits_bind);
     RUN_TEST(test_derive_socket_long_byid_golden);
+    RUN_TEST(test_read_owner_secret_file);
+    RUN_TEST(test_resolve_client_socket_device_vs_sock);
     RUN_TEST(test_derive_socket_rejects_bad_args);
     RUN_TEST(test_derive_board_socket_shortens);
     RUN_TEST(test_parse_host_and_port);
@@ -578,6 +763,7 @@ int main(void)
     RUN_TEST(test_write_all_fails_on_closed_fd);
     RUN_TEST(test_by_id_weak_heuristic);
     RUN_TEST(test_refuse_weak_seat_change);
+    RUN_TEST(test_socket_is_reachable);
     RUN_TEST(test_autodiscover_should_refuse);
     RUN_TEST(test_gc_helpers);
     RUN_TEST(test_unix_mcp_peer_pids_live);
@@ -585,6 +771,8 @@ int main(void)
     RUN_TEST(test_wait_path_exists_now);
     RUN_TEST(test_wait_path_timeout);
     RUN_TEST(test_wait_path_appears_mid_wait);
+    RUN_TEST(test_wait_device_open_now);
+    RUN_TEST(test_wait_device_open_timeout);
 
     TEST_REPORT();
 }

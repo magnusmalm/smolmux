@@ -1,14 +1,16 @@
+#include "sm_features.h"
 #include "constants.h"
 #include "broker.h"
 #include "broker_info.h"
 #include "cJSON.h"
 #include "device_profile.h"
+#if SM_ENABLE_UART
 #include "links/uart.h"
+#endif
 #include "logger.h"
 #include "util/sock_util.h"
 #include "util/profile_resolve.h"
 #include "util/timeutil.h"
-#include "sm_features.h"
 
 #if SM_ENABLE_GDB
 #include "links/gdb.h"
@@ -102,41 +104,14 @@ static void sigchld_handler(int sig)
  * that did not load must never silently degrade into "no auth". */
 static int read_auth_token_file(const char *path, char *out, size_t out_len)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "Error: cannot read --auth-token-file %s: %s\n",
-                path, strerror(errno));
-        return -1;
-    }
-
-    struct stat st;
-    if (fstat(fileno(f), &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)))
-        fprintf(stderr,
-                "Warning: %s is readable by other users (mode %03o); "
-                "chmod 600 it.\n",
-                path, (unsigned)(st.st_mode & 07777));
-
-    char buf[256];
-    if (!fgets(buf, sizeof(buf), f)) {
-        fprintf(stderr, "Error: --auth-token-file %s is empty\n", path);
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-
-    buf[strcspn(buf, "\r\n")] = '\0';
-    if (!buf[0]) {
-        fprintf(stderr, "Error: --auth-token-file %s is empty\n", path);
-        return -1;
-    }
-
-    snprintf(out, out_len, "%s", buf);
-    return 0;
+    /* Fail-closed: O_NOFOLLOW, regular file, euid, nlink==1, 0600.
+     * Silent truncate used to hide an oversized token (ACT-030). */
+    return sm_read_owner_secret_file(path, out, out_len);
 }
 
-static void usage(const char *prog)
+static void usage(FILE *out, const char *prog)
 {
-    fprintf(stderr,
+    fprintf(out,
         "%s — serial device multiplexer\n"
         "\n"
         "Holds a serial port open and multiplexes access to multiple clients\n"
@@ -150,15 +125,18 @@ static void usage(const char *prog)
         "\n"
         "OPTIONS:\n"
         "  -b, --baud <rate>           Baud rate (default: %d)\n"
-        "  -s, --socket <path>         Unix socket path\n"
+        "  -s, --socket <path>         Unix socket path (not a TTY; not -t)\n"
         "  -l, --log-dir <dir>         I/O log directory\n"
         "                              (default: $XDG_STATE_HOME/smolmux or\n"
         "                               ~/.local/state/smolmux; holds console\n"
         "                               traffic, created 0600)\n"
-        "  -t, --text-log-dir <dir>    Text log directory\n"
-        "  -p, --profile <path>        Device profile JSON file\n"
-        "  --board <name>              Group this wire under a board (for discovery)\n"
-        "  --role <label>              This wire's role on the board (console, swd, ...)\n"
+        "  -t, --text-log-dir <dir>    Text log directory (not a timeout; not -s)\n"
+        "  -p, --profile <path>        Device profile JSON\n"
+        "                              (*.smolmux-profile.json)\n"
+        "  --board <name>              Group this wire under a board\n"
+        "  --role <label>              Role on the board (console, swd, ...)\n"
+        "  JSON suffixes: *.smolmux-profile.json, *.board.json,\n"
+        "                 *.gdb-profile.json\n"
 #if SM_ENABLE_GDB
         "  --gdb                       Use GDB MI link instead of UART\n"
         "  --gdb-path <path>           Path to gdb binary (default: gdb)\n"
@@ -189,11 +167,12 @@ static void usage(const char *prog)
         "  --ws-port <port>            Enable WebSocket sink on port (default: %d)\n"
 #endif
         "  --no-text-log               Disable text log\n"
+        "  --no-io-log                 Disable JSONL I/O log\n"
         "  --no-reconnect              Don't auto-reconnect on disconnect\n"
         "  --wait-device <seconds>     Wait for the device path to appear before\n"
         "                              open (late USB/gadget attach). 0 = off.\n"
         "  --list-ports                List available serial ports and exit\n"
-        "  --list-profiles             List available device profiles and exit\n"
+        "  --list-profiles             List profiles (~/.config/smolmux/, ./profiles/)\n"
         "  --help-protocol             Show wire protocol documentation\n"
         "  -v, --verbose               Enable debug logging\n"
         "  -V, --version               Show version\n"
@@ -203,7 +182,7 @@ static void usage(const char *prog)
         "  %s /dev/ttyUSB0                          # Default 115200 baud\n"
         "  %s /dev/ttyUSB0 -b 9600                  # Custom baud rate\n"
         "  %s /dev/ttyACM0 -p profiles/nrf9151.json # With device profile\n"
-        "  %s /dev/ttyUSB0 --tcp-port 5555          # Enable remote TCP access\n"
+        "  %s /dev/ttyUSB0 --tcp-port 5555 --auth-token-file TOKEN\n"
         "  %s --list-ports                           # Discover serial ports\n"
         "\n"
         "SOCKET PATH:\n"
@@ -231,7 +210,7 @@ static void usage(const char *prog)
 #endif
         , prog, prog, prog, prog, prog
     );
-    fprintf(stderr,
+    fprintf(out,
         "\nCOMPANION TOOLS:\n"
         "  smolmux-cli              Command-line client (send, read)\n"
         "  smolmux-monitor          Interactive terminal (Ctrl-] escape)\n"
@@ -255,7 +234,7 @@ static void print_protocol_help(void)
         "  TCP clients may require token when --auth-token / SMOLMUX_AUTH_TOKEN is set.\n"
         "\n"
         "  -> {\"type\":\"hello\",\"name\":\"my-tool\",\"role\":\"controller\",\"protocol_version\":1}\n"
-        "  <- {\"type\":\"welcome\",\"broker_version\":\"0.2.0\",\"protocol_version\":1,\n"
+        "  <- {\"type\":\"welcome\",\"broker_version\":\"0.3.0\",\"protocol_version\":1,\n"
         "      \"port\":\"/dev/ttyUSB0\",\"baud\":115200,\"your_role\":\"controller\"}\n"
         "\n"
         "ROLES:\n"
@@ -375,68 +354,83 @@ static void do_list_ports(void)
     }
 }
 
+#define SM_LIST_PROFILES_SEEN_MAX 64
+
+static int profile_name_seen(char seen[][64], int n, const char *name)
+{
+    for (int i = 0; i < n; i++) {
+        if (strcmp(seen[i], name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void list_profiles_glob(const char *pattern, const char *tag, int *found,
+                               char seen[][64], int *seen_n)
+{
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    if (glob(pattern, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            sm_device_profile_t p;
+            sm_profile_init_default(&p);
+            if (sm_profile_load(&p, g.gl_pathv[i]) == 0) {
+                if (profile_name_seen(seen, *seen_n, p.name)) {
+                    sm_profile_destroy(&p);
+                    continue;
+                }
+                if (*seen_n < SM_LIST_PROFILES_SEEN_MAX)
+                    snprintf(seen[(*seen_n)++], 64, "%s", p.name);
+                if (tag && tag[0])
+                    printf("%-20s %s  (%s)\n", p.name, p.description, tag);
+                else
+                    printf("%-20s %s\n", p.name, p.description);
+                (*found)++;
+            }
+            sm_profile_destroy(&p);
+        }
+    }
+    globfree(&g);
+}
+
 static void do_list_profiles(void)
 {
     const char *home = getenv("HOME");
     int found = 0;
+    char seen[SM_LIST_PROFILES_SEEN_MAX][64];
+    int seen_n = 0;
 
-    /* Check env var */
     const char *env_path = getenv(SM_PROFILE_ENV);
     if (env_path && env_path[0]) {
         sm_device_profile_t p;
         sm_profile_init_default(&p);
         if (sm_profile_load(&p, env_path) == 0) {
-            printf("%-20s %s  ($%s)\n", p.name, p.description, SM_PROFILE_ENV);
-            found++;
+            if (!profile_name_seen(seen, seen_n, p.name)) {
+                if (seen_n < SM_LIST_PROFILES_SEEN_MAX)
+                    snprintf(seen[seen_n++], 64, "%s", p.name);
+                printf("%-20s %s  ($%s)\n", p.name, p.description, SM_PROFILE_ENV);
+                found++;
+            }
         }
         sm_profile_destroy(&p);
     }
 
-    /* Scan config dir */
     if (home) {
         char pattern[512];
         snprintf(pattern, sizeof(pattern), SM_PROFILE_CONFIG_DIR_FMT, home);
         size_t dir_len = strlen(pattern);
         snprintf(pattern + dir_len, sizeof(pattern) - dir_len,
                  "/*%s", SM_PROFILE_FILE_SUFFIX);
-
-        glob_t g;
-        memset(&g, 0, sizeof(g));
-        if (glob(pattern, 0, NULL, &g) == 0) {
-            for (size_t i = 0; i < g.gl_pathc; i++) {
-                sm_device_profile_t p;
-                sm_profile_init_default(&p);
-                if (sm_profile_load(&p, g.gl_pathv[i]) == 0) {
-                    printf("%-20s %s\n", p.name, p.description);
-                    found++;
-                }
-                sm_profile_destroy(&p);
-            }
-        }
-        globfree(&g);
+        list_profiles_glob(pattern, NULL, &found, seen, &seen_n);
     }
 
-    /* Scan bundled profiles in configs/ */
-    {
-        glob_t g;
-        memset(&g, 0, sizeof(g));
-        if (glob("configs/*" SM_PROFILE_FILE_SUFFIX, 0, NULL, &g) == 0) {
-            for (size_t i = 0; i < g.gl_pathc; i++) {
-                sm_device_profile_t p;
-                sm_profile_init_default(&p);
-                if (sm_profile_load(&p, g.gl_pathv[i]) == 0) {
-                    printf("%-20s %s  (bundled)\n", p.name, p.description);
-                    found++;
-                }
-                sm_profile_destroy(&p);
-            }
-        }
-        globfree(&g);
-    }
+    list_profiles_glob("profiles/*" SM_PROFILE_FILE_SUFFIX, "profiles/", &found,
+                       seen, &seen_n);
 
     if (!found)
         printf("No device profiles found.\n"
-               "Place profiles in ~/.config/smolmux/ with suffix %s\n",
+               "Place profiles in ~/.config/smolmux/ with suffix %s\n"
+               "From an unpacked zip, ./profiles/ in the current directory is also listed.\n",
                SM_PROFILE_FILE_SUFFIX);
 }
 
@@ -495,6 +489,7 @@ int main(int argc, char *argv[])
     char text_log_dir[256] = {0};
     const char *profile_path = NULL;
     int no_text_log = 0;
+    int no_io_log = 0;
     int no_reconnect = 0;
     int verbose = 0;
     int enable_mcp = 0;
@@ -510,6 +505,8 @@ int main(int argc, char *argv[])
     int insecure_no_auth = 0;
     const char *board = NULL;
     const char *role = NULL;
+    const char *identity_policy = NULL;
+    const char *identity_by_path = NULL;
     int ws_port = 0;
     int wait_device_s = 0;
     int wait_device_set = 0;
@@ -558,6 +555,9 @@ int main(int argc, char *argv[])
         OPT_GDB_ALLOW_SHELL,
         OPT_AUTH_TOKEN_FILE,
         OPT_WAIT_DEVICE,
+        OPT_NO_IO_LOG,
+        OPT_IDENTITY_POLICY,
+        OPT_BY_PATH,
     };
 
     static const struct option long_opts[] = {
@@ -579,8 +579,11 @@ int main(int argc, char *argv[])
         {"insecure-no-auth", no_argument,     NULL, OPT_INSECURE_NO_AUTH},
         {"board",          required_argument, NULL, OPT_BOARD},
         {"role",           required_argument, NULL, OPT_ROLE},
+        {"identity-policy", required_argument, NULL, OPT_IDENTITY_POLICY},
+        {"by-path",        required_argument, NULL, OPT_BY_PATH},
         {"ws-port",        required_argument, NULL, 'W'},
         {"no-text-log",    no_argument,       NULL, 'N'},
+        {"no-io-log",      no_argument,       NULL, OPT_NO_IO_LOG},
         {"no-reconnect",   no_argument,       NULL, 'R'},
         {"wait-device",    required_argument, NULL, OPT_WAIT_DEVICE},
         {"list-ports",     no_argument,       NULL, OPT_LIST_PORTS},
@@ -627,6 +630,8 @@ int main(int argc, char *argv[])
         case 'B': tcp_bind = optarg; break;
         case OPT_BOARD: board = optarg; break;
         case OPT_ROLE:  role = optarg; break;
+        case OPT_IDENTITY_POLICY: identity_policy = optarg; break;
+        case OPT_BY_PATH: identity_by_path = optarg; break;
         case 'W': {
             char *endp;
             long val = strtol(optarg, &endp, 10);
@@ -638,6 +643,7 @@ int main(int argc, char *argv[])
             break;
         }
         case 'N': no_text_log = 1; break;
+        case OPT_NO_IO_LOG: no_io_log = 1; break;
         case 'R': no_reconnect = 1; break;
         case OPT_LIST_PORTS: do_list_ports_flag = 1; break;
         case OPT_LIST_PROFILES: do_list_profiles_flag = 1; break;
@@ -662,10 +668,10 @@ int main(int argc, char *argv[])
             printf("%s %s\n", SM_NAME, SM_VERSION);
             return 0;
         case 'h':
-            usage(argv[0]);
+            usage(stdout, argv[0]);
             return 0;
         default:
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return 1;
         }
     }
@@ -691,7 +697,7 @@ int main(int argc, char *argv[])
     if (!port && !enable_gdb && !serial_tcp_target) {
         fprintf(stderr, "Error: serial port required (or use --gdb / --serial-tcp)\n"
                 "  Use --list-ports to see available ports.\n\n");
-        usage(argv[0]);
+        usage(stderr, argv[0]);
         return 1;
     }
 
@@ -764,9 +770,10 @@ int main(int argc, char *argv[])
     if (!link) {
         if (!port) {
             fprintf(stderr, "Error: serial port required\n\n");
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return 1;
         }
+#if SM_ENABLE_UART
         link = sm_uart_new(port, baud, 1);
         if (!link) {
             SM_LOG_ERROR("main", "failed to create UART link");
@@ -774,21 +781,26 @@ int main(int argc, char *argv[])
         }
         SM_LOG_INFO("main", "port=%s baud=%d socket=%s", port, baud,
                     socket_path);
+#else
+        fprintf(stderr,
+                "Error: UART support not built; use --gdb or --serial-tcp\n");
+        return 1;
+#endif
     }
 
     /* Wait for late-attached device nodes (OTG gadget, cold USB). */
     if (wait_device_s > 0 && port) {
         SM_LOG_INFO("main", "waiting up to %ds for device %s", wait_device_s,
                     port);
-        if (sm_wait_path_exists(port, (double)wait_device_s, 250000) != 0) {
+        if (sm_wait_device_open(port, (double)wait_device_s, 250000) != 0) {
             fprintf(stderr,
-                    "Error: device path not present after %ds: %s\n"
+                    "Error: device did not open after %ds: %s\n"
                     "  Is the cable attached? Gadget userspace up?\n"
                     "  Use serial_list_ports / --list-ports to confirm.\n",
                     wait_device_s, port);
             return 1;
         }
-        SM_LOG_INFO("main", "device path present: %s", port);
+        SM_LOG_INFO("main", "device opened: %s", port);
     }
     (void)wait_device_set;
 
@@ -800,16 +812,12 @@ int main(int argc, char *argv[])
         char now[256];
         now[0] = '\0';
         (void)sm_serial_resolve_by_path(port, now, sizeof(now));
-        if (sm_identity_named_board_is_ambiguous(1, 1, NULL, NULL, now,
+        if (sm_identity_named_board_is_ambiguous(1, 1, identity_policy,
+                                                 identity_by_path, now,
                                                  identity_ok)) {
-            cJSON *err = sm_identity_ambiguous_json(board, port,
+            sm_identity_ambiguous_fprint(stderr, board, port,
                 "named board + weak by-id; pin by_path (policy=seat) "
                 "or set SMOLMUX_IDENTITY_OK=1");
-            char *s = cJSON_PrintUnformatted(err);
-            fprintf(stderr, "%s\n",
-                    s ? s : "{\"error\":\"identity_ambiguous\"}");
-            free(s);
-            cJSON_Delete(err);
             return 1;
         }
     }
@@ -821,17 +829,21 @@ int main(int argc, char *argv[])
     broker.baudrate = baud;
     if (board) snprintf(broker.board, sizeof(broker.board), "%s", board);
     if (role)  snprintf(broker.role, sizeof(broker.role), "%s", role);
+    if (identity_by_path && identity_by_path[0])
+        snprintf(broker.identity_by_path, sizeof(broker.identity_by_path),
+                 "%s", identity_by_path);
     if (port && sm_serial_by_id_is_weak(port)) {
         broker.identity_weak_by_id = 1;
         SM_LOG_WARN("main",
                     "device path looks like a WEAK by-id (class-only, no USB "
                     "serial). Reconnect will refuse if the physical seat "
                     "changes. Prefer a board with USB serial or a by-path "
-                    "seat key. See issue-serial-identity-collision-by-id.");
+                    "seat key. See docs/PERSISTENT-SERIAL.md.");
     }
     snprintf(broker.log_dir, sizeof(broker.log_dir), "%s", log_dir);
     snprintf(broker.text_log_dir, sizeof(broker.text_log_dir), "%s", text_log_dir);
     broker.no_text_log = no_text_log;
+    broker.no_io_log = no_io_log;
     broker.reconnect = !no_reconnect;
     /* --auth-token-file wins over both the flag and the environment: it is
      * the only input that leaves the token out of world-readable
@@ -900,6 +912,10 @@ int main(int argc, char *argv[])
         }
 
         sm_sink_t *tcp = sm_tcp_sink_new(tcp_port, tcp_bind);
+        if (!tcp) {
+            fprintf(stderr, "Error: out of memory for TCP sink\n");
+            return 1;
+        }
         sm_broker_add_sink(&broker, tcp);
         SM_LOG_INFO("main", "TCP sink enabled on port %d", tcp_port);
 
@@ -924,6 +940,10 @@ int main(int argc, char *argv[])
 #if SM_ENABLE_SINK_WS
     if (ws_port > 0) {
         sm_sink_t *wss = sm_ws_sink_new(ws_port);
+        if (!wss) {
+            fprintf(stderr, "Error: out of memory for WebSocket sink\n");
+            return 1;
+        }
         sm_broker_add_sink(&broker, wss);
         SM_LOG_INFO("main", "WebSocket sink enabled on port %d", ws_port);
         if (!broker.auth_token[0])

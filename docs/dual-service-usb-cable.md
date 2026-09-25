@@ -18,7 +18,7 @@ USB object inside the broker.
 | JTAG (libftdi) | OpenOCD external | GDB → host:port  |
 
 **Channel map is board-specific.** Never assume if00 = JTAG and if01 = UART
-for every FTDI board — check vendor docs and `ls -l /dev/serial/by-id`.
+for every FTDI board, check vendor docs and `ls -l /dev/serial/by-id`.
 
 ---
 
@@ -31,9 +31,10 @@ ls -l /dev/serial/by-id/
 # two by-id names sharing the serial; differ in -if00 vs -if01
 ```
 
-1. Start **OpenOCD on the JTAG interface only** (board-specific channel —
+1. Start **OpenOCD on the JTAG interface only** (board-specific channel, 
    do not claim the UART interface from OpenOCD).
-2. Copy `configs/ft2232-dual.board.json` (Pro zip: `profiles/`) and fill:
+2. Copy `profiles/ft2232-dual.board.json` from the Pro zip into
+   `~/.config/smolmux/` and fill:
    - `console.device` = by-id for the **UART** interface (prefer STRONG
      serial; see weak by-id in `persistent-serial-devices.md`).
    - `swd.target` = OpenOCD GDB port (usually `localhost:3333`).
@@ -41,7 +42,7 @@ ls -l /dev/serial/by-id/
 3. Bring the board up:
 
 ```bash
-smolmux-cli board up configs/ft2232-dual.board.json   # edit paths first
+smolmux-cli board up ~/.config/smolmux/ft2232-dual.board.json   # edit paths first
 smolmux-cli boards --json
 ```
 
@@ -66,9 +67,9 @@ Daily single-tty (`smolmux /dev/ttyUSB0`) is unchanged.
 ## 3. Hard rules
 
 1. **One smolmux process holds one link** (UART or GDB, not both).
-2. **OpenOCD is external** — GDB wire is host:port only.
+2. **OpenOCD is external**, GDB wire is host:port only.
 3. **Do not open the same USB interface** from OpenOCD and ftdi_sio.
-4. **Multi-wire agents always use `-s`** — first-glob is a footgun.
+4. **Multi-wire agents always use `-s`**, first-glob is a footgun.
 5. Prefer **board-role sockets** over long by-id basename sockets.
 6. Weak class-only by-id: seat risk; list-ports `[WEAK]` tags apply.
 
@@ -78,8 +79,9 @@ Daily single-tty (`smolmux /dev/ttyUSB0`) is unchanged.
 
 | Doc                                | Why                       |
 | ---------------------------------- | ------------------------- |
-| configs/ft2232-dual.board.json     | Example two-wire manifest |
-| configs/samc21.board.json          | Same model, ACM + OpenOCD |
+| Pro zip ft2232-dual.board.json     | Example two-wire manifest |
+| Pro zip samc21.board.json          | Same model, ACM + OpenOCD |
+| configs/newboard.board.json        | Public clone schema       |
 | docs/openocd-cold-attach.md        | Probe before GDB broker   |
 | docs/board-exploration-workflow.md | One broker per wire       |
 | docs/persistent-serial-devices.md  | by-id / weak id           |

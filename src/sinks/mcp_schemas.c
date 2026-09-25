@@ -126,6 +126,8 @@ cJSON *sm_mcp_build_tools_list(void)
             "Regex pattern to match end of response (default: from device profile).");
         schema_add_integer(props, "timeout_ms",
             "Timeout in milliseconds (default: from device profile).");
+        schema_add_string(props, "eol",
+            "Line ending appended to command: lf (default), cr, or crlf.");
         cJSON_AddItemToObject(s, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("command"));
@@ -207,7 +209,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *props = cJSON_CreateObject();
         schema_add_string(props, "pin", "Pin to control: dtr, rts, or break.");
         schema_add_string(props, "action",
-            "Action: set, clear, toggle (for dtr/rts), or send (for break).");
+            "Action: set, clear, toggle, or pulse for dtr/rts "
+            "(send aliases pulse: assert then deassert immediately; "
+            "duration_ms is for break only). For break: send or pulse.");
         schema_add_integer(props, "duration_ms",
             "Break duration in ms (default 250).");
         cJSON_AddItemToObject(s, "properties", props);

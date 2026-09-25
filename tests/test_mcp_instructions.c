@@ -4,21 +4,43 @@
 #include "constants.h"
 #include "cJSON.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static void test_instructions_content(void)
 {
+    unsetenv("SMOLMUX_MCP_MUTATE");
     const char *ins = sm_mcp_serial_instructions();
     ASSERT_NOT_NULL(ins);
     size_t len = strlen(ins);
     ASSERT(len >= 200, "instructions min length >= 200");
-    ASSERT(strstr(ins, "serial_suspend") != NULL,
-           "instructions mention serial_suspend");
+    ASSERT(strstr(ins, "serial_wait_for") != NULL,
+           "read path recommends wait_for");
+    ASSERT(strstr(ins, "serial_monitor") != NULL,
+           "read path recommends monitor");
+    ASSERT(strstr(ins, "serial_output_history") != NULL,
+           "read path recommends history");
     ASSERT(strstr(ins, "serial_get_incidents") != NULL,
            "instructions mention serial_get_incidents");
-    /* Negative: not just the server name */
+    ASSERT(strstr(ins, "SMOLMUX_MCP_MUTATE") != NULL,
+           "instructions mention MUTATE gate");
+    ASSERT(strstr(ins, "serial_write for raw") == NULL,
+           "mutate-off does not recommend serial_write first");
+    {
+        const char *wait = strstr(ins, "serial_wait_for");
+        const char *wr = strstr(ins, "serial_write");
+        ASSERT(wait && wr && wait < wr,
+               "wait_for appears before any serial_write");
+    }
     ASSERT(strcmp(ins, SM_NAME) != 0, "not server name alone");
     ASSERT(strcmp(ins, SM_NAME "-mcp") != 0, "not serverInfo.name alone");
+
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+    const char *rw = sm_mcp_serial_instructions();
+    ASSERT(rw != ins, "mutate-on uses a different string");
+    ASSERT(strstr(rw, "serial_write for raw") != NULL,
+           "mutate-on may recommend serial_write");
+    unsetenv("SMOLMUX_MCP_MUTATE");
 }
 
 static void test_prompt_names_exact_set(void)
