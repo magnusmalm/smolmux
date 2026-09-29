@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.4.0
+
+- Version is 0.4.0.
+- Loopback TCP and WebSocket listeners now require a token. Started without
+  `--auth-token`, the broker generates one into
+  `$XDG_RUNTIME_DIR/smolmux-<tcp|ws>-<port>.token`, or `/tmp` when
+  `XDG_RUNTIME_DIR` is unset (mode `0600`, removed on exit), so other local
+  users and processes can no longer drive the device. `smolmux-monitor`,
+  `smolmux-mcp` and `smolmux-gdb-mcp` with `--tcp` to a loopback address read
+  it automatically, before every connect, from either place (a broker from
+  cron or a system unit often has no `XDG_RUNTIME_DIR`). `smolmux-cli token`
+  prints it for an SSH tunnel's far end or a WebSocket client. If `/tmp`
+  already holds that name (another user's file or a symlink), the broker
+  refuses to start and says to set `XDG_RUNTIME_DIR`. `--insecure-no-auth` restores tokenless serving. **Breaking** for
+  other TCP/WS clients on loopback: give them the token.
+- The WEAK by-id warnings point at `docs/persistent-serial-devices.md`, which
+  exists in the repository and the Pro zip. `docs/PERSISTENT-SERIAL.md`
+  (named in the 0.3.0 and 0.3.1 warnings) exists only in the zip.
+- `--help-protocol` shows the running version in its handshake example.
+
 ## 0.3.1
 
 - Version is 0.3.1.

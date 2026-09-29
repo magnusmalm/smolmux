@@ -9,6 +9,7 @@
 #endif
 #include "logger.h"
 #include "util/sock_util.h"
+#include "util/auth_token.h"
 #include "util/profile_resolve.h"
 #include "util/timeutil.h"
 
@@ -160,8 +161,10 @@ static void usage(FILE *out, const char *prog)
         "                              (prefer env SMOLMUX_AUTH_TOKEN — hidden from ps)\n"
         "  --auth-token-file <path>    Read the token from a file (keeps it out of\n"
         "                              argv and the environment; systemd LoadCredential)\n"
-        "  --insecure-no-auth          Allow a non-loopback --tcp-bind with no token.\n"
-        "                              Refused by default: it is an open console.\n"
+        "  --insecure-no-auth          Serve TCP/WS with no token. Without it, a\n"
+        "                              loopback listener gets a generated token\n"
+        "                              (0600 file; smolmux-cli token prints it) and\n"
+        "                              a non-loopback --tcp-bind is refused.\n"
 #endif
 #if SM_ENABLE_SINK_WS
         "  --ws-port <port>            Enable WebSocket sink on port (default: %d)\n"
@@ -231,10 +234,11 @@ static void print_protocol_help(void)
         "HANDSHAKE:\n"
         "  Client sends 'hello', broker responds with 'welcome'.\n"
         "  No other messages accepted before hello. Hello cannot be re-sent.\n"
-        "  TCP clients may require token when --auth-token / SMOLMUX_AUTH_TOKEN is set.\n"
+        "  TCP/WS clients send a token in hello: --auth-token, or the one a loopback\n"
+        "  listener generates (smolmux-cli token; own clients read it themselves).\n"
         "\n"
         "  -> {\"type\":\"hello\",\"name\":\"my-tool\",\"role\":\"controller\",\"protocol_version\":1}\n"
-        "  <- {\"type\":\"welcome\",\"broker_version\":\"0.3.0\",\"protocol_version\":1,\n"
+        "  <- {\"type\":\"welcome\",\"broker_version\":\"" SM_VERSION "\",\"protocol_version\":1,\n"
         "      \"port\":\"/dev/ttyUSB0\",\"baud\":115200,\"your_role\":\"controller\"}\n"
         "\n"
         "ROLES:\n"
@@ -838,7 +842,7 @@ int main(int argc, char *argv[])
                     "device path looks like a WEAK by-id (class-only, no USB "
                     "serial). Reconnect will refuse if the physical seat "
                     "changes. Prefer a board with USB serial or a by-path "
-                    "seat key. See docs/PERSISTENT-SERIAL.md.");
+                    "seat key. See docs/persistent-serial-devices.md.");
     }
     snprintf(broker.log_dir, sizeof(broker.log_dir), "%s", log_dir);
     snprintf(broker.text_log_dir, sizeof(broker.text_log_dir), "%s", text_log_dir);
@@ -854,6 +858,37 @@ int main(int argc, char *argv[])
             return 1;
     } else if (auth_token) {
         snprintf(broker.auth_token, sizeof(broker.auth_token), "%s", auth_token);
+    }
+
+    /* ACT-029: a loopback TCP/WS listener without a token would hand every
+     * local user and process a full controller session. Generate a token
+     * and leave it in a 0600 file for this user's clients instead.
+     * --insecure-no-auth keeps the old tokenless behavior. */
+#if SM_ENABLE_SINK_TCP
+    int tcp_on_loopback = tcp_port > 0 && sm_tcp_bind_is_loopback(tcp_bind);
+#else
+    int tcp_on_loopback = 0;
+#endif
+#if SM_ENABLE_SINK_WS
+    int ws_on = ws_port > 0;
+#else
+    int ws_on = 0;
+#endif
+    /* The files are written just before the event loop (below), so no early
+     * error return can leave one behind. */
+    const char *token_kinds[2] = { "tcp", "ws" };
+    int token_ports[2] = { 0, 0 };
+    char token_paths[2][512] = {{0}};
+    if (!broker.auth_token[0] && !insecure_no_auth &&
+        (tcp_on_loopback || ws_on)) {
+        if (sm_auth_token_generate(broker.auth_token,
+                                   sizeof(broker.auth_token)) != 0) {
+            fprintf(stderr, "Error: cannot generate an auth token: %s\n",
+                    strerror(errno));
+            return 1;
+        }
+        token_ports[0] = tcp_on_loopback ? tcp_port : 0;
+        token_ports[1] = ws_on ? ws_port : 0;
     }
 
     /* Load device profile */
@@ -977,12 +1012,41 @@ int main(int argc, char *argv[])
     /* Ignore SIGPIPE */
     signal(SIGPIPE, SIG_IGN);
 
+    for (int i = 0; i < 2; i++) {
+        if (token_ports[i] <= 0)
+            continue;
+        if (sm_auth_token_path(token_paths[i], sizeof(token_paths[i]),
+                               token_kinds[i], token_ports[i]) != 0 ||
+            sm_auth_token_write(token_paths[i], broker.auth_token) != 0) {
+            int err = errno;
+            fprintf(stderr, "Error: cannot write auth token file %s: %s\n",
+                    token_paths[i], strerror(err));
+            const char *xdg = getenv("XDG_RUNTIME_DIR");
+            if (!xdg || !xdg[0])
+                fprintf(stderr, "  XDG_RUNTIME_DIR is unset, so the file goes "
+                        "to the shared /tmp, where another\n  user or a "
+                        "symlink may hold that name. Set XDG_RUNTIME_DIR to "
+                        "a private dir.\n");
+            fprintf(stderr, "  Or pass --auth-token-file, or --insecure-no-auth "
+                    "to serve without a token.\n");
+            if (i == 1 && token_paths[0][0])
+                unlink(token_paths[0]);
+            sm_broker_destroy(&broker);
+            return 1;
+        }
+        SM_LOG_INFO("main", "%s auth token in %s (smolmux-cli token)",
+                    token_kinds[i], token_paths[i]);
+    }
+
     /* Run */
     int rc = sm_broker_run(&broker);
     /* Setup failures (rc<0) on a UART port: name the holder if one exists. */
     if (rc < 0 && port && !enable_gdb && !serial_tcp_target)
         diagnose_busy_port(port);
     sm_broker_destroy(&broker);
+    for (int i = 0; i < 2; i++)
+        if (token_paths[i][0])
+            unlink(token_paths[i]);
 
     SM_LOG_INFO("main", "exiting (rc=%d)", rc);
     return rc < 0 ? 1 : 0;

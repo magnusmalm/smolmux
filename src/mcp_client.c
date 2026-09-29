@@ -12,6 +12,7 @@
 #include "util/base64.h"
 #include "util/json_helpers.h"
 #include "util/sock_util.h"
+#include "util/auth_token.h"
 #include "broker_info.h"
 #include "util/str.h"
 #include "util/timeutil.h"
@@ -1583,6 +1584,7 @@ static int try_connect_broker(void)
     ctx.offline_reason[0] = '\0';
 
     if (ctx.use_tcp) {
+        sm_auth_token_autoload(ctx.tcp_host, ctx.tcp_port);
         ctx.conn.fd = sm_connect_tcp(ctx.tcp_host, ctx.tcp_port);
         if (ctx.conn.fd < 0) {
             ctx.offline = 1;

@@ -640,8 +640,8 @@ static void test_weak_by_id_warn_cites_packed_doc(void)
     };
     int rc = capture_out_err(argv, out, sizeof(out), err, sizeof(err));
     ASSERT(rc != 0, "missing weak by-id fails to open");
-    ASSERT(strstr(err, "docs/PERSISTENT-SERIAL.md") != NULL,
-           "WEAK warn cites packed doc");
+    ASSERT(strstr(err, "docs/persistent-serial-devices.md") != NULL,
+           "WEAK warn cites the doc name in both the repo and the zip");
     ASSERT(strstr(err, "source tree") == NULL,
            "WEAK warn has no source-tree parenthetical");
 }

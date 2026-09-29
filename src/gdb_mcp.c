@@ -21,6 +21,7 @@
 #include "util/mi_parse.h"
 #include "util/json_helpers.h"
 #include "util/sock_util.h"
+#include "util/auth_token.h"
 #include "util/str.h"
 #include "util/profile_resolve.h"
 #include "logger.h"
@@ -2293,6 +2294,7 @@ int main(int argc, char *argv[])
         char host[240];
         int port = SM_TCP_DEFAULT_PORT;
         sm_parse_host_port(tcp_target, host, sizeof(host), &port);
+        sm_auth_token_autoload(host, port);
         g.conn.fd = sm_connect_tcp(host, port);
         if (g.conn.fd < 0) {
             fprintf(stderr, "Error: cannot connect to %s:%d: %s\n",

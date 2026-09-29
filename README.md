@@ -33,10 +33,13 @@ Day-to-day serial (multi-client, U-Boot break-in, flasher handoff):
 - **Network sinks** - TCP and WebSocket for remote access (loopback by default).
   The wire protocol is cleartext, and any client that completes the handshake
   gets full control of the device — console writes, pins, BREAK, SysRq, GDB.
-  For remote use, keep the bind on loopback and reach it over an SSH tunnel or
-  WireGuard rather than exposing the port; smolmux refuses to serve a
-  non-loopback TCP bind with no `--auth-token` unless you pass
-  `--insecure-no-auth`.
+  On loopback without `--auth-token`, the broker generates a token into a
+  `0600` file in `$XDG_RUNTIME_DIR` (or `/tmp`), so other local users and processes
+  cannot connect; your own `smolmux-monitor` / `smolmux-mcp` read it
+  automatically, and `smolmux-cli token` prints it. For remote use, keep the
+  bind on loopback and reach it over an SSH tunnel or WireGuard rather than
+  exposing the port; smolmux refuses to serve a non-loopback TCP bind with no
+  `--auth-token`. `--insecure-no-auth` turns both protections off.
 - **MCP servers** - standalone `smolmux-mcp` / `smolmux-gdb-mcp` attach to a running broker; optional in-process `--mcp` sink for single-process stdio
 - **Boot tracking & autoresponder** - ordered boot stages, stall events, standing expect->send rules
 - **Autoboot interrupt** - broker-side key flood (and optional DTR/RTS reset) for `bootdelay=0` U-Boot
@@ -130,8 +133,10 @@ Options:
   --auth-token <token>        Require token in hello from TCP clients
                               (prefer env SMOLMUX_AUTH_TOKEN - hidden from ps)
   --auth-token-file <path>    Read the token from a file
-  --insecure-no-auth          Allow a non-loopback --tcp-bind with no token.
-                              Refused by default: it is an open console.
+  --insecure-no-auth          Serve TCP/WS with no token. Without it, a
+                              loopback listener gets a generated token
+                              (0600 file; smolmux-cli token prints it) and
+                              a non-loopback --tcp-bind is refused.
   --ws-port <port>            Enable WebSocket sink (default: 5556)
   --no-text-log               Disable text log
   --no-io-log                 Disable JSONL I/O log
@@ -162,7 +167,7 @@ Example session:
 
 ```json
 -> {"type":"hello","name":"my-tool","role":"controller","protocol_version":1}
-<- {"type":"welcome","broker_version":"0.3.0","protocol_version":1,"port":"/dev/ttyUSB0","baud":115200,"your_role":"controller"}
+<- {"type":"welcome","broker_version":"x.y.z","protocol_version":1,"port":"/dev/ttyUSB0","baud":115200,"your_role":"controller"}
 -> {"type":"send","id":"1","data":"dW5hbWUgLWEK"}
 <- {"type":"output","data":"TGludXggNC4xOS4w...","timestamp":1709654321.123}
 ```

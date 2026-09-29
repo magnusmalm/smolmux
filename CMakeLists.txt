@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(smolmux VERSION 0.3.1 LANGUAGES C)
+project(smolmux VERSION 0.4.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -75,6 +75,7 @@ set(SM_SOURCES
     src/util/base64.c
     src/util/json_helpers.c
     src/util/sock_util.c
+    src/util/auth_token.c
     src/util/shared_line.c
     src/util/timeutil.c
     src/util/keyspec.c
@@ -267,6 +268,11 @@ if(SM_ENABLE_WATCHER)
     list(APPEND TEST_SOURCES tests/test_watcher.c)
 endif()
 
+# ACT-029 generated tokens: unit + real broker on a PTY with a TCP port.
+if(SM_ENABLE_UART AND SM_ENABLE_SINK_TCP)
+    list(APPEND TEST_SOURCES tests/test_auth_token.c)
+endif()
+
 # smolmux-cli is always built, so its reader test is unconditional.
 list(APPEND TEST_SOURCES tests/test_cli.c)
 
@@ -298,6 +304,11 @@ if(SM_ENABLE_WATCHER)
     target_compile_definitions(watcher_testlib PRIVATE main=watcher_main)
     target_link_libraries(test_watcher PRIVATE smolmux_lib)
     target_sources(test_watcher PRIVATE $<TARGET_OBJECTS:watcher_testlib>)
+endif()
+
+if(SM_ENABLE_UART AND SM_ENABLE_SINK_TCP)
+    target_link_libraries(test_auth_token PRIVATE util)
+    add_dependencies(test_auth_token smolmux smolmux-cli)
 endif()
 
 # CLI test needs cli.c compiled with main renamed (for cli_test_* hooks)

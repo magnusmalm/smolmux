@@ -21,6 +21,7 @@
 #include "util/json_helpers.h"
 #include "util/keyspec.h"
 #include "util/sock_util.h"
+#include "util/auth_token.h"
 #include "util/timeutil.h"
 #include "monitor_esc.h"
 #include "monitor_crlf.h"
@@ -689,6 +690,7 @@ int main(int argc, char *argv[])
         int port = SM_TCP_DEFAULT_PORT;
         sm_parse_host_port(tcp_target, host, sizeof(host), &port);
 
+        sm_auth_token_autoload(host, port);
         mon.sock_fd = sm_connect_tcp(host, port);
         if (mon.sock_fd < 0) {
             fprintf(stderr, "Error: cannot connect to %s:%d: %s\n",

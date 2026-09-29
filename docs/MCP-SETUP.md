@@ -128,9 +128,17 @@ vendor ID registers, emit a starter `*.gdb-profile.json`).
 Both servers accept `--tcp host:port` to reach a broker started with
 `--tcp-port`.
 
-**Authentication works.** Export the same token the broker was started with
-in the environment of the MCP server, and `sm_msg_hello()` sends it
-automatically:
+**On the same machine, no setup is needed.** A broker serving TCP on
+loopback without `--auth-token` generates a token into
+`$XDG_RUNTIME_DIR/smolmux-tcp-<port>.token` (mode `0600`; `/tmp` when
+`XDG_RUNTIME_DIR` is unset), and `--tcp 127.0.0.1:<port>` reads it before
+every connect, including reconnects after a broker restart. It looks in
+`$XDG_RUNTIME_DIR` first, then `/tmp`. The MCP server must run as the same
+user as the broker.
+
+**Elsewhere (an SSH tunnel's far end, or a broker started with
+`--auth-token`),** export the token in the environment of the MCP server;
+`smolmux-cli token` on the broker's machine prints a generated one:
 
 ```jsonc
 {
@@ -148,7 +156,8 @@ Get it wrong and the tool result says so, `broker rejected this client:
 authentication failed`, with a hint naming the variable.
 
 The TCP sink binds `127.0.0.1` by default, and smolmux refuses to serve a
-non-loopback bind with no token unless you pass `--insecure-no-auth`. The
+non-loopback bind with no token. `--insecure-no-auth` serves with no token
+at all, on loopback too. The
 wire protocol is cleartext either way, so for a remote broker prefer an SSH
 tunnel over exposing the port.
 

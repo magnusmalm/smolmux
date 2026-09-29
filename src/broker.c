@@ -2481,7 +2481,7 @@ static void attempt_reconnect(sm_broker_t *b)
         SM_LOG_ERROR(LOG_TAG,
             "refusing reconnect: weak by-id path %s moved seats "
             "(was %s). Stop the broker or rebind deliberately "
-            "(see docs/PERSISTENT-SERIAL.md)",
+            "(see docs/persistent-serial-devices.md)",
             b->port,
             b->identity_by_path[0] ? b->identity_by_path : "(unset)");
         /* Back off hard so we do not thrash; operator must intervene. */

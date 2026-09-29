@@ -15,12 +15,14 @@
 #include "util/base64.h"
 #include "util/json_helpers.h"
 #include "util/sock_util.h"
+#include "util/auth_token.h"
 #include "util/str.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <glob.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -1640,6 +1642,10 @@ static void usage(FILE *out, const char *prog)
         "  brokers                 List active brokers and what each holds\n"
         "                          (no broker needed; use --json for agents)\n"
         "\n"
+        "  token                   Print auth tokens local brokers generated for\n"
+        "                          loopback TCP/WS (to copy to the far end of an\n"
+        "                          SSH tunnel; local clients read them already)\n"
+        "\n"
         "  boards                  Group active brokers by --board (a board's wires)\n"
         "                          (no broker needed; use --json for agents)\n"
         "\n"
@@ -1716,6 +1722,64 @@ static void usage(FILE *out, const char *prog)
         "ENVIRONMENT:\n"
         "  SMOLMUX_SOCKET    Override broker socket path\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog);
+}
+
+/* Print the auth tokens local brokers generated for their loopback TCP/WS
+ * listeners (ACT-029), one "<kind> <port> <token>" line each: for copying to
+ * the far end of an SSH tunnel or into a WebSocket client. Local TCP clients
+ * of the same user read the files themselves. */
+static int cmd_token(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    cJSON *arr = cli.json_output ? cJSON_CreateArray() : NULL;
+    int found = 0;
+    const char *dirs[2];
+    int nd = sm_auth_token_dirs(dirs);
+    for (int d = 0; d < nd; d++) {
+        char pattern[600];
+        snprintf(pattern, sizeof(pattern), "%s/smolmux-*-*.token", dirs[d]);
+        glob_t g;
+        if (glob(pattern, 0, NULL, &g) != 0)
+            continue;
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            const char *base = strrchr(g.gl_pathv[i], '/');
+            base = base ? base + 1 : g.gl_pathv[i];
+            char kind[8];
+            int port;
+            struct stat st;
+            if (sscanf(base, "smolmux-%7[a-z]-%d.token", kind, &port) != 2)
+                continue;
+            /* In /tmp other users' brokers leave files too; not ours. */
+            if (lstat(g.gl_pathv[i], &st) != 0 || st.st_uid != geteuid())
+                continue;
+            char tok[256];
+            if (sm_read_owner_secret_file(g.gl_pathv[i], tok, sizeof(tok)) != 0)
+                continue;
+            if (arr) {
+                cJSON *o = cJSON_CreateObject();
+                cJSON_AddStringToObject(o, "kind", kind);
+                cJSON_AddNumberToObject(o, "port", port);
+                cJSON_AddStringToObject(o, "token", tok);
+                cJSON_AddItemToArray(arr, o);
+            } else {
+                printf("%s %d %s\n", kind, port, tok);
+            }
+            found++;
+        }
+        globfree(&g);
+    }
+    if (arr) {
+        char *s = cJSON_PrintUnformatted(arr);
+        printf("%s\n", s ? s : "[]");
+        free(s);
+        cJSON_Delete(arr);
+    } else if (!found) {
+        fprintf(stderr, "No generated auth tokens in %s%s: no local broker "
+                "serves TCP/WS with one.\n", dirs[0],
+                nd > 1 ? " or /tmp" : "");
+    }
+    return found ? 0 : 1;
 }
 
 /* List active brokers and what each holds. No broker connection needed — it
@@ -2590,6 +2654,7 @@ static const subcmd_t subcmds[] = {
     {"incidents",  cmd_incidents,  1, "observer"},
     {"list-ports", cmd_list_ports, 0, NULL},
     {"brokers",    cmd_brokers,    0, NULL},
+    {"token",      cmd_token,      0, NULL},
     {"boards",     cmd_boards,     0, NULL},
     {"board",      cmd_board,      0, NULL},
     {"shutdown",   cmd_shutdown,   0, NULL},
