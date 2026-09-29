@@ -21,13 +21,16 @@
 #include "util/json_helpers.h"
 #include "util/keyspec.h"
 #include "util/sock_util.h"
+#include "util/timeutil.h"
 #include "monitor_esc.h"
+#include "monitor_crlf.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +45,7 @@
  * disconnect. */
 #define MON_READ_BUF_INIT SM_MONITOR_READ_BUF_SIZE
 #define MON_READ_BUF_MAX  (4 * 1024 * 1024)
+#define MON_EVENT_HOLD_S  0.2
 
 static struct {
     int sock_fd;
@@ -52,6 +56,13 @@ static struct {
     char name[64];
     struct termios orig_termios;
     int raw_mode;
+    int raw_output;          /* --raw: write device bytes unchanged */
+    int map_lf;              /* bare LF -> CRLF on a raw-mode terminal */
+    int prev_cr;             /* sm_mon_map_lf state across output chunks */
+    int at_bol;              /* last device byte written ended a line */
+    char pending[4096];      /* event lines held until the device line ends */
+    size_t pending_len;
+    double pending_since;    /* monotonic time the first held line arrived */
     char *read_buf;
     size_t read_len;
     size_t read_cap;
@@ -108,6 +119,72 @@ static int send_msg(cJSON *msg)
     return rc;
 }
 
+/* --- Event lines --- */
+
+/* Broker events (suspend, anomaly, boot stage, ...) print on a line of their
+ * own. While the device is mid-line they are held until the device ends the
+ * line, or MON_EVENT_HOLD_S passes, so they do not split device output. */
+static void flush_events(void)
+{
+    if (mon.pending_len == 0)
+        return;
+    if (!mon.at_bol)
+        write(STDERR_FILENO, "\r\n", 2);
+    write(STDERR_FILENO, mon.pending, mon.pending_len);
+    mon.pending_len = 0;
+    mon.at_bol = 1;
+}
+
+static void event_line(const char *fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+    if ((size_t)n > sizeof(line) - 3)
+        n = (int)(sizeof(line) - 3);
+    memcpy(line + n, "\r\n", 2);
+    n += 2;
+
+    if (mon.at_bol && mon.pending_len == 0) {
+        write(STDERR_FILENO, line, (size_t)n);
+        return;
+    }
+    if (mon.pending_len + (size_t)n > sizeof(mon.pending))
+        flush_events();
+    if (mon.pending_len == 0)
+        mon.pending_since = sm_now_monotonic();
+    memcpy(mon.pending + mon.pending_len, line, (size_t)n);
+    mon.pending_len += (size_t)n;
+    if (mon.at_bol)
+        flush_events();
+}
+
+/* Write device bytes; release held events at the first line end. */
+static void write_device(const uint8_t *p, size_t len)
+{
+    if (len == 0)
+        return;
+    if (mon.pending_len > 0) {
+        const uint8_t *nl = memchr(p, '\n', len);
+        if (nl) {
+            size_t head = (size_t)(nl - p) + 1;
+            write(STDOUT_FILENO, p, head);
+            mon.at_bol = 1;
+            flush_events();
+            p += head;
+            len -= head;
+            if (len == 0)
+                return;
+        }
+    }
+    write(STDOUT_FILENO, p, len);
+    mon.at_bol = (p[len - 1] == '\n');
+}
+
 /* --- Broker message handling --- */
 
 static void handle_output(cJSON *root)
@@ -117,8 +194,16 @@ static void handle_output(cJSON *root)
 
     size_t dec_len;
     uint8_t *data = sm_base64_decode(b64, strlen(b64), &dec_len);
-    if (data && dec_len > 0)
-        write(STDOUT_FILENO, data, dec_len);
+    if (data && dec_len > 0) {
+        uint8_t *mapped = mon.map_lf ? malloc(2 * dec_len) : NULL;
+        if (mapped) {
+            size_t n = sm_mon_map_lf(data, dec_len, mapped, &mon.prev_cr);
+            write_device(mapped, n);
+            free(mapped);
+        } else {
+            write_device(data, dec_len);
+        }
+    }
     free(data);
 }
 
@@ -164,15 +249,13 @@ static void handle_error(cJSON *root)
 static void handle_suspended(cJSON *root)
 {
     const char *port = sm_json_get_string(root, "port");
-    dprintf(STDERR_FILENO, "\r\n\033[33m[suspended] %s\033[0m\r\n",
-            port ? port : "serial");
+    event_line("\033[33m[suspended] %s\033[0m", port ? port : "serial");
 }
 
 static void handle_resumed(cJSON *root)
 {
     const char *port = sm_json_get_string(root, "port");
-    dprintf(STDERR_FILENO, "\r\n\033[32m[resumed] %s\033[0m\r\n",
-            port ? port : "serial");
+    event_line("\033[32m[resumed] %s\033[0m", port ? port : "serial");
 }
 
 static void handle_anomaly(cJSON *root)
@@ -190,11 +273,17 @@ static void handle_anomaly(cJSON *root)
             color = "\033[33m";
     }
 
-    dprintf(STDERR_FILENO, "\r\n%s[anomaly:%s] %s: %s\033[0m\r\n",
-            color,
-            severity ? severity : "?",
-            pattern ? pattern : "?",
-            match ? match : "");
+    /* First line of the match only: the rest is device output already on
+     * screen. */
+    if (!match)
+        match = "";
+    int match_len = (int)strcspn(match, "\r\n");
+
+    event_line("%s[anomaly:%s] %s: %.*s\033[0m",
+               color,
+               severity ? severity : "?",
+               pattern ? pattern : "?",
+               match_len, match);
 }
 
 static void handle_boot_stage(cJSON *root)
@@ -203,8 +292,8 @@ static void handle_boot_stage(cJSON *root)
     int index = sm_json_get_int(root, "index", -1);
     int total = sm_json_get_int(root, "total", 0);
 
-    dprintf(STDERR_FILENO, "\r\n\033[32m[boot] reached %s (%d/%d)\033[0m\r\n",
-            name ? name : "?", index + 1, total);
+    event_line("\033[32m[boot] reached %s (%d/%d)\033[0m",
+               name ? name : "?", index + 1, total);
 }
 
 static void handle_boot_stall(cJSON *root)
@@ -214,9 +303,8 @@ static void handle_boot_stall(cJSON *root)
     int total = sm_json_get_int(root, "total", 0);
     int ms = sm_json_get_int(root, "stalled_ms", 0);
 
-    dprintf(STDERR_FILENO,
-            "\r\n\033[31m[boot STALLED] at %s (%d/%d) after %dms\033[0m\r\n",
-            name ? name : "?", index + 1, total, ms);
+    event_line("\033[31m[boot STALLED] at %s (%d/%d) after %dms\033[0m",
+               name ? name : "?", index + 1, total, ms);
 }
 
 static void handle_autoresponder_fired(cJSON *root)
@@ -224,8 +312,8 @@ static void handle_autoresponder_fired(cJSON *root)
     const char *name = sm_json_get_string(root, "name");
     int sent = sm_json_get_int(root, "sent", 0);
 
-    dprintf(STDERR_FILENO, "\r\n\033[36m[autorespond] %s fired (%d bytes)\033[0m\r\n",
-            name ? name : "?", sent);
+    event_line("\033[36m[autorespond] %s fired (%d bytes)\033[0m",
+               name ? name : "?", sent);
 }
 
 static void dispatch_message(sm_msg_t *msg)
@@ -462,6 +550,8 @@ static void usage(FILE *out, const char *prog)
         "  -s, --socket <path>     Broker socket (not the TTY; a char device\n"
         "                          is derived to the broker sock)\n"
         "  --tcp <host:port>       Connect via TCP instead of Unix socket\n"
+        "  --raw                   Write device bytes unchanged (default: a bare\n"
+        "                          LF from the device is shown as CRLF)\n"
         "  -V, --version           Show version\n"
         "  -h, --help              Show help\n"
         "\n"
@@ -524,6 +614,7 @@ int main(int argc, char *argv[])
     memset(&mon, 0, sizeof(mon));
     mon.sock_fd = -1;
     mon.running = 1;
+    mon.at_bol = 1;
     mon.escape_char = SM_MONITOR_ESCAPE_CHAR;
     snprintf(mon.name, sizeof(mon.name), "monitor");
     snprintf(mon.role, sizeof(mon.role), "observer");
@@ -534,6 +625,7 @@ int main(int argc, char *argv[])
         {"escape",     required_argument, NULL, 'e'},
         {"socket",     required_argument, NULL, 's'},
         {"tcp",        required_argument, NULL, 'T'},
+        {"raw",        no_argument,       NULL, 'R'},
         {"list",       no_argument,       NULL, 'L'},
         {"version",    no_argument,       NULL, 'V'},
         {"help",       no_argument,       NULL, 'h'},
@@ -564,6 +656,9 @@ int main(int argc, char *argv[])
             break;
         case 'T':
             tcp_target = optarg;
+            break;
+        case 'R':
+            mon.raw_output = 1;
             break;
         case 'V':
             printf("%s-monitor %s\n", SM_NAME, SM_VERSION);
@@ -694,6 +789,9 @@ int main(int argc, char *argv[])
     /* Enter raw mode and register cleanup */
     atexit(cleanup);
     enter_raw_mode();
+    /* Only a raw-mode terminal loses its own LF -> CRLF; a pipe or file
+     * gets the device bytes as sent. */
+    mon.map_lf = mon.raw_mode && !mon.raw_output && isatty(STDOUT_FILENO);
 
     /* Event loop */
     struct pollfd fds[2] = {
@@ -702,7 +800,12 @@ int main(int argc, char *argv[])
     };
 
     while (mon.running) {
-        int ret = poll(fds, 2, -1);
+        int timeout_ms = -1;
+        if (mon.pending_len > 0) {
+            double left = mon.pending_since + MON_EVENT_HOLD_S - sm_now_monotonic();
+            timeout_ms = left > 0 ? (int)(left * 1000.0) + 1 : 0;
+        }
+        int ret = poll(fds, 2, timeout_ms);
         if (ret < 0) {
             if (errno == EINTR)
                 continue;
@@ -711,7 +814,11 @@ int main(int argc, char *argv[])
 
         if (fds[1].revents & POLLIN)
             handle_broker_data();
+        if (mon.pending_len > 0 &&
+            sm_now_monotonic() - mon.pending_since >= MON_EVENT_HOLD_S)
+            flush_events();
         if (fds[1].revents & (POLLHUP | POLLERR)) {
+            flush_events();
             dprintf(STDERR_FILENO, "\r\n[broker disconnected]\r\n");
             break;
         }
@@ -720,6 +827,7 @@ int main(int argc, char *argv[])
     }
 
     /* Clean up */
+    flush_events();
     close(mon.sock_fd);
     dprintf(STDERR_FILENO, "\r\n[disconnected]\r\n");
 

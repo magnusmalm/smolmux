@@ -214,6 +214,26 @@ static void test_explicit_reset(void)
     sm_boot_destroy(&t);
 }
 
+/* After a link reconnect, the last stage's marker from the previous boot is
+ * still within the rescan overlap. It must not count for the new boot. */
+static void test_restart_forgets_previous_boot(void)
+{
+    sm_boot_tracker_t t;
+    sm_boot_init(&t);
+    add_stages(&t);
+
+    feed(&t, "BL2\nDDR OK\nU-Boot 2024\nhost login: ", 1.0);
+    ASSERT(sm_boot_terminal_reached(&t), "first boot complete");
+
+    sm_boot_restart(&t);
+    feed(&t, "BL2\n", 2.0);
+    ASSERT(t.stages[0].reached, "new boot reaches stage 0");
+    ASSERT(!t.stages[3].reached, "login from the old boot does not count");
+    ASSERT_INT_EQ(t.furthest, 0);
+
+    sm_boot_destroy(&t);
+}
+
 static void test_empty_tracker_is_inert(void)
 {
     sm_boot_tracker_t t;
@@ -238,6 +258,7 @@ int main(void)
     RUN_TEST(test_stall_detection);
     RUN_TEST(test_reboot_reset_on_stage0);
     RUN_TEST(test_explicit_reset);
+    RUN_TEST(test_restart_forgets_previous_boot);
     RUN_TEST(test_empty_tracker_is_inert);
     RUN_TEST(test_esp_reset_alternation);
 

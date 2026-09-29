@@ -2041,6 +2041,18 @@ static void process_link_chunk(sm_broker_t *b, const uint8_t *buf, size_t n, dou
     if (b->text_log)
         sm_text_log_write(b->text_log, buf, n, ts);
 
+    /* Output goes to clients before the anomaly / boot-stage / autoresponder
+     * events it triggers, so a monitor shows the matching line first. */
+    for (size_t s = 0; s < b->sink_count; s++) {
+        if (b->sinks[s]->on_output)
+            b->sinks[s]->on_output(b->sinks[s], buf, n, ts);
+    }
+
+    cJSON *out = sm_msg_output_b64(b64, ts);
+    free(b64);
+    broadcast(b, out, NULL);
+    cJSON_Delete(out);
+
     size_t new_incidents = sm_anomaly_feed(&b->anomaly, buf, n, ts);
     if (new_incidents > 0) {
         size_t count;
@@ -2115,16 +2127,6 @@ static void process_link_chunk(sm_broker_t *b, const uint8_t *buf, size_t n, dou
             cJSON_Delete(fmsg);
         }
     }
-
-    for (size_t s = 0; s < b->sink_count; s++) {
-        if (b->sinks[s]->on_output)
-            b->sinks[s]->on_output(b->sinks[s], buf, n, ts);
-    }
-
-    cJSON *out = sm_msg_output_b64(b64, ts);
-    free(b64);
-    broadcast(b, out, NULL);
-    cJSON_Delete(out);
 }
 
 static void link_drain_chunk(void *ctx, const uint8_t *buf, size_t n)
@@ -2393,7 +2395,7 @@ static void link_bring_up(sm_broker_t *b, int broadcast_up)
 
     /* A reconnect usually means the device was reset/replugged: start boot
      * progress over so stages re-detect from the new boot. */
-    sm_boot_reset(&b->boot);
+    sm_boot_restart(&b->boot);
     stall_disarm(b);   /* fresh boot; the stall timer re-arms when stage 0 hits */
     sm_autoresponder_reset_window(&b->autoresponder);
     sm_anomaly_reset_window(&b->anomaly);

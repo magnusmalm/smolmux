@@ -2,7 +2,7 @@
 #define SM_CONSTANTS_H
 
 #define SM_NAME "smolmux"
-#define SM_VERSION "0.3.0"
+#define SM_VERSION "0.3.1"
 #define SM_PROTOCOL_VERSION 1
 
 /* Limits */

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.3.1
+
+- Version is 0.3.1.
+- `smolmux-monitor` shows a bare LF from the device as CRLF, so firmware
+  that ends lines with `\n` alone no longer staircases across the screen.
+  Only a raw-mode terminal is affected; piped output is unchanged. `--raw`
+  writes device bytes unchanged.
+- The broker sends device output before the anomaly, boot-stage, and
+  autoresponder events that output triggers, so the matching line shows first.
+- After a link reconnect (including `resume` and `with-port`), boot stages are
+  matched only against the new boot. Before, the last stage's marker from the
+  previous boot could count again.
+- `smolmux-monitor` holds event lines while the device is mid-line and prints
+  them at the line end (at most 200 ms later), so they no longer split device
+  output. `[anomaly]` shows the first line of the match only.
+
 ## 0.3.0
 
 - Version is 0.3.0 (`SM_VERSION` and CMake `project VERSION`).

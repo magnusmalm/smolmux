@@ -66,6 +66,15 @@ void sm_boot_reset(sm_boot_tracker_t *t)
     t->last_advance_ts = 0.0;
 }
 
+void sm_boot_restart(sm_boot_tracker_t *t)
+{
+    sm_boot_reset(t);
+    t->window_len = 0;
+    t->search_offset = 0;
+    if (t->window)
+        t->window[0] = '\0';
+}
+
 /* Append data to the fixed-size sliding window, dropping the oldest bytes when
  * it would overflow. Keeps the buffer NUL-terminated for the regex engine and
  * slides search_offset along with any evicted prefix. */

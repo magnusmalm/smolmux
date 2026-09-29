@@ -12,6 +12,7 @@
 #include "util/base64.h"
 #include "util/json_helpers.h"
 #include "monitor_esc.h"
+#include "monitor_crlf.h"
 
 #include <pthread.h>
 #include <unistd.h>
@@ -194,6 +195,51 @@ static void test_escape_c_is_not_hello(void)
     ASSERT_INT_EQ(sm_mon_esc_wire(SM_MON_ESC_TAKEOVER), SM_MON_WIRE_TAKEOVER);
 }
 
+static size_t map_str(const char *in, char *out, int *prev_cr)
+{
+    size_t n = sm_mon_map_lf((const uint8_t *)in, strlen(in),
+                             (uint8_t *)out, prev_cr);
+    out[n] = '\0';
+    return n;
+}
+
+/* Bare LF from the device must return the carriage on a raw-mode tty. */
+static void test_map_lf(void)
+{
+    char out[64];
+    int cr = 0;
+
+    map_str("a\nb\n", out, &cr);
+    ASSERT_STR_EQ(out, "a\r\nb\r\n");
+
+    cr = 0;
+    map_str("a\r\nb\r\n", out, &cr);
+    ASSERT_STR_EQ(out, "a\r\nb\r\n");
+
+    /* CRLF split across two output chunks is not doubled. */
+    cr = 0;
+    map_str("line\r", out, &cr);
+    ASSERT_STR_EQ(out, "line\r");
+    map_str("\nnext", out, &cr);
+    ASSERT_STR_EQ(out, "\nnext");
+
+    /* LF then LF is two line breaks; lone CR (progress bars) is kept. */
+    cr = 0;
+    map_str("\n\n", out, &cr);
+    ASSERT_STR_EQ(out, "\r\n\r\n");
+    map_str("50%\r60%", out, &cr);
+    ASSERT_STR_EQ(out, "50%\r60%");
+
+    /* Non-text bytes pass through; only 0x0a gains a CR. */
+    const uint8_t bin[] = { 0x00, 0xff, 0x0a, 0x1b, 0x0d, 0x0a };
+    const uint8_t want[] = { 0x00, 0xff, 0x0d, 0x0a, 0x1b, 0x0d, 0x0a };
+    uint8_t got[12];
+    cr = 0;
+    size_t n = sm_mon_map_lf(bin, sizeof(bin), got, &cr);
+    ASSERT_INT_EQ((int)n, (int)sizeof(want));
+    ASSERT(memcmp(got, want, sizeof(want)) == 0, "binary bytes unchanged");
+}
+
 static void test_role_upgrade_rejected(void)
 {
     test_ctx_t ctx;
@@ -253,6 +299,7 @@ int main(void)
     RUN_TEST(test_connect_observe);
     RUN_TEST(test_send_keystroke);
     RUN_TEST(test_escape_c_is_not_hello);
+    RUN_TEST(test_map_lf);
     RUN_TEST(test_role_upgrade_rejected);
     RUN_TEST(test_status_request);
 

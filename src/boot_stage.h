@@ -58,6 +58,10 @@ size_t sm_boot_feed(sm_boot_tracker_t *t, const uint8_t *data, size_t len, doubl
  * the sliding window. */
 void sm_boot_reset(sm_boot_tracker_t *t);
 
+/* sm_boot_reset plus drop the sliding window: text from before a link
+ * reconnect must not reach stages of the next boot. */
+void sm_boot_restart(sm_boot_tracker_t *t);
+
 /* 1 if the boot appears stalled at wall-clock time `now`. */
 int sm_boot_stalled(const sm_boot_tracker_t *t, double now);
 

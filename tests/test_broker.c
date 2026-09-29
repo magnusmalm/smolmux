@@ -2808,6 +2808,65 @@ static void test_autoboot_flood_timeout(void)
     teardown(&ctx);
 }
 
+/* Return a copy of the first "type" among a and b seen on fd (caller frees),
+ * or NULL on timeout. */
+static char *first_type_of(int fd, const char *a, const char *b, int max_ms)
+{
+    char buf[16384];
+    size_t total = 0;
+    for (int t = 0; t < max_ms / 10; t++) {
+        ssize_t n = read(fd, buf + total, sizeof(buf) - total - 1);
+        if (n > 0) {
+            total += (size_t)n;
+            buf[total] = '\0';
+            char *start = buf, *nl;
+            while ((nl = memchr(start, '\n', (size_t)(buf + total - start)))) {
+                *nl = '\0';
+                cJSON *j = cJSON_Parse(start);
+                const char *ty = j ? sm_json_get_string(j, "type") : NULL;
+                if (ty && (strcmp(ty, a) == 0 || strcmp(ty, b) == 0)) {
+                    char *r = strdup(ty);
+                    cJSON_Delete(j);
+                    return r;
+                }
+                cJSON_Delete(j);
+                start = nl + 1;
+            }
+            size_t rem = (size_t)(buf + total - start);
+            memmove(buf, start, rem);
+            total = rem;
+        } else {
+            usleep(10000);
+        }
+    }
+    return NULL;
+}
+
+/* A monitor must show the line that reached a boot stage before the
+ * boot_stage event, not after it. */
+static void test_output_before_boot_stage(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+    sm_boot_add_stage(&ctx.broker.boot, "login", "login:");
+
+    int obs = connect_unix(TEST_SOCK);
+    send_json(obs, sm_msg_hello("obs", "observer"));
+    sm_msg_t w = recv_json(obs);
+    sm_msg_free(&w);
+
+    (void)!write(ctx.master, "host login: ", 12);
+
+    char *first = first_type_of(obs, "output", "boot_stage", 2000);
+    ASSERT_NOT_NULL(first);
+    if (first)
+        ASSERT_STR_EQ(first, "output");
+    free(first);
+
+    close(obs);
+    teardown(&ctx);
+}
+
 /* Boot-stage progress: device output advances the tracker, the broker
  * broadcasts a boot_stage event, and status_response carries the boot object. */
 static void test_boot_stage_progress(void)
@@ -3260,6 +3319,7 @@ int main(void)
     RUN_TEST(test_reset_and_interrupt_bad_hold);
     RUN_TEST(test_autoresponder_fires);
     RUN_TEST(test_boot_stage_progress);
+    RUN_TEST(test_output_before_boot_stage);
     RUN_TEST(test_boot_stall_fires);
     RUN_TEST(test_boot_no_stall_when_complete);
     RUN_TEST(test_broker_listens_on_derived_long_byid_socket);
