@@ -12,6 +12,7 @@
 #include "links/serial_tcp.h"
 #include "links/link.h"
 #include "util/json_helpers.h"
+#include "broker.h"
 
 #include <string.h>
 #include <unistd.h>
@@ -492,6 +493,59 @@ static void test_connect_refused(void)
     link->destroy(link);
 }
 
+/* No key may appear twice at the top level of status_response. */
+static int count_key(const cJSON *obj, const char *key)
+{
+    int n = 0;
+    const cJSON *c;
+    cJSON_ArrayForEach(c, obj)
+        if (c->string && strcmp(c->string, key) == 0) n++;
+    return n;
+}
+
+static int has_duplicate_keys(const cJSON *obj)
+{
+    const cJSON *c;
+    cJSON_ArrayForEach(c, obj)
+        if (c->string && count_key(obj, c->string) > 1) return 1;
+    return 0;
+}
+
+/* todo #22: the serial-tcp link's own "port" (TCP port number) and
+ * "connected" used to be added next to the broker's, so status_response
+ * carried both and last-duplicate parsers saw a numeric port. */
+static void test_status_response_no_duplicate_keys(void)
+{
+    int port, lfd = make_listener(&port);
+    ASSERT(lfd >= 0, "listener created");
+    sm_link_t *link = NULL;
+    int sfd = connect_pair(lfd, port, &link);
+    ASSERT(sfd >= 0, "connected");
+    if (sfd < 0) { close(lfd); return; }
+
+    sm_broker_t b;
+    memset(&b, 0, sizeof(b));
+    b.link = link;
+    snprintf(b.port, sizeof(b.port), "tcp:127.0.0.1:%d", port);
+    b.baudrate = 115200;
+
+    cJSON *st = sm_broker_status_json(&b, "st");
+    ASSERT_NOT_NULL(st);
+    ASSERT(!has_duplicate_keys(st), "no duplicate top-level keys");
+    ASSERT_INT_EQ(count_key(st, "port"), 1);
+    const cJSON *p = cJSON_GetObjectItemCaseSensitive(st, "port");
+    ASSERT(cJSON_IsString(p), "top-level port is the broker's string");
+    ASSERT_STR_EQ(sm_json_get_string(st, "link_type"), "serial-tcp");
+    ASSERT_STR_EQ(sm_json_get_string(st, "host"), "127.0.0.1");
+    const cJSON *lk = cJSON_GetObjectItemCaseSensitive(st, "link");
+    ASSERT(cJSON_IsObject(lk), "full link view under link");
+    ASSERT_INT_EQ(sm_json_get_int(lk, "port", -1), port);
+    ASSERT(!has_duplicate_keys(lk), "link object has no duplicates");
+    cJSON_Delete(st);
+
+    close(sfd); close(lfd); link->destroy(link);
+}
+
 int main(void)
 {
     printf("test_serial_tcp\n");
@@ -510,5 +564,6 @@ int main(void)
     RUN_TEST(test_async_connect_fails);
     RUN_TEST(test_reconnect_uses_cached_addr);
     RUN_TEST(test_connect_refused);
+    RUN_TEST(test_status_response_no_duplicate_keys);
     TEST_REPORT();
 }

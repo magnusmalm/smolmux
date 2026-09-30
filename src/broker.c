@@ -1003,10 +1003,8 @@ static void handle_release(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     send_to_client(c, sm_msg_ack("release", id));
 }
 
-static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
+cJSON *sm_broker_status_json(sm_broker_t *b, const char *id)
 {
-    const char *id = sm_json_get_string(msg->root, "id");
-
     cJSON *resp = sm_msg_status_response(id ? id : "", b->port, b->baudrate,
                                          b->link->read_fd(b->link) >= 0,
                                          b->suspended);
@@ -1060,8 +1058,20 @@ static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     cJSON_AddStringToObject(resp, "identity_by_id", b->identity_by_id);
     cJSON_AddStringToObject(resp, "identity_by_path", b->identity_by_path);
 
-    /* Add pin states via link */
-    b->link->get_status(b->link, resp);
+    /* Link status (pin states, link_type, ...). The link writes into its
+     * own object: its "port"/"connected" (serial-tcp: the TCP port number)
+     * used to land next to the broker's, so status_response carried each
+     * key twice and parsers that keep the last duplicate saw a numeric
+     * "port". Keys the broker has not set are merged to the top level as
+     * before; the complete link view is also kept under "link". */
+    cJSON *link_status = cJSON_CreateObject();
+    b->link->get_status(b->link, link_status);
+    const cJSON *lk;
+    cJSON_ArrayForEach(lk, link_status) {
+        if (!cJSON_GetObjectItemCaseSensitive(resp, lk->string))
+            cJSON_AddItemToObject(resp, lk->string, cJSON_Duplicate(lk, 1));
+    }
+    cJSON_AddItemToObject(resp, "link", link_status);
 
     /* Add log path */
     if (b->io_log)
@@ -1092,7 +1102,13 @@ static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
         cJSON_AddItemToObject(resp, "boot", boot);
     }
 
-    send_to_client(c, resp);
+    return resp;
+}
+
+static void handle_status(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
+{
+    const char *id = sm_json_get_string(msg->root, "id");
+    send_to_client(c, sm_broker_status_json(b, id));
 }
 
 /* Completion context for a wire-protocol break request. The client is
@@ -1557,7 +1573,13 @@ static void handle_incidents_request(sm_broker_t *b, sm_client_t *c, sm_msg_t *m
 {
     const char *id = sm_json_get_string(msg->root, "id");
     double since_ts = sm_json_get_double(msg->root, "since_ts", 0.0);
+    cJSON *resp = sm_msg_incidents_response(id ? id : "",
+                                            sm_broker_incidents_json(b, since_ts));
+    send_to_client(c, resp);
+}
 
+cJSON *sm_broker_incidents_json(sm_broker_t *b, double since_ts)
+{
     size_t count;
     const sm_anomaly_incident_t *incidents = sm_anomaly_get_incidents(&b->anomaly, &count);
 
@@ -1573,9 +1595,7 @@ static void handle_incidents_request(sm_broker_t *b, sm_client_t *c, sm_msg_t *m
         cJSON_AddStringToObject(inc, "pre_context", incidents[i].pre_context);
         cJSON_AddItemToArray(arr, inc);
     }
-
-    cJSON *resp = sm_msg_incidents_response(id ? id : "", arr);
-    send_to_client(c, resp);
+    return arr;
 }
 
 static void handle_configure_anomaly(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
@@ -2282,7 +2302,9 @@ static int broker_setup(sm_broker_t *b)
     broker_record_identity(b);
 
     if (b->log_dir[0] && !b->no_io_log) {
-        char tag[128], path[512];
+        /* Sized from the source fields so neither copy can truncate. */
+        char tag[sizeof(b->port)];
+        char path[sizeof(b->log_dir) + sizeof(tag) + sizeof(SM_IO_LOG_FILE_FMT)];
         io_log_tag_from_port(b->port, tag, sizeof(tag));
         snprintf(path, sizeof(path), SM_IO_LOG_FILE_FMT, b->log_dir, tag);
         b->io_log = sm_io_log_open(path);

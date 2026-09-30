@@ -9,3 +9,4 @@ dist/
 # Desk JSON — serial/MAC/host. Packer also refuses these globs.
 configs/te0950*
 configs/esp32s3-spare-a*
+polar-oat

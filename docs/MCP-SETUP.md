@@ -84,6 +84,11 @@ Lossless paging: `serial_output_history` with `since_seq` (JSON
 `cursor`/`dropped`/`has_more`/`chunks`); pass `cursor` back as
 `since_seq`. Listen-only wait: `serial_wait_for` (no TX; observers OK).
 
+**Structured results:** `serial_port_status`, `serial_boot_status`,
+`serial_get_incidents`, `serial_list_ports` and `serial_output_history`
+declare an `outputSchema` in `tools/list` and return the same data as
+`structuredContent` next to the text. Failed calls set `isError: true`.
+
 On `initialize`, the serial MCP also sends short **instructions**
 (status, history, incidents; write/suspend tools only when
 `SMOLMUX_MCP_MUTATE=1`). Guided **prompts** (slash commands in

@@ -23,6 +23,9 @@ zip, `./profiles/`. It does not scan `./configs/`.
 
 ## Recommended Build (UART + MCP + Watcher only)
 
+Prerequisites (CMake 3.21+, Python 3 with kconfiglib, optional PCRE2) are
+listed in the README's Quick start.
+
 ```bash
 cd /path/to/smolmux          # clone or release tree
 cp configs/defconfig.embedded .config
@@ -556,8 +559,13 @@ glob / discovery. Use `-s` only when you want an explicit path.
 ```bash
 ./build/smolmux-monitor -s /tmp/smolmux-ttyUSB0.sock
 # or: ./build/smolmux-monitor -c /tmp/smolmux-ttyUSB0.sock  # controller role
-# or if using TCP sink (advanced)
-./build/smolmux-monitor --tcp 192.168.1.42:5555
+# or if using TCP sink (advanced; broker started with --tcp-port 5555)
+# same machine: the monitor reads the broker's generated token itself
+./build/smolmux-monitor --tcp 127.0.0.1:5555
+# another machine: tunnel to the broker's loopback port and pass the token
+# (run `smolmux-cli token` on the broker's machine to print it)
+ssh -N -L 5555:127.0.0.1:5555 broker-host &
+SMOLMUX_AUTH_TOKEN=<token> ./build/smolmux-monitor --tcp 127.0.0.1:5555
 ```
 
 ### MCP (for Claude Code / Cursor / other agents)

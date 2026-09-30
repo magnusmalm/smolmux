@@ -1334,14 +1334,14 @@ static int resolve_profile_write_path(const char *spec, char *out, size_t n,
         size_t dlen = strlen(dir);
         if (strncmp(expanded, dir, dlen) != 0 || expanded[dlen] != '/') {
             snprintf(why, why_n,
-                     "profiles may only be written to %s (got %s)",
+                     "profiles may only be written to %.100s (got %.100s)",
                      dir, expanded);
             return -1;
         }
         base = expanded + dlen + 1;
         if (base[0] == '\0' || strchr(base, '/') != NULL) {
             snprintf(why, why_n,
-                     "write directly into %s, not a subdirectory — profile "
+                     "write directly into %.100s, not a subdirectory — profile "
                      "discovery does not recurse", dir);
             return -1;
         }
@@ -1472,11 +1472,15 @@ static char *tool_generate_profile(cJSON *args)
     else if (cJSON_IsNumber(jr))
         snprintf(memnote, sizeof(memnote), " %d KB RAM.", (int)jr->valuedouble);
 
-    snprintf(prof.description, sizeof(prof.description),
+    /* A long core/vendor/dev_id can cut the trailing hint short; the
+     * profile is still valid, so truncation is accepted, not an error. */
+    int dlen = snprintf(prof.description, sizeof(prof.description),
              "Auto-gen from gdb_identify_target: %s %s, vendor %s%s%s.%s "
              "peripheral_map seeded with Cortex-M + vendor debug blocks; add "
              "application peripherals (UART/SPI/GPIO) + rtos from the datasheet.",
              core, revision, vendor, dev_id[0] ? ", dev_id " : "", dev_id, memnote);
+    if (dlen < 0 || (size_t)dlen >= sizeof(prof.description))
+        SM_LOG_DEBUG(LOG_TAG, "profile description truncated");
 
     /* Register set: architectural, keyed off the core class. */
     prof.register_count = 0;
@@ -1672,7 +1676,10 @@ static cJSON *build_gdb_tools_list(void)
     add_str(props, "target", "Optional GDB target string to (re)select.");
     req1[0] = "executable";
     cJSON_AddItemToArray(tools, tool_entry("gdb_launch",
-        "Load an ELF's symbols (the broker owns the gdb process/connection).",
+        "Load an ELF's symbols (the broker owns the gdb process/connection). "
+        "Call first when you have the firmware ELF: breakpoints by name, "
+        "backtraces and gdb_load need it. Unknown board, no ELF: "
+        "gdb_identify_target works without one.",
         props, req1, 1));
 
     props = cJSON_CreateObject();
@@ -1681,16 +1688,19 @@ static cJSON *build_gdb_tools_list(void)
     add_bool(props, "temporary", "Delete the breakpoint after the first hit.");
     req1[0] = "location";
     cJSON_AddItemToArray(tools, tool_entry("gdb_breakpoint",
-        "Set a breakpoint.", props, req1, 1));
+        "Set a breakpoint, then gdb_continue and gdb_wait_stop to run to it. "
+        "temporary=true for a one-shot stop.", props, req1, 1));
 
     props = cJSON_CreateObject();
     add_int(props, "number", "Breakpoint number to delete.");
     req1[0] = "number";
     cJSON_AddItemToArray(tools, tool_entry("gdb_delete_breakpoint",
-        "Delete a breakpoint by number.", props, req1, 1));
+        "Delete a breakpoint by number (numbers come from gdb_breakpoint, or "
+        "gdb_command -break-list).", props, req1, 1));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_continue",
-        "Resume execution. Returns immediately; use gdb_wait_stop to wait.",
+        "Resume execution. Returns immediately; use gdb_wait_stop to wait "
+        "for a breakpoint or fault, gdb_interrupt to halt it yourself.",
         NULL, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_interrupt",
@@ -1701,10 +1711,14 @@ static cJSON *build_gdb_tools_list(void)
     add_str(props, "mode", "step (into), next (over), finish (out), stepi, nexti.");
     add_int(props, "count", "Number of steps (default 1).");
     cJSON_AddItemToArray(tools, tool_entry("gdb_step",
-        "Step execution.", props, NULL, 0));
+        "Step from a halted target: step into, next over, finish out of the "
+        "frame, stepi/nexti by instruction. A next over a slow loop can time "
+        "out on SWD; use stepi or a breakpoint past it, and gdb_interrupt if "
+        "it keeps running.", props, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_backtrace",
-        "Get the current call stack with frame details.", NULL, NULL, 0));
+        "Get the current call stack with frame details. Target must be "
+        "halted; needs gdb_launch symbols for function names.", NULL, NULL, 0));
 
     props = cJSON_CreateObject();
     add_str_array(props, "names",
@@ -1712,27 +1726,35 @@ static cJSON *build_gdb_tools_list(void)
         "Default = the target profile's important registers. "
         "Also accepts a CSV string for clients that send strings.");
     cJSON_AddItemToArray(tools, tool_entry("gdb_read_registers",
-        "Read CPU registers (optionally filtered by names).", props, NULL, 0));
+        "Read CPU registers (optionally filtered by names). For decoded "
+        "Cortex-M fault state use gdb_read_fault_registers; for a named "
+        "peripheral block, gdb_read_peripheral.", props, NULL, 0));
 
     props = cJSON_CreateObject();
     add_str(props, "address", "Hex address (0x...) or expression (&var).");
     add_int(props, "length", "Number of bytes to read (default 256).");
     req1[0] = "address";
     cJSON_AddItemToArray(tools, tool_entry("gdb_read_memory",
-        "Read raw memory from the target.", props, req1, 1));
+        "Read raw memory from the target as bytes. For a typed value or a "
+        "struct use gdb_evaluate; for a profile-named peripheral, "
+        "gdb_read_peripheral.", props, req1, 1));
 
     props = cJSON_CreateObject();
     add_str(props, "expression", "C expression to evaluate in the current frame.");
     req1[0] = "expression";
     cJSON_AddItemToArray(tools, tool_entry("gdb_evaluate",
-        "Evaluate a C expression in the current frame context.", props, req1, 1));
+        "Evaluate a C expression in the current frame context (variables, "
+        "struct fields, casts like *(uint32_t*)0x...). Needs gdb_launch symbols "
+        "for names; raw bytes: gdb_read_memory.", props, req1, 1));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_threads",
-        "List all threads (RTOS-aware if the profile configures it).",
+        "List all threads (RTOS-aware if the profile configures it). Without "
+        "RTOS support the bare-metal core shows as one thread.",
         NULL, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_load",
-        "Flash the loaded ELF to the target via GDB.", NULL, NULL, 0));
+        "Flash the ELF from gdb_launch to the target via GDB, then gdb_reset "
+        "to run it. Writes flash.", NULL, NULL, 0));
 
     props = cJSON_CreateObject();
     add_str(props, "mode", "halt (stop at reset), run, or init.");
@@ -1744,35 +1766,47 @@ static cJSON *build_gdb_tools_list(void)
         props, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_status",
-        "Get current GDB/target status.", NULL, NULL, 0));
+        "Check first: loaded profile, broker link, and whether the target is "
+        "running or stopped. If running, gdb_interrupt before reading state.",
+        NULL, NULL, 0));
 
     props = cJSON_CreateObject();
     add_int(props, "timeout_ms", "Maximum time to wait in ms (default 30000).");
     cJSON_AddItemToArray(tools, tool_entry("gdb_wait_stop",
-        "Wait for the target to stop (breakpoint, signal, or step completion).",
+        "Wait for the target to stop (breakpoint, signal, or step completion) "
+        "after gdb_continue or gdb_step. Returns [TIMEOUT] if it is still "
+        "running; then gdb_interrupt.",
         props, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_console_output",
-        "Drain buffered GDB console/target output since the last read.",
+        "Drain buffered GDB console/target output since the last read (e.g. "
+        "OpenOCD monitor replies, semihosting). Not the serial console: that "
+        "is smolmux-mcp.",
         NULL, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_read_fault_registers",
         "Read and decode ARM Cortex-M fault status registers (CFSR/HFSR/"
-        "MMFAR/BFAR).", NULL, NULL, 0));
+        "MMFAR/BFAR). Use when the target stopped in a HardFault or other "
+        "fault handler; follow with gdb_backtrace. M0/M0+/M23 have no CFSR.",
+        NULL, NULL, 0));
 
     props = cJSON_CreateObject();
     add_str(props, "name", "Peripheral name from the target profile (e.g. UARTE0).");
     add_int(props, "num_registers", "Number of 32-bit registers to read (default 16).");
     req1[0] = "name";
     cJSON_AddItemToArray(tools, tool_entry("gdb_read_peripheral",
-        "Read memory-mapped registers from a named peripheral.", props, req1, 1));
+        "Read memory-mapped registers from a peripheral named in the target "
+        "profile's peripheral_map. Arbitrary addresses: gdb_read_memory.",
+        props, req1, 1));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_identify_target",
         "Identify unknown silicon: decode SCB CPUID (ARM Cortex-M core + "
         "revision), probe the CoreSight ROM table, and best-effort read vendor "
         "device-ID registers (STM32 DBGMCU_IDCODE, SAM DSU DID, nRF FICR) -> "
         "structured JSON {core, revision, vendor_guess, dev_id, flash_kb, "
-        "ram_kb, evidence}. Target must be halted and attached.",
+        "ram_kb, evidence}. Target must be halted and attached. Use on an "
+        "unknown board before anything else; gdb_generate_profile turns the "
+        "result into a starter profile.",
         NULL, NULL, 0));
 
     props = cJSON_CreateObject();
@@ -1802,7 +1836,10 @@ static cJSON *build_gdb_tools_list(void)
     add_str(props, "command", "GDB/MI command (e.g. -break-list).");
     req1[0] = "command";
     cJSON_AddItemToArray(tools, tool_entry("gdb_command",
-        "Send a raw GDB/MI command to the debugger.", props, req1, 1));
+        "Send a raw GDB/MI command to the debugger when no dedicated tool "
+        "fits (e.g. -break-list, -data-list-changed-registers). Prefer the "
+        "dedicated tools. Shell/python commands are refused unless the broker "
+        "runs with --gdb-allow-shell.", props, req1, 1));
 
     {
         int nnames = SM_GDB_MCP_TOOL_NAME_COUNT;

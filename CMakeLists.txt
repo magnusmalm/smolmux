@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(smolmux VERSION 0.4.0 LANGUAGES C)
+project(smolmux VERSION 0.5.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -100,6 +100,7 @@ set(SM_SOURCES
     src/broker.c
     src/links/link_wq.c
     src/sinks/mcp_schemas.c
+    src/sinks/mcp_results.c
 )
 
 if(SM_ENABLE_UART)
@@ -324,10 +325,16 @@ target_sources(test_cli PRIVATE $<TARGET_OBJECTS:cli_testlib>)
 target_link_libraries(test_cli PRIVATE pthread util)
 add_dependencies(test_cli smolmux-cli smolmux)
 
+# Host hook: argv fixtures (allow with-port / deny raw TTY). Not a C test.
+add_test(NAME deny_raw_tty
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/deny-raw-tty.sh" --self-test)
+
 # Broker/monitor tests need pthreads and util (openpty)
 if(SM_ENABLE_UART)
     target_link_libraries(test_broker PRIVATE pthread util)
     target_link_libraries(test_monitor PRIVATE pthread util)
+    # test_monitor runs the real smolmux-monitor binary (welcome gate).
+    add_dependencies(test_monitor smolmux-monitor)
     target_link_libraries(test_uart PRIVATE util)
 endif()
 

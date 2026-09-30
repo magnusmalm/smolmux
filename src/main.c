@@ -180,7 +180,18 @@ static void usage(FILE *out, const char *prog)
         "  -v, --verbose               Enable debug logging\n"
         "  -V, --version               Show version\n"
         "  -h, --help                  Show this help\n"
-        "\n"
+        "\n",
+        prog, prog, prog, prog, prog, SM_DEFAULT_BAUD
+#if SM_ENABLE_SINK_TCP
+        , SM_TCP_DEFAULT_PORT
+#endif
+#if SM_ENABLE_SINK_WS
+        , SM_WS_DEFAULT_PORT
+#endif
+    );
+    /* Two calls: one literal would pass the 4095-byte C11 limit that
+     * -Woverlength-strings enforces. */
+    fprintf(out,
         "EXAMPLES:\n"
         "  %s /dev/ttyUSB0                          # Default 115200 baud\n"
         "  %s /dev/ttyUSB0 -b 9600                  # Custom baud rate\n"
@@ -202,16 +213,8 @@ static void usage(FILE *out, const char *prog)
         "  SMOLMUX_DEVICE_PROFILE   Path to device profile JSON\n"
         "  SMOLMUX_WAIT_DEVICE_S    Default --wait-device seconds if flag omitted\n"
         "  XDG_RUNTIME_DIR          Preferred directory for socket files\n"
-        "  XDG_STATE_HOME           Preferred directory for the I/O log\n"
-        ,
-        prog, prog, prog, prog, prog, SM_DEFAULT_BAUD
-#if SM_ENABLE_SINK_TCP
-        , SM_TCP_DEFAULT_PORT
-#endif
-#if SM_ENABLE_SINK_WS
-        , SM_WS_DEFAULT_PORT
-#endif
-        , prog, prog, prog, prog, prog
+        "  XDG_STATE_HOME           Preferred directory for the I/O log\n",
+        prog, prog, prog, prog, prog
     );
     fprintf(out,
         "\nCOMPANION TOOLS:\n"

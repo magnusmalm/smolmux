@@ -1,6 +1,7 @@
 #include "sinks/mcp.h"
 #include "sinks/mcp_internal.h"
 #include "sinks/mcp_schemas.h"
+#include "sinks/mcp_results.h"
 #include "broker.h"
 #include "logger.h"
 #include "mcp_explain.h"
@@ -155,48 +156,15 @@ static char *tool_serial_write(sm_mcp_sink_t *mcp, cJSON *args)
     return strdup("OK");
 }
 
-static char *tool_serial_port_status(sm_mcp_sink_t *mcp)
+static char *tool_serial_port_status(sm_mcp_sink_t *mcp, cJSON **sc)
 {
-    sm_broker_t *b = mcp->broker;
-
-    cJSON *status_json = cJSON_CreateObject();
-    b->link->get_status(b->link, status_json);
-
-    /* sm_strbuf — the old fixed char[4096] with off += snprintf(buf+off,
-     * sizeof-off, ...) shared the M15 underflow idiom: unusually long client
-     * names / pin JSON could push off past 4096 and write out of bounds. */
-    sm_strbuf_t sb;
-    sm_strbuf_init(&sb);
-    sm_strbuf_printf(&sb,
-        "Port: %s\nBaud: %d\nConnected: %s\nSuspended: %s\n",
-        b->port, b->baudrate,
-        b->link->read_fd(b->link) >= 0 ? "true" : "false",
-        b->suspended ? "true" : "false");
-
-    /* Pin states */
-    cJSON *pins = cJSON_GetObjectItemCaseSensitive(status_json, "pin_states");
-    if (pins) {
-        char *pin_str = cJSON_PrintUnformatted(pins);
-        sm_strbuf_printf(&sb, "Pin states: %s\n", pin_str ? pin_str : "{}");
-        free(pin_str);
-    }
-
-    /* Takeover */
-    if (b->takeover_client)
-        sm_strbuf_printf(&sb, "Takeover: %s\n", b->takeover_client->name);
-    else
-        sm_strbuf_printf(&sb, "Takeover: none\n");
-
-    /* Clients */
-    sm_strbuf_printf(&sb, "Clients:\n");
-    for (size_t i = 0; i < b->client_count; i++) {
-        sm_strbuf_printf(&sb, "  - %s (%s)\n",
-                         b->clients[i]->name, b->clients[i]->role);
-    }
-
-    cJSON_Delete(status_json);
-    char *out = sm_strbuf_steal(&sb);
-    return out ? out : strdup("(allocation failed)");
+    /* Same status_response a wire client gets, rendered by the shared
+     * mcp_results code, so both MCP surfaces report identical fields. */
+    cJSON *status = sm_broker_status_json(mcp->broker, NULL);
+    *sc = sm_mcp_port_status_structured(status, NULL);
+    char *out = sm_mcp_port_status_text(status, NULL);
+    cJSON_Delete(status);
+    return out;
 }
 
 static char *tool_serial_add_autoresponder(sm_mcp_sink_t *mcp, cJSON *args)
@@ -227,40 +195,13 @@ static char *tool_serial_add_autoresponder(sm_mcp_sink_t *mcp, cJSON *args)
     return strdup(result);
 }
 
-static char *tool_serial_boot_status(sm_mcp_sink_t *mcp)
+static char *tool_serial_boot_status(sm_mcp_sink_t *mcp, cJSON **sc)
 {
-    sm_broker_t *b = mcp->broker;
-
-    if (b->boot.stage_count == 0)
-        return strdup("No boot_stages defined in the device profile — "
-                      "boot progress tracking is not configured.");
-
-    int furthest = b->boot.furthest;
-    int total = (int)b->boot.stage_count;
-    int stalled = sm_boot_stalled(&b->boot, sm_now_realtime());
-    int done = sm_boot_terminal_reached(&b->boot);
-
-    int reached = 0;
-    for (size_t i = 0; i < b->boot.stage_count; i++)
-        if (b->boot.stages[i].reached) reached++;
-    const char *fname = (furthest >= 0 && (size_t)furthest < b->boot.stage_count)
-                        ? b->boot.stages[furthest].name : NULL;
-    const char *state = done ? "complete" : (stalled ? "STALLED"
-                      : (furthest < 0 ? "not started" : "in progress"));
-
-    sm_strbuf_t sb;
-    sm_strbuf_init(&sb);
-    sm_strbuf_printf(&sb, "Boot: %d/%d stages reached", reached, total);
-    if (fname) sm_strbuf_printf(&sb, " (furthest: %s)", fname);
-    sm_strbuf_printf(&sb, ", state: %s\n", state);
-    for (size_t i = 0; i < b->boot.stage_count; i++) {
-        sm_boot_stage_t *st = &b->boot.stages[i];
-        sm_strbuf_printf(&sb, "  [%c] %s%s\n", st->reached ? 'x' : ' ',
-                         st->name, (int)i == furthest ? "  <- furthest" : "");
-    }
-
-    char *out = sm_strbuf_steal(&sb);
-    return out ? out : strdup("(allocation failed)");
+    cJSON *status = sm_broker_status_json(mcp->broker, NULL);
+    *sc = sm_mcp_boot_status_structured(status);
+    char *out = sm_mcp_boot_status_text(status);
+    cJSON_Delete(status);
+    return out;
 }
 
 /* Completion context for a deferred break/SysRq tool call. The JSON-RPC
@@ -424,7 +365,7 @@ static char *tool_serial_wait_for(sm_mcp_sink_t *mcp, cJSON *args,
     return NULL;
 }
 
-static char *history_json_page(sm_broker_t *b, uint64_t since_seq, int max_bytes)
+static cJSON *history_json_page(sm_broker_t *b, uint64_t since_seq, int max_bytes)
 {
     if (max_bytes <= 0)
         max_bytes = (int)SM_MAX_HISTORY_RESPONSE_BYTES;
@@ -462,7 +403,7 @@ static char *history_json_page(sm_broker_t *b, uint64_t since_seq, int max_bytes
             cJSON_Delete(ch);
             cJSON_Delete(root);
             free(chunks);
-            return strdup("(allocation failed)");
+            return NULL;
         }
         for (size_t j = 0; j < len; j++) {
             uint8_t c = chunks[i].data[off + j];
@@ -480,15 +421,11 @@ static char *history_json_page(sm_broker_t *b, uint64_t since_seq, int max_bytes
             break;
     }
     free(chunks);
-
-    char *out = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!out)
-        return strdup("(allocation failed)");
-    return out;
+    return root;
 }
 
-static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
+static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args,
+                                       cJSON **sc)
 {
     sm_broker_t *b = mcp->broker;
 
@@ -496,7 +433,13 @@ static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
     if (cJSON_IsNumber(since_item)) {
         uint64_t since_seq = (uint64_t)since_item->valuedouble;
         int max_bytes = sm_json_get_int(args, "max_bytes", 0);
-        return history_json_page(b, since_seq, max_bytes);
+        cJSON *page = history_json_page(b, since_seq, max_bytes);
+        if (!page)
+            return strdup("(allocation failed)");
+        *sc = sm_mcp_history_page_structured(page);
+        char *out = sm_mcp_history_page_text(page);
+        cJSON_Delete(page);
+        return out;
     }
 
     double seconds = sm_json_get_double(args, "seconds", 0.0);
@@ -515,6 +458,7 @@ static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
 
     if (count == 0) {
         free(chunks);
+        *sc = sm_mcp_history_text_structured("");
         return strdup("(no output in history)");
     }
 
@@ -539,6 +483,7 @@ static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
     text[off] = '\0';
     free(chunks);
 
+    *sc = sm_mcp_history_text_structured(text);
     if (off == 0) {
         free(text);
         return strdup("(no output in history)");
@@ -546,48 +491,16 @@ static char *tool_serial_output_history(sm_mcp_sink_t *mcp, cJSON *args)
     return text;
 }
 
-static char *tool_serial_get_incidents(sm_mcp_sink_t *mcp, cJSON *args)
+static char *tool_serial_get_incidents(sm_mcp_sink_t *mcp, cJSON *args,
+                                      cJSON **sc)
 {
-    sm_broker_t *b = mcp->broker;
     double seconds = sm_json_get_double(args, "seconds", 0.0);
     double since_ts = seconds > 0 ? sm_now_realtime() - seconds : 0.0;
-
-    size_t count;
-    const sm_anomaly_incident_t *incidents =
-        sm_anomaly_get_incidents(&b->anomaly, &count);
-
-    /* Count matching incidents */
-    size_t matching = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (since_ts > 0 && incidents[i].timestamp < since_ts) continue;
-        matching++;
-    }
-
-    if (matching == 0) return strdup("No anomalies detected.");
-
-    /* Build report with sm_strbuf — a fixed matching*512 budget underflowed
-     * once one incident's match_text (256B) + pre_context (1024B) pushed the
-     * accumulated snprintf return values past the cap, corrupting the heap. */
-    sm_strbuf_t sb;
-    sm_strbuf_init(&sb);
-
-    int num = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (since_ts > 0 && incidents[i].timestamp < since_ts) continue;
-        num++;
-        sm_strbuf_printf(&sb,
-            "### Incident %d: %s [%s]\nMatch: %s\n",
-            num, incidents[i].pattern_name, incidents[i].severity,
-            incidents[i].match_text);
-        if (incidents[i].pre_context[0]) {
-            sm_strbuf_printf(&sb,
-                "Pre-context:\n```\n%s\n```\n", incidents[i].pre_context);
-        }
-        sm_strbuf_printf(&sb, "\n");
-    }
-
-    char *out = sm_strbuf_steal(&sb);
-    return out ? out : strdup("(allocation failed)");
+    cJSON *incidents = sm_broker_incidents_json(mcp->broker, since_ts);
+    *sc = sm_mcp_incidents_structured(incidents);
+    char *out = sm_mcp_incidents_text(incidents);
+    cJSON_Delete(incidents);
+    return out;
 }
 
 static char *tool_serial_add_watchdog(sm_mcp_sink_t *mcp, cJSON *args)
@@ -726,17 +639,18 @@ static char *tool_serial_generate_report(sm_mcp_sink_t *mcp)
     return out ? out : strdup("(allocation failed)");
 }
 
-static char *tool_serial_list_ports(void)
+static char *tool_serial_list_ports(cJSON **sc)
 {
-    return sm_format_serial_ports_text();
+    return sm_mcp_list_ports(sc);
 }
 
 /* --- Tool dispatcher --- */
 
 char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
-                         cJSON *jsonrpc_id)
+                         cJSON *jsonrpc_id, cJSON **structured)
 {
     char *result = NULL;
+    *structured = NULL;
     if (sm_mcp_tool_is_mutate(name) && !sm_mcp_mutate_enabled())
         return strdup("[ERROR] mutate tools disabled (set SMOLMUX_MCP_MUTATE=1)");
     /* In-process --mcp bypasses the Unix-client takeover check. Keep the
@@ -750,9 +664,9 @@ char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
     else if (strcmp(name, "serial_write") == 0)
         result = tool_serial_write(mcp, args);
     else if (strcmp(name, "serial_port_status") == 0)
-        result = tool_serial_port_status(mcp);
+        result = tool_serial_port_status(mcp, structured);
     else if (strcmp(name, "serial_boot_status") == 0)
-        result = tool_serial_boot_status(mcp);
+        result = tool_serial_boot_status(mcp, structured);
     else if (strcmp(name, "serial_add_autoresponder") == 0)
         result = tool_serial_add_autoresponder(mcp, args);
     else if (strcmp(name, "serial_pin_control") == 0)
@@ -766,9 +680,9 @@ char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
     else if (strcmp(name, "serial_wait_for") == 0)
         result = tool_serial_wait_for(mcp, args, jsonrpc_id);
     else if (strcmp(name, "serial_output_history") == 0)
-        result = tool_serial_output_history(mcp, args);
+        result = tool_serial_output_history(mcp, args, structured);
     else if (strcmp(name, "serial_get_incidents") == 0)
-        result = tool_serial_get_incidents(mcp, args);
+        result = tool_serial_get_incidents(mcp, args, structured);
     else if (strcmp(name, "serial_add_watchdog") == 0)
         result = tool_serial_add_watchdog(mcp, args);
     else if (strcmp(name, "serial_monitor") == 0)
@@ -776,7 +690,7 @@ char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
     else if (strcmp(name, "serial_generate_report") == 0)
         result = tool_serial_generate_report(mcp);
     else if (strcmp(name, "serial_list_ports") == 0)
-        result = tool_serial_list_ports();
+        result = tool_serial_list_ports(structured);
     else {
         char err[256];
         snprintf(err, sizeof(err), "[ERROR] unknown tool: %s", name);

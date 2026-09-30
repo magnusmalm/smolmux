@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Version is 0.5.0.
+- Five read-only serial MCP tools declare an `outputSchema` and return
+  `structuredContent` next to the text: `serial_port_status`,
+  `serial_boot_status`, `serial_get_incidents`, `serial_list_ports` and
+  `serial_output_history` (`mode: "cursor"` with `since_seq`, `"text"`
+  without). Agents can read fields instead of parsing prose. The text block
+  is unchanged in `smolmux-mcp`.
+- Tool errors carry `isError: true` in `smolmux-mcp` and the broker's
+  `--mcp` sink. A structured tool that fails returns no `structuredContent`.
+- Every serial tool description says when to use it and which sibling to
+  use instead (`serial_read` vs `serial_output_history` vs `serial_monitor`
+  vs `serial_wait_for`, and so on).
+- The `--mcp` sink's `serial_port_status` now reports the same fields as
+  `smolmux-mcp` (identity strength and paths, link age, bytes since link up,
+  log path). Both now build their answer from the broker's `status_response`.
+- `smolmux-mcp` `serial_get_incidents` reports a broker error instead of
+  "No anomalies detected.".
+- `smolmux-gdb-mcp` tool descriptions say when to use each tool and which
+  to use instead (for example `gdb_read_memory` vs `gdb_evaluate` vs
+  `gdb_read_peripheral`, `gdb_wait_stop` vs `gdb_interrupt`).
+- `status_response` no longer carries duplicate keys. The link's status
+  fields are merged only where the broker has not set that key, and the
+  complete link view is under a new `link` object. Before, a serial-tcp
+  broker sent `port` twice (the device string, then the TCP port number),
+  and parsers that keep the last duplicate saw a number.
+- `smolmux-monitor` prints "Connected to ..." only after the broker's
+  `welcome`. A refused hello (wrong or missing token) prints the broker's
+  reason and exits 1 instead of announcing a connection and then
+  disconnecting.
+- README lists the build prerequisites, including Python `kconfiglib`, which
+  the configure step needs.
+- The build is free of compiler warnings again. The WebSocket frame length
+  check can no longer wrap. A port path longer than 127 bytes no longer gets
+  a truncated I/O log file name. Help texts are split under the C11
+  string-literal limit (output unchanged).
+- README shows the one-port-three-clients demo GIF. The daily-driver TCP
+  monitor example passes the auth token.
+
 ## 0.4.0
 
 - Version is 0.4.0.

@@ -7,6 +7,16 @@ GDB bring-up on Linux.
 
 > **New here?** [**docs/START-HERE.md**](docs/START-HERE.md) is a one-screen router - find your intent (run it, bring up a new board with an AI agent, understand the architecture, hack on the code) and it points you to the right doc.
 
+## One port, three clients
+
+![smolmux on an ESP32-S3: smolmux-monitor in the top pane; in the bottom pane a script sends a command and waits for the reboot, then esptool borrows the port through with-port](assets/demo-one-port-three-clients.gif)
+
+One broker holds an ESP32-S3's UART. The monitor (top) watches it live. In the
+bottom pane a script sends `temp` and gets the reply on the same wire, resets
+the board and waits for its prompt, then esptool reads the flash ID through
+`with-port`: the broker suspends, esptool runs, the broker resumes, and the
+monitor never loses the port.
+
 ## Example: probe an unknown board
 
 One broker holds SWD; `smolmux-gdb-mcp` runs **`probe_unknown_board`**. On a
@@ -48,6 +58,18 @@ Day-to-day serial (multi-client, U-Boot break-in, flasher handoff):
 - **Build-time feature selection** - Kconfig-based; UART-only builds carry no GDB/TCP/WebSocket code
 
 ## Quick start
+
+Prerequisites: Linux, a C11 compiler, CMake 3.21+, Python 3 with
+[kconfiglib](https://pypi.org/project/kconfiglib/) (the configure step
+generates the feature header with it). `libpcre2-8` is optional; without it
+regex matching falls back to POSIX.
+
+```bash
+# Debian/Ubuntu
+sudo apt install build-essential cmake python3 python3-pip libpcre2-dev
+pip install kconfiglib   # or in a venv; Debian's system Python may need
+                         # --break-system-packages
+```
 
 ```bash
 cmake -B build && cmake --build build -j$(nproc)

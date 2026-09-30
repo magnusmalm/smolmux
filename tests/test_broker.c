@@ -1938,7 +1938,7 @@ static void test_text_log_grows_after_reconnect(void)
 static void test_no_io_log_and_text_log_path(void)
 {
     const char *tmp = getenv("TMPDIR");
-    char tdir[256], sock[256];
+    char tdir[256], sock[sizeof(tdir) + 16];
     snprintf(tdir, sizeof(tdir), "%s/smolmux-a49-%d",
              tmp && tmp[0] ? tmp : "/tmp", (int)getpid());
     mkdir(tdir, 0700);

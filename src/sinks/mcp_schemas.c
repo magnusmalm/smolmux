@@ -2,6 +2,7 @@
  * standalone smolmux-mcp binary (mcp_client.c). Extracted from the two
  * previously-duplicated tool-list builders so they cannot drift. */
 #include "sinks/mcp_schemas.h"
+#include "sinks/mcp_results.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,9 @@ static cJSON *make_tool_ex(const char *name, const char *desc, cJSON *input_sche
     cJSON_AddStringToObject(t, "name", name);
     cJSON_AddStringToObject(t, "description", desc);
     cJSON_AddItemToObject(t, "inputSchema", input_schema);
+    cJSON *output_schema = sm_mcp_output_schema(name);
+    if (output_schema)
+        cJSON_AddItemToObject(t, "outputSchema", output_schema);
     cJSON *ann = cJSON_CreateObject();
     if (title)
         cJSON_AddStringToObject(ann, "title", title);
@@ -133,7 +137,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("command"));
         cJSON_AddItemToObject(s, "required", req);
         cJSON_AddItemToArray(tools, make_tool("serial_send_command",
-            "Send a command to the serial device and wait for a response.", s));
+            "Send a command line and wait for its response (up to "
+            "expect_pattern or the profile prompt). Use for request/response "
+            "shells; use serial_write for raw bytes with no wait.", s));
     }
 
     /* serial_read */
@@ -141,8 +147,10 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool_ro("serial_read",
-            "Read buffered serial output without sending anything "
-            "(session drain; prefer history for lossless capture).", s));
+            "Drain the output this MCP session buffered since the last "
+            "read, without sending. Quick look after your own command; lossy "
+            "across turns. Lossless capture: serial_output_history with "
+            "since_seq. Waiting for known text: serial_wait_for.", s));
     }
 
     /* serial_write */
@@ -155,7 +163,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("data"));
         cJSON_AddItemToObject(s, "required", req);
         cJSON_AddItemToArray(tools, make_tool("serial_write",
-            "Write raw data to the serial port without waiting for a response.", s));
+            "Write raw data to the serial port without waiting for a response. "
+            "Use for keystrokes and binary; use serial_send_command when you "
+            "need the reply.", s));
     }
 
     /* serial_port_status */
@@ -163,7 +173,10 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool_ro("serial_port_status",
-            "Get the current status of the serial port and connected clients.", s));
+            "Check the link before sending, or when output looks wrong: port, "
+            "baud, connected/suspended, by-id identity strength, pins, who "
+            "holds write control, and connected clients. Boot progress: "
+            "serial_boot_status. Crashes: serial_get_incidents.", s));
     }
 
     /* serial_boot_status */
@@ -173,7 +186,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(tools, make_tool_ro("serial_boot_status",
             "Report cold-boot progress: which boot stages the device has reached, "
             "the furthest stage, and whether the boot has stalled. Requires the "
-            "device profile to declare boot_stages; otherwise reports none.", s));
+            "device profile to declare boot_stages; otherwise reports none. "
+            "Use after a reset or power cycle; if stalled, check "
+            "serial_get_incidents.", s));
     }
 
     /* serial_add_autoresponder */
@@ -220,7 +235,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("action"));
         cJSON_AddItemToObject(s, "required", req);
         cJSON_AddItemToArray(tools, make_tool_destr("serial_pin_control",
-            "Control serial port pins or send a break signal.", s));
+            "Control DTR/RTS or send a break. DTR/RTS often drive reset and "
+            "boot-mode lines (ESP32, many dev boards), so a pulse can reset "
+            "the target.", s));
     }
 
     /* serial_sysrq */
@@ -237,7 +254,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("key"));
         cJSON_AddItemToObject(s, "required", req);
         cJSON_AddItemToArray(tools, make_tool_destr("serial_sysrq",
-            "Send a Linux SysRq command (BREAK + key) to the serial device.", s));
+            "Send a Linux SysRq command (BREAK + key) to the serial device. "
+            "Use when a Linux target hangs: t dumps tasks, w blocked tasks; "
+            "b reboots at once.", s));
     }
 
     /* serial_suspend */
@@ -245,7 +264,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool_destr("serial_suspend",
-            "Suspend the serial port so external tools can access the device.", s));
+            "Close the serial port so an external tool (flasher, esptool, "
+            "OpenOCD) can open it; clients stay connected. Call "
+            "serial_resume afterwards.", s));
     }
 
     /* serial_resume */
@@ -253,7 +274,8 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool("serial_resume",
-            "Resume the serial port after a suspend.", s));
+            "Reopen the serial port after serial_suspend, once the external "
+            "tool has exited.", s));
     }
 
     /* serial_wait_for */
@@ -269,8 +291,11 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("pattern"));
         cJSON_AddItemToObject(s, "required", req);
         cJSON_AddItemToArray(tools, make_tool_ro("serial_wait_for",
-            "Wait for a regex in serial output without sending. Works for "
-            "observers. Ends early on critical anomaly (ABORTED).", s));
+            "Wait for a regex in serial output without sending. Use when you "
+            "know the text to expect (a prompt, login:, a log line). Works "
+            "for observers. Ends early on a critical anomaly ([ABORTED "
+            "anomaly:...]). Open-ended listening: serial_monitor. Output that "
+            "already arrived: serial_output_history.", s));
     }
 
     /* serial_output_history */
@@ -288,8 +313,11 @@ cJSON *sm_mcp_build_tools_list(void)
             "With since_seq: max raw bytes in this page (default broker cap).");
         cJSON_AddItemToObject(s, "properties", props);
         cJSON_AddItemToArray(tools, make_tool_ro("serial_output_history",
-            "Non-destructive history. With since_seq: JSON cursor page. "
-            "Without: prose by time/bytes. serial_read is drain-only.", s));
+            "Read past output from the broker's shared history without "
+            "consuming it. For anything you must not miss, page with since_seq "
+            "(start at 0; pass the returned cursor back; check dropped and "
+            "has_more). Without since_seq: text by seconds or last_bytes. "
+            "serial_read is drain-only.", s));
     }
 
     /* serial_get_incidents */
@@ -300,7 +328,11 @@ cJSON *sm_mcp_build_tools_list(void)
             "If > 0, only return incidents from the last N seconds.");
         cJSON_AddItemToObject(s, "properties", props);
         cJSON_AddItemToArray(tools, make_tool_ro("serial_get_incidents",
-            "Get detected anomalies/crashes from the broker.", s));
+            "List anomalies the broker detected in output (kernel panic, "
+            "oops, hard fault, assert, watchdog, brownout, ESP resets, plus "
+            "profile patterns) with the match and pre-context. Use when a "
+            "boot stalls, a wait aborts, or output looks like a crash; pair "
+            "with serial_output_history for the surrounding log.", s));
     }
 
     /* serial_add_watchdog */
@@ -318,7 +350,8 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(req, cJSON_CreateString("pattern"));
         cJSON_AddItemToObject(s, "required", req);
         cJSON_AddItemToArray(tools, make_tool("serial_add_watchdog",
-            "Add a custom anomaly detection pattern.", s));
+            "Add a custom anomaly detection pattern; matches then appear in "
+            "serial_get_incidents and can abort serial_wait_for.", s));
     }
 
     /* serial_monitor */
@@ -329,7 +362,10 @@ cJSON *sm_mcp_build_tools_list(void)
             "How long to monitor (max 300 seconds, default 30).");
         cJSON_AddItemToObject(s, "properties", props);
         cJSON_AddItemToArray(tools, make_tool_ro("serial_monitor",
-            "Monitor serial output for a duration, returning output and anomalies.", s));
+            "Listen for a fixed time (default 30 s, max 300 s) and return "
+            "what the device printed plus anomalies in that window. Use when "
+            "you do not know what to expect; when you do, serial_wait_for "
+            "returns as soon as it matches.", s));
     }
 
     /* serial_generate_report */
@@ -337,7 +373,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool_ro("serial_generate_report",
-            "Generate a status report for the serial device.", s));
+            "Markdown summary of device profile, port status and incidents. "
+            "Use to open a debugging session or hand a human a snapshot; for "
+            "one fact, call the single-purpose tool.", s));
     }
 
     /* serial_list_ports */
@@ -345,8 +383,10 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON *s = schema_object();
         cJSON_AddItemToObject(s, "properties", cJSON_CreateObject());
         cJSON_AddItemToArray(tools, make_tool_ro("serial_list_ports",
-            "List serial ports with by-id and USB VID/PID when available. "
-            "Bridge chips name the adapter, not the MCU.", s));
+            "List serial ports on this host with by-id paths and USB VID/PID "
+            "(works without a broker). Use to pick a port before starting a "
+            "broker, or when output is garbage (wrong port). Bridge chips "
+            "name the adapter, not the MCU.", s));
     }
 
     return tools;

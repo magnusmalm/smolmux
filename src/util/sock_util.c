@@ -997,6 +997,12 @@ char *sm_format_serial_ports_text(void)
 {
     sm_serial_port_info_t infos[SM_SERIAL_PORT_INFO_MAX];
     size_t n = sm_list_serial_ports_info(infos, SM_SERIAL_PORT_INFO_MAX);
+    return sm_format_serial_ports_info_text(infos, n);
+}
+
+char *sm_format_serial_ports_info_text(const sm_serial_port_info_t *infos,
+                                       size_t n)
+{
     if (n == 0)
         return strdup("No serial ports found.");
 
@@ -1006,7 +1012,7 @@ char *sm_format_serial_ports_text(void)
         return strdup("(allocation failed)");
     size_t off = 0;
     for (size_t i = 0; i < n; i++) {
-        sm_serial_port_info_t *p = &infos[i];
+        const sm_serial_port_info_t *p = &infos[i];
         int k = snprintf(buf + off, cap - off, "%s", p->path);
         if (k < 0 || (size_t)k >= cap - off)
             break;

@@ -172,7 +172,8 @@ static const char *find_smolmux_cli(char *buf, size_t len)
     if (!slash)
         return NULL;
     *slash = '\0';
-    snprintf(buf, len, "%s/smolmux-cli", exe);
+    if ((size_t)snprintf(buf, len, "%s/smolmux-cli", exe) >= len)
+        return NULL;
     if (access(buf, X_OK) != 0)
         return NULL;
     return buf;
@@ -189,7 +190,8 @@ static const char *find_smolmux(char *buf, size_t len)
     if (!slash)
         return NULL;
     *slash = '\0';
-    snprintf(buf, len, "%s/smolmux", exe);
+    if ((size_t)snprintf(buf, len, "%s/smolmux", exe) >= len)
+        return NULL;
     if (access(buf, X_OK) != 0)
         return NULL;
     return buf;

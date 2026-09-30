@@ -5,6 +5,7 @@
  * through the broker to the fake device and back. The binary path comes in
  * as argv[1] (CMake passes $<TARGET_FILE:smolmux-mcp>). */
 #include "test_main.h"
+#include "mcp_schema_check.h"
 #include "broker.h"
 #include "links/uart.h"
 #include "protocol.h"
@@ -348,6 +349,13 @@ static void test_mcp_auth_rejection_reaches_agent(void)
             ASSERT(strstr(text, "Start a broker first") == NULL,
                    "not the generic no-broker guidance");
         }
+        /* A structured tool that failed must say so, and must not carry
+         * structuredContent it cannot fill. */
+        cJSON *result = cJSON_GetObjectItem(resp, "result");
+        ASSERT(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")),
+               "rejected call is flagged isError");
+        ASSERT(cJSON_GetObjectItem(result, "structuredContent") == NULL,
+               "no structuredContent on an error");
         cJSON_Delete(resp);
     }
 
@@ -686,6 +694,100 @@ static void test_mcp_mutate_off_e2e(void)
     teardown(&fx);
 }
 
+/* Each structured tool's structuredContent must match the outputSchema the
+ * binary itself listed; checked end to end through the real smolmux-mcp. */
+static cJSON *e2e_structured(fixture_t *fx, const cJSON *tools, int id,
+                             const char *name, const char *args_json)
+{
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"%s\",\"arguments\":%s}}",
+             id, name, args_json);
+    cJSON *resp = rpc_call(fx, id, req, 400);
+    ASSERT_NOT_NULL(resp);
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    ASSERT(!cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")),
+           "structured tool result is not an error");
+    cJSON *sc = cJSON_GetObjectItem(result, "structuredContent");
+    ASSERT(cJSON_IsObject(sc), "structuredContent present");
+    const cJSON *schema = tools_output_schema(tools, name);
+    ASSERT_NOT_NULL(schema);
+    char why[256] = "";
+    int rc = sc && schema ? schema_check(sc, schema, name, why, sizeof(why)) : -1;
+    if (rc != 0)
+        fprintf(stderr, "  schema mismatch: %s\n", why);
+    ASSERT_INT_EQ(rc, 0);
+    return resp;
+}
+
+static void test_mcp_structured_output_e2e(void)
+{
+    fixture_t fx;
+    setup(&fx);
+    sm_boot_add_stage(&fx.broker.boot, "uboot", "U-Boot 20");
+    sm_boot_add_stage(&fx.broker.boot, "login", "login:");
+
+    cJSON *resp = rpc_call(&fx, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        200);
+    cJSON_Delete(resp);
+    cJSON *list = rpc_call(&fx, 2,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}", 500);
+    ASSERT_NOT_NULL(list);
+    const cJSON *tools = cJSON_GetObjectItem(cJSON_GetObjectItem(list, "result"),
+                                             "tools");
+    ASSERT_INT_EQ(tools_output_schema_count(tools), 5);
+
+    const char *dev_out = "U-Boot 2024.01\r\nKernel panic - not syncing\r\n";
+    write(fx.master, dev_out, strlen(dev_out));
+    usleep(200000);
+
+    resp = e2e_structured(&fx, tools, 3, "serial_port_status", "{}");
+    cJSON *sc = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"),
+                                    "structuredContent");
+    ASSERT_INT_EQ(sm_json_get_int(sc, "baud", 0), 115200);
+    cJSON *clients = cJSON_GetObjectItem(sc, "clients");
+    ASSERT(cJSON_GetArraySize(clients) >= 1, "sees its own client entry");
+    cJSON_Delete(resp);
+
+    resp = e2e_structured(&fx, tools, 4, "serial_boot_status", "{}");
+    sc = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"),
+                             "structuredContent");
+    ASSERT_STR_EQ(sm_json_get_string(sc, "furthest"), "uboot");
+    ASSERT_STR_EQ(sm_json_get_string(sc, "state"), "in progress");
+    cJSON_Delete(resp);
+
+    resp = e2e_structured(&fx, tools, 5, "serial_get_incidents", "{}");
+    sc = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"),
+                             "structuredContent");
+    ASSERT_INT_EQ(sm_json_get_int(sc, "count", -1), 1);
+    cJSON_Delete(resp);
+
+    resp = e2e_structured(&fx, tools, 6, "serial_list_ports", "{}");
+    cJSON_Delete(resp);
+
+    resp = e2e_structured(&fx, tools, 7, "serial_output_history",
+                          "{\"since_seq\":0}");
+    sc = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"),
+                             "structuredContent");
+    ASSERT_STR_EQ(sm_json_get_string(sc, "mode"), "cursor");
+    ASSERT_INT_EQ(sm_json_get_int(sc, "cursor", -1), (int)strlen(dev_out));
+    cJSON_Delete(resp);
+
+    resp = e2e_structured(&fx, tools, 8, "serial_output_history",
+                          "{\"last_bytes\":4096}");
+    sc = cJSON_GetObjectItem(cJSON_GetObjectItem(resp, "result"),
+                             "structuredContent");
+    ASSERT_STR_EQ(sm_json_get_string(sc, "mode"), "text");
+    const char *ht = sm_json_get_string(sc, "text");
+    ASSERT(ht && strstr(ht, "Kernel panic") != NULL, "text mode has output");
+    cJSON_Delete(resp);
+
+    cJSON_Delete(list);
+    teardown(&fx);
+}
+
 int main(int argc, char *argv[])
 {
     printf("test_mcp_client\n");
@@ -700,6 +802,7 @@ int main(int argc, char *argv[])
 
     RUN_TEST(test_mcp_e2e_smoke);
     RUN_TEST(test_mcp_mutate_off_e2e);
+    RUN_TEST(test_mcp_structured_output_e2e);
     RUN_TEST(test_conn_wait_drains_data_before_hangup);
     RUN_TEST(test_conn_pump_drains_data_before_hangup);
     RUN_TEST(test_conn_event_cb_link_down);

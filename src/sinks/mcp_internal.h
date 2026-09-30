@@ -50,7 +50,8 @@ char *mcp_drain_output(sm_mcp_sink_t *mcp);
 /* Tool dispatch (defined in mcp_tools.c). The tools/list schema builder now
  * lives in sinks/mcp_schemas.c (sm_mcp_build_tools_list), shared with the
  * standalone smolmux-mcp binary. */
+/* *structured receives the tool's structuredContent (or NULL). */
 char  *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
-                          cJSON *jsonrpc_id);
+                          cJSON *jsonrpc_id, cJSON **structured);
 
 #endif /* SM_MCP_INTERNAL_H */

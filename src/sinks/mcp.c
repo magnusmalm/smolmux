@@ -4,6 +4,7 @@
 #include "logger.h"
 #include "util/str.h"
 #include "sinks/mcp_schemas.h"
+#include "sinks/mcp_results.h"
 #include "mcp_instructions.h"
 #include "mcp_explain.h"
 #include "cJSON.h"
@@ -55,14 +56,7 @@ void mcp_send_result(cJSON *id, cJSON *result)
 
 void mcp_send_tool_result(cJSON *id, const char *text)
 {
-    cJSON *result = cJSON_CreateObject();
-    cJSON *content = cJSON_CreateArray();
-    cJSON *item = cJSON_CreateObject();
-    cJSON_AddStringToObject(item, "type", "text");
-    cJSON_AddStringToObject(item, "text", text);
-    cJSON_AddItemToArray(content, item);
-    cJSON_AddItemToObject(result, "content", content);
-    mcp_send_result(id, result);
+    mcp_send_result(id, sm_mcp_tool_call_result(NULL, text, NULL));
 }
 
 static void mcp_send_error(cJSON *id, int code, const char *message)
@@ -261,10 +255,13 @@ static void handle_tools_call(sm_mcp_sink_t *mcp, cJSON *id, cJSON *params)
         args = args_tmp;
     }
 
-    char *result = mcp_tool_dispatch(mcp, name, args, id);
+    cJSON *structured = NULL;
+    char *result = mcp_tool_dispatch(mcp, name, args, id, &structured);
     if (result) {
-        mcp_send_tool_result(id, result);
+        mcp_send_result(id, sm_mcp_tool_call_result(name, result, structured));
         free(result);
+    } else {
+        cJSON_Delete(structured);
     }
     /* If NULL returned, response will be sent when pending call resolves */
     cJSON_Delete(args_tmp);

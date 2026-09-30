@@ -26,6 +26,9 @@ size_t sm_list_serial_ports_info(sm_serial_port_info_t *out, size_t max);
 
 /* Human-readable multi-line listing (malloc'd). */
 char *sm_format_serial_ports_text(void);
+/* Same listing for ports already scanned (n may be 0). */
+char *sm_format_serial_ports_info_text(const sm_serial_port_info_t *infos,
+                                       size_t n);
 
 /* 1 if path is a /dev/serial/by-id/... node whose basename has no long
  * USB serial run (class-only CH340-style names). 0 otherwise. */

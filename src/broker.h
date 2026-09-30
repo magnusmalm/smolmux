@@ -142,6 +142,12 @@ void sm_broker_stop(sm_broker_t *b);
 void sm_broker_destroy(sm_broker_t *b);
 void sm_broker_add_sink(sm_broker_t *b, sm_sink_t *sink);
 void sm_broker_broadcast_msg(sm_broker_t *b, cJSON *msg);
+/* The status_response a wire client gets (clients, identity, pins, boot).
+ * Also used by the in-broker MCP sink. Caller owns the result. */
+cJSON *sm_broker_status_json(sm_broker_t *b, const char *id);
+/* Incident array as in incidents_response; since_ts <= 0 means all.
+ * Caller owns the result. */
+cJSON *sm_broker_incidents_json(sm_broker_t *b, double since_ts);
 sm_client_t *sm_broker_register_client(sm_broker_t *b, int fd);
 /* Hand an already-accepted fd to the broker thread (thread-safe; used by sinks
  * that accept on their own thread). requires_auth must be 1 for any

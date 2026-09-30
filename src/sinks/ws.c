@@ -131,7 +131,7 @@ static size_t ws_encode_frame(uint8_t *out, size_t out_cap,
     else if (len < 65536) hdr = 4;
     else                 hdr = 10;
 
-    if (hdr + len > out_cap) return 0;
+    if (len > out_cap || hdr > out_cap - len) return 0;
 
     out[0] = (uint8_t)(0x80 | (opcode & 0x0F)); /* FIN + opcode */
     if (len < 126) {

@@ -49,7 +49,8 @@ static const char *find_bin(char *buf, size_t len, const char *name)
     if (!slash)
         return NULL;
     *slash = '\0';
-    snprintf(buf, len, "%s/%s", exe, name);
+    if ((size_t)snprintf(buf, len, "%s/%s", exe, name) >= len)
+        return NULL;
     return access(buf, X_OK) == 0 ? buf : NULL;
 }
 

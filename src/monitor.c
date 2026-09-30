@@ -47,6 +47,7 @@
 #define MON_READ_BUF_INIT SM_MONITOR_READ_BUF_SIZE
 #define MON_READ_BUF_MAX  (4 * 1024 * 1024)
 #define MON_EVENT_HOLD_S  0.2
+#define MON_WELCOME_TIMEOUT_S 5.0  /* broker answers hello at once; 5 s is generous */
 
 static struct {
     int sock_fd;
@@ -67,6 +68,7 @@ static struct {
     char *read_buf;
     size_t read_len;
     size_t read_cap;
+    int welcomed;            /* broker answered hello with welcome */
 } mon;
 
 /* --- Terminal raw mode --- */
@@ -336,6 +338,7 @@ static void dispatch_message(sm_msg_t *msg)
             const char *r = sm_json_get_string(msg->root, "your_role");
             if (r)
                 snprintf(mon.role, sizeof(mon.role), "%s", r);
+            mon.welcomed = 1;
         }
         break;
     default:
@@ -768,8 +771,33 @@ int main(int argc, char *argv[])
     /* Send hello */
     send_msg(sm_msg_hello(mon.name, mon.role));
 
-    /* Read welcome */
-    handle_broker_data();
+    /* Wait for welcome before announcing the connection. A broker that
+     * refuses the hello (wrong or missing token) sends an error and hangs
+     * up; printing "Connected" on the TCP connect alone claimed a session
+     * that never existed (todo #18). */
+    double welcome_deadline = sm_now_monotonic() + MON_WELCOME_TIMEOUT_S;
+    while (mon.running && !mon.welcomed) {
+        double left = welcome_deadline - sm_now_monotonic();
+        if (left <= 0)
+            break;
+        struct pollfd wp = { .fd = mon.sock_fd, .events = POLLIN };
+        int wr = poll(&wp, 1, (int)(left * 1000.0) + 1);
+        if (wr < 0 && errno == EINTR)
+            continue;
+        if (wr <= 0)
+            break;
+        handle_broker_data();
+    }
+    if (!mon.welcomed) {
+        if (mon.running)
+            fprintf(stderr, "Error: no welcome from %s within %.0f s\n",
+                    connect_desc, MON_WELCOME_TIMEOUT_S);
+        else
+            fprintf(stderr, "Error: %s did not accept the connection\n",
+                    connect_desc);
+        close(mon.sock_fd);
+        return 1;
+    }
 
     /* Print banner */
     char key_label[16];

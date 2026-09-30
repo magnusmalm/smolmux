@@ -1648,7 +1648,8 @@ static void usage(FILE *out, const char *prog)
         "\n"
         "  boards                  Group active brokers by --board (a board's wires)\n"
         "                          (no broker needed; use --json for agents)\n"
-        "\n"
+        "\n");
+    fprintf(out,
         "  board up <manifest>     Start every wire in a *.board.json manifest\n"
         "                          (--identity-ok: bind a WEAK by-id name)\n"
         "    --foreground, -F      Tie the wires' lifetime to this run (Ctrl-C stops all)\n"
@@ -1698,7 +1699,10 @@ static void usage(FILE *out, const char *prog)
         "                          Interactive TUI is smolmux-monitor.\n"
         "\n"
         "  report                  Generate a status report\n"
-        "\n"
+        "\n");
+    /* Split: one literal would pass the 4095-byte C11 limit that
+     * -Woverlength-strings enforces. */
+    fprintf(out,
         "EXAMPLES:\n"
         "  %s send \"uname -a\"\n"
         "  %s send --expect 'login:' --timeout 10000 \"\"\n"
@@ -1897,8 +1901,9 @@ static void resolve_broker_path(char *out, size_t len)
         char *slash = strrchr(exe, '/');
         if (slash) {
             *slash = '\0';
-            snprintf(out, len, "%s/smolmux", exe);
-            if (access(out, X_OK) == 0) return;
+            if ((size_t)snprintf(out, len, "%s/smolmux", exe) < len &&
+                access(out, X_OK) == 0)
+                return;
         }
     }
     snprintf(out, len, "smolmux");   /* fall back to PATH via execvp */

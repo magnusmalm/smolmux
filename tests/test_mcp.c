@@ -1,4 +1,5 @@
 #include "test_main.h"
+#include "mcp_schema_check.h"
 #include "broker.h"
 #include "links/uart.h"
 #include "protocol.h"
@@ -717,6 +718,8 @@ static void test_mcp_status_fat_names(void)
     for (size_t i = 0; i < n; i++) {
         sm_client_t *c = calloc(1, sizeof(*c));
         ASSERT_NOT_NULL(c);
+        if (!c)
+            return;
         c->fd = -1;
         snprintf(c->name, sizeof(c->name),
                  "FAT%02d-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", (int)i);
@@ -904,6 +907,8 @@ static void test_serial_write_mutate_off_refused(void)
     const char *text = sm_json_get_string(first, "text");
     ASSERT(text && strstr(text, "mutate tools disabled") != NULL,
            "dispatch refuses serial_write when mutate off");
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")),
+           "refusal is flagged isError");
     cJSON_Delete(resp);
 
     char dev[64];
@@ -915,6 +920,147 @@ static void test_serial_write_mutate_off_refused(void)
 
     teardown(&ctx);
     setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+}
+
+/* Call one tool and return the parsed JSON-RPC response (caller frees). */
+static cJSON *call_tool(test_ctx_t *ctx, int id, const char *name,
+                        cJSON *args)
+{
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "name", name);
+    cJSON_AddItemToObject(params, "arguments",
+                          args ? args : cJSON_CreateObject());
+    send_jsonrpc(ctx->mcp_stdin_write, jsonrpc_request(id, "tools/call", params));
+    usleep(100000);
+    static char buf[65536];
+    if (read_line(ctx->mcp_stdout_read, buf, sizeof(buf)) <= 0)
+        return NULL;
+    return cJSON_Parse(buf);
+}
+
+/* A structured result must carry structuredContent that matches the
+ * outputSchema this same server listed, and must not be an error. */
+static cJSON *assert_structured(cJSON *tools, const char *name, cJSON *resp)
+{
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(resp, "result");
+    ASSERT(!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(result, "isError")),
+           "structured tool result is not an error");
+    cJSON *sc = cJSON_GetObjectItemCaseSensitive(result, "structuredContent");
+    ASSERT(cJSON_IsObject(sc), "structuredContent present");
+    const cJSON *schema = tools_output_schema(tools, name);
+    ASSERT_NOT_NULL(schema);
+    char why[256] = "";
+    int rc = sc && schema ? schema_check(sc, schema, name, why, sizeof(why)) : -1;
+    if (rc != 0)
+        fprintf(stderr, "  schema mismatch: %s\n", why);
+    ASSERT_INT_EQ(rc, 0);
+    return sc;
+}
+
+static void test_structured_output(void)
+{
+    test_ctx_t ctx;
+    setup(&ctx);
+    sm_boot_add_stage(&ctx.broker.boot, "uboot", "U-Boot 20");
+    sm_boot_add_stage(&ctx.broker.boot, "login", "login:");
+
+    cJSON *init_params = cJSON_CreateObject();
+    cJSON_AddStringToObject(init_params, "protocolVersion", "2025-06-18");
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize",
+                                                      init_params));
+    usleep(100000);
+    static char buf[65536];
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(2, "tools/list", NULL));
+    usleep(100000);
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    cJSON *list = cJSON_Parse(buf);
+    cJSON *tools = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(list, "result"), "tools");
+    ASSERT(cJSON_IsArray(tools), "tools/list parsed");
+    /* Exactly these five declare an outputSchema. */
+    ASSERT_INT_EQ(tools_output_schema_count(tools), 5);
+
+    /* The checker itself must reject drift, or every pass below is vacuous. */
+    {
+        const cJSON *ps = tools_output_schema(tools, "serial_port_status");
+        char why[256];
+        cJSON *bad = cJSON_Parse("{\"port\":\"p\",\"baud\":\"fast\","
+            "\"connected\":true,\"suspended\":false,"
+            "\"takeover_client\":null,\"clients\":[]}");
+        ASSERT(schema_check(bad, ps, "bad", why, sizeof(why)) != 0,
+               "wrong type rejected");
+        cJSON_DeleteItemFromObject(bad, "baud");
+        cJSON_AddNumberToObject(bad, "baud", 9600);
+        ASSERT(schema_check(bad, ps, "ok", why, sizeof(why)) == 0,
+               "fixed object accepted");
+        cJSON_DeleteItemFromObject(bad, "clients");
+        ASSERT(schema_check(bad, ps, "bad", why, sizeof(why)) != 0,
+               "missing required rejected");
+        cJSON_Delete(bad);
+    }
+
+    const char *dev_out = "U-Boot 2024.01\r\nKernel panic - not syncing\r\n";
+    write(ctx.master, dev_out, strlen(dev_out));
+    usleep(150000);
+
+    cJSON *resp = call_tool(&ctx, 3, "serial_port_status", NULL);
+    ASSERT_NOT_NULL(resp);
+    cJSON *sc = assert_structured(tools, "serial_port_status", resp);
+    ASSERT_INT_EQ(sm_json_get_int(sc, "baud", 0), 115200);
+    ASSERT(cJSON_IsNull(cJSON_GetObjectItem(sc, "takeover_client")),
+           "no takeover -> null");
+    cJSON_Delete(resp);
+
+    resp = call_tool(&ctx, 4, "serial_boot_status", NULL);
+    sc = assert_structured(tools, "serial_boot_status", resp);
+    ASSERT_STR_EQ(sm_json_get_string(sc, "state"), "in progress");
+    ASSERT_STR_EQ(sm_json_get_string(sc, "furthest"), "uboot");
+    ASSERT_INT_EQ(sm_json_get_int(sc, "reached", -1), 1);
+    ASSERT_INT_EQ(sm_json_get_int(sc, "total", -1), 2);
+    cJSON_Delete(resp);
+
+    resp = call_tool(&ctx, 5, "serial_get_incidents", NULL);
+    sc = assert_structured(tools, "serial_get_incidents", resp);
+    ASSERT_INT_EQ(sm_json_get_int(sc, "count", -1), 1);
+    cJSON *inc0 = cJSON_GetArrayItem(cJSON_GetObjectItem(sc, "incidents"), 0);
+    ASSERT_STR_EQ(sm_json_get_string(inc0, "pattern_name"), "kernel_panic");
+    cJSON_Delete(resp);
+
+    resp = call_tool(&ctx, 6, "serial_list_ports", NULL);
+    assert_structured(tools, "serial_list_ports", resp);
+    cJSON_Delete(resp);
+
+    cJSON *hargs = cJSON_CreateObject();
+    cJSON_AddNumberToObject(hargs, "since_seq", 0);
+    resp = call_tool(&ctx, 7, "serial_output_history", hargs);
+    sc = assert_structured(tools, "serial_output_history", resp);
+    ASSERT_STR_EQ(sm_json_get_string(sc, "mode"), "cursor");
+    ASSERT_INT_EQ(sm_json_get_int(sc, "cursor", -1), (int)strlen(dev_out));
+    cJSON *ch0 = cJSON_GetArrayItem(cJSON_GetObjectItem(sc, "chunks"), 0);
+    const char *t0 = sm_json_get_string(ch0, "text");
+    ASSERT(t0 && strstr(t0, "U-Boot 2024.01") != NULL, "cursor page has output");
+    cJSON_Delete(resp);
+
+    resp = call_tool(&ctx, 8, "serial_output_history", NULL);
+    sc = assert_structured(tools, "serial_output_history", resp);
+    ASSERT_STR_EQ(sm_json_get_string(sc, "mode"), "text");
+    const char *ht = sm_json_get_string(sc, "text");
+    ASSERT(ht && strstr(ht, "Kernel panic") != NULL, "text mode has output");
+    cJSON_Delete(resp);
+
+    /* A tool with no outputSchema keeps plain results. */
+    resp = call_tool(&ctx, 9, "serial_read", NULL);
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    ASSERT(cJSON_GetObjectItem(result, "structuredContent") == NULL,
+           "serial_read has no structuredContent");
+    ASSERT(cJSON_GetObjectItem(result, "isError") == NULL,
+           "serial_read success is not an error");
+    cJSON_Delete(resp);
+
+    cJSON_Delete(list);
+    teardown(&ctx);
 }
 
 int main(void)
@@ -939,6 +1085,7 @@ int main(void)
     RUN_TEST(test_mcp_write_as_is_backslash);
     RUN_TEST(test_tools_list_mutate_off);
     RUN_TEST(test_serial_write_mutate_off_refused);
+    RUN_TEST(test_structured_output);
 
     TEST_REPORT();
 }

@@ -15,6 +15,7 @@
  * in the output — the old builder truncated/overflowed the later incidents. */
 
 #include "test_main.h"
+#include "util/json_helpers.h"
 #include "broker.h"
 #include "anomaly.h"
 #include "sinks/mcp_internal.h"
@@ -65,8 +66,17 @@ static void test_get_incidents_no_overflow(void)
 
     /* No "seconds" arg => since_ts stays 0 => every incident matches. */
     cJSON *args = cJSON_CreateObject();
-    char *report = mcp_tool_dispatch(&sink, "serial_get_incidents", args, NULL);
+    cJSON *sc = NULL;
+    char *report = mcp_tool_dispatch(&sink, "serial_get_incidents", args, NULL,
+                                     &sc);
     cJSON_Delete(args);
+
+    /* structuredContent carries every incident, not just the prose. */
+    ASSERT_NOT_NULL(sc);
+    ASSERT_INT_EQ(sm_json_get_int(sc, "count", -1), N_INCIDENTS);
+    ASSERT_INT_EQ(cJSON_GetArraySize(cJSON_GetObjectItem(sc, "incidents")),
+                  N_INCIDENTS);
+    cJSON_Delete(sc);
 
     ASSERT_NOT_NULL(report);
     if (report) {
@@ -100,8 +110,14 @@ static void test_get_incidents_empty(void)
     sink.broker = &broker;
 
     cJSON *args = cJSON_CreateObject();
-    char *report = mcp_tool_dispatch(&sink, "serial_get_incidents", args, NULL);
+    cJSON *sc = NULL;
+    char *report = mcp_tool_dispatch(&sink, "serial_get_incidents", args, NULL,
+                                     &sc);
     cJSON_Delete(args);
+
+    ASSERT_NOT_NULL(sc);
+    ASSERT_INT_EQ(sm_json_get_int(sc, "count", -1), 0);
+    cJSON_Delete(sc);
 
     ASSERT_NOT_NULL(report);
     if (report) {
