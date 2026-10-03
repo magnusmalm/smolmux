@@ -1043,10 +1043,13 @@ int main(int argc, char *argv[])
 
     /* Run */
     int rc = sm_broker_run(&broker);
-    /* Setup failures (rc<0) on a UART port: name the holder if one exists. */
+    sm_broker_destroy(&broker);
+    /* Setup failures (rc<0) on a UART port: name the holder if one exists.
+     * Only after destroy closed our own link: probing while we still held
+     * the port exclusively blamed "another process" for any later setup
+     * failure (e.g. a socket path too long to bind). */
     if (rc < 0 && port && !enable_gdb && !serial_tcp_target)
         diagnose_busy_port(port);
-    sm_broker_destroy(&broker);
     for (int i = 0; i < 2; i++)
         if (token_paths[i][0])
             unlink(token_paths[i]);

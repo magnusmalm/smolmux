@@ -1312,6 +1312,38 @@ static void test_json_board_up_success_stdout(void)
 }
 #endif
 
+#if SM_ENABLE_UART
+/* A setup failure after the port opened (here: a socket path too long to
+ * bind) must not be blamed on "another process". The busy-port diagnosis
+ * used to run while the broker itself still held the port exclusively. */
+static void test_setup_failure_not_blamed_on_port_holder(void)
+{
+    char bin[4200];
+    const char *sm = find_smolmux(bin, sizeof(bin));
+    ASSERT_NOT_NULL(sm);
+    if (!sm) return;
+    int master, slave;
+    ASSERT(openpty(&master, &slave, NULL, NULL, NULL) == 0, "openpty");
+    char dev[64];
+    snprintf(dev, sizeof(dev), "%s", ttyname(slave));
+    close(slave);   /* the broker opens the slave itself */
+
+    char sock[256];
+    memset(sock, 'x', 200);
+    memcpy(sock, "/tmp/", 5);
+    snprintf(sock + 200, sizeof(sock) - 200, ".sock");
+    char *argv[] = { (char *)sm, dev, "-s", sock, "--no-io-log",
+                     "--no-text-log", NULL };
+    static char out[8192], err[16384];
+    int rc = capture_out_err(argv, out, sizeof(out), err, sizeof(err));
+    ASSERT(rc != 0, "broker refuses an unbindable socket path");
+    ASSERT(strstr(err, "socket") != NULL, "says the socket is the problem");
+    ASSERT(strstr(err, "held by another process") == NULL,
+           "does not blame another process for the port");
+    close(master);
+}
+#endif
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1331,6 +1363,7 @@ int main(void)
 #endif
     RUN_TEST(test_list_ports_json_flag_before_or_after);
 #if SM_ENABLE_UART
+    RUN_TEST(test_setup_failure_not_blamed_on_port_holder);
     RUN_TEST(test_with_port_success_resumes);
     RUN_TEST(test_with_port_propagates_exit_code);
     RUN_TEST(test_with_port_exec_failure);

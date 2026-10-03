@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.5.1
+
+- Version is 0.5.1.
+- A broker that fails to start after opening its port (for example on a
+  socket path too long to bind) no longer reports `port ... is held by
+  another process`. The busy-port check ran while the broker itself still
+  held the port.
+- The UART link clears its exclusive lock (`TIOCNXCL`) when it closes. The
+  lock belongs to the tty, so it outlived the close whenever another file
+  descriptor kept the tty open, and the next opener got `EBUSY`.
+- `serial_add_autoresponder`, `serial_pin_control`, `gdb_threads` and
+  `gdb_reset` descriptions name the tool to use instead.
+
 ## 0.5.0
 
 - Version is 0.5.0.

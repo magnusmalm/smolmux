@@ -215,7 +215,9 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(tools, make_tool("serial_add_autoresponder",
             "Register a standing expect->send rule: when the device output "
             "matches `pattern`, the broker auto-sends `send` (for boot menus, "
-            "y/N prompts, unattended login) with no round-trip.", s));
+            "y/N prompts, unattended login) with no round-trip. For a single "
+            "reply now, use serial_send_command or serial_write; to only "
+            "watch for a pattern, serial_add_watchdog.", s));
     }
 
     /* serial_pin_control */
@@ -237,7 +239,8 @@ cJSON *sm_mcp_build_tools_list(void)
         cJSON_AddItemToArray(tools, make_tool_destr("serial_pin_control",
             "Control DTR/RTS or send a break. DTR/RTS often drive reset and "
             "boot-mode lines (ESP32, many dev boards), so a pulse can reset "
-            "the target.", s));
+            "the target. For a Linux SysRq use serial_sysrq, which sends the "
+            "break and the key together.", s));
     }
 
     /* serial_sysrq */

@@ -1749,7 +1749,8 @@ static cJSON *build_gdb_tools_list(void)
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_threads",
         "List all threads (RTOS-aware if the profile configures it). Without "
-        "RTOS support the bare-metal core shows as one thread.",
+        "RTOS support the bare-metal core shows as one thread. For the "
+        "current thread's call stack use gdb_backtrace.",
         NULL, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_load",
@@ -1762,7 +1763,9 @@ static cJSON *build_gdb_tools_list(void)
         "Reset the target via OpenOCD monitor. "
         "mode halt/init: leave stopped and flush GDB register cache. "
         "mode run: reset halt, flush cache, then -exec-continue "
-        "(so GDB breakpoints apply; not bare monitor reset run).",
+        "(so GDB breakpoints apply; not bare monitor reset run). Use after "
+        "gdb_load to start the new image; to stop a running target without "
+        "a reset, use gdb_interrupt.",
         props, NULL, 0));
 
     cJSON_AddItemToArray(tools, tool_entry("gdb_status",

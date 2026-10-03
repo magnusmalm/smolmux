@@ -163,6 +163,13 @@ static void uart_close(sm_link_t *self)
     tcflush(ud->fd, TCIOFLUSH);
     if (ud->orig_saved)
         tcsetattr(ud->fd, TCSANOW, &ud->orig_termios);
+    /* Drop exclusivity explicitly: the flag lives on the tty, not the fd,
+     * and outlives this close whenever another fd keeps the tty alive (a
+     * PTY's master; a USB port another process also has open), so the
+     * next opener - a flasher after suspend, our own busy-port probe -
+     * would get EBUSY. */
+    if (ud->exclusive)
+        ioctl(ud->fd, TIOCNXCL);
     close(ud->fd);
     ud->fd = -1;
     SM_LOG_INFO(LOG_TAG, "closed %s", ud->port);
