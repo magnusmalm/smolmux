@@ -166,6 +166,63 @@ static void teardown(fixture_t *fx)
     close(fx->slave);
 }
 
+/* Fake link (socketpair data, recorded dtr/rts set_param) so serial_reset
+ * can succeed end to end; a PTY rejects modem-line ioctls. */
+typedef struct cfk_data {
+    int fd;
+    char log[16][16];
+    volatile int n;
+} cfk_data_t;
+static int  cfk_open(sm_link_t *s) { (void)s; return 0; }
+static void cfk_close(sm_link_t *s) { (void)s; }
+static int  cfk_fd(sm_link_t *s) { return ((cfk_data_t *)s->data)->fd; }
+static int  cfk_write(sm_link_t *s, const uint8_t *d, size_t n) {
+    ssize_t w = write(((cfk_data_t *)s->data)->fd, d, n);
+    return w < 0 ? -1 : (int)w;
+}
+static int  cfk_zero(sm_link_t *s) { (void)s; return 0; }
+static int  cfk_brk(sm_link_t *s, int ms) { (void)s; (void)ms; return 0; }
+static int  cfk_set_param(sm_link_t *s, const char *k, const char *v) {
+    cfk_data_t *d = s->data;
+    if (d->n < 16) snprintf(d->log[d->n], 16, "%s=%s", k, v);
+    d->n++;
+    return 0;
+}
+static int  cfk_status(sm_link_t *s, cJSON *o) { (void)s; (void)o; return 0; }
+static void cfk_destroy(sm_link_t *s) { free(s->data); free(s); }
+
+/* Like setup(), but the broker drives the fake link; master is the device
+ * end of the socketpair (teardown closes it). */
+static void setup_fake_link(fixture_t *fx)
+{
+    memset(fx, 0, sizeof(*fx));
+    int sp[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+    fcntl(sp[0], F_SETFL, O_NONBLOCK);
+    cfk_data_t *d = calloc(1, sizeof(*d));
+    d->fd = sp[0];
+    sm_link_t *l = calloc(1, sizeof(*l));
+    l->name = "fake";
+    l->open = cfk_open; l->close = cfk_close;
+    l->read_fd = cfk_fd; l->write_fd = cfk_fd;
+    l->write_data = cfk_write; l->has_write_pending = cfk_zero;
+    l->flush_write_queue = cfk_zero; l->send_break = cfk_brk;
+    l->set_param = cfk_set_param; l->get_status = cfk_status;
+    l->destroy = cfk_destroy;
+    l->silence_normal = 1;
+    l->data = d;
+    fx->link = l;
+    fx->master = sp[1];
+    fx->slave = -1;
+    sm_broker_init(&fx->broker, l, TEST_SOCK);
+    snprintf(fx->broker.port, sizeof(fx->broker.port), "fake");
+    fx->broker.baudrate = 115200;
+    pthread_create(&fx->tid, NULL, broker_thread, &fx->broker);
+    usleep(STARTUP_DELAY);
+    spawn_mcp_full(fx, NULL, NULL);
+    usleep(STARTUP_DELAY);
+}
+
 /* --- JSON-RPC over the pipe --- */
 
 static void rpc_send(fixture_t *fx, const char *json_line)
@@ -788,6 +845,84 @@ static void test_mcp_structured_output_e2e(void)
     teardown(&fx);
 }
 
+/* serial_reset end to end through the real smolmux-mcp (todo #23): the
+ * broker sees dtr=clear, rts=set, rts=clear; with wait_pattern the banner
+ * the device prints after the release answers the call. */
+static void test_mcp_serial_reset_e2e(void)
+{
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+    fixture_t fx;
+    setup_fake_link(&fx);
+    cfk_data_t *d = fx.link->data;
+    cJSON *resp = rpc_call(&fx, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        200);
+    cJSON_Delete(resp);
+
+    resp = rpc_call(&fx, 2,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_reset\",\"arguments\":{\"hold_ms\":150}}}", 400);
+    ASSERT_NOT_NULL(resp);
+    const char *text = resp ? tool_text(resp) : NULL;
+    ASSERT(text && strstr(text, "OK (reset via rts") != NULL, "reset OK");
+    ASSERT_INT_EQ(d->n, 3);
+    if (d->n >= 3) {
+        ASSERT_STR_EQ(d->log[0], "dtr=clear");
+        ASSERT_STR_EQ(d->log[1], "rts=set");
+        ASSERT_STR_EQ(d->log[2], "rts=clear");
+    }
+    cJSON_Delete(resp);
+
+    rpc_send(&fx,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_reset\",\"arguments\":{\"wait_pattern\":\"commands:\","
+        "\"timeout_ms\":3000}}}");
+    for (int i = 0; i < 200 && d->n < 6; i++)
+        usleep(10000);
+    ASSERT_INT_EQ(d->n, 6);
+    usleep(50000);   /* ack delivered; the listen was armed before it */
+    const char *banner = "ESP-ROM boot\r\ncommands: help temp\r\n";
+    write(fx.master, banner, strlen(banner));
+    resp = NULL;
+    for (int i = 0; i < 50 && !resp; i++) {
+        char *l = next_line(&fx, 100);
+        if (!l) continue;
+        cJSON *j = cJSON_Parse(l);
+        cJSON *rid = j ? cJSON_GetObjectItem(j, "id") : NULL;
+        if (cJSON_IsNumber(rid) && (int)rid->valuedouble == 3) resp = j;
+        else cJSON_Delete(j);
+    }
+    ASSERT_NOT_NULL(resp);
+    text = resp ? tool_text(resp) : NULL;
+    ASSERT(text && strstr(text, "boot line /commands:/ seen") != NULL,
+           "wait matched the banner");
+    cJSON_Delete(resp);
+    teardown(&fx);
+}
+
+/* On a PTY broker the reset is refused, and the agent sees why. */
+static void test_mcp_serial_reset_refused_e2e(void)
+{
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+    fixture_t fx;
+    setup(&fx);
+    cJSON *resp = rpc_call(&fx, 1,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+        200);
+    cJSON_Delete(resp);
+    resp = rpc_call(&fx, 2,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"serial_reset\",\"arguments\":{}}}", 400);
+    ASSERT_NOT_NULL(resp);
+    const char *text = resp ? tool_text(resp) : NULL;
+    ASSERT(text && strstr(text, "[ERROR] reset busy or unavailable") != NULL,
+           "refusal names the reason");
+    cJSON *result = resp ? cJSON_GetObjectItem(resp, "result") : NULL;
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")), "flagged isError");
+    cJSON_Delete(resp);
+    teardown(&fx);
+}
+
 int main(int argc, char *argv[])
 {
     printf("test_mcp_client\n");
@@ -803,6 +938,8 @@ int main(int argc, char *argv[])
     RUN_TEST(test_mcp_e2e_smoke);
     RUN_TEST(test_mcp_mutate_off_e2e);
     RUN_TEST(test_mcp_structured_output_e2e);
+    RUN_TEST(test_mcp_serial_reset_e2e);
+    RUN_TEST(test_mcp_serial_reset_refused_e2e);
     RUN_TEST(test_conn_wait_drains_data_before_hangup);
     RUN_TEST(test_conn_pump_drains_data_before_hangup);
     RUN_TEST(test_conn_event_cb_link_down);

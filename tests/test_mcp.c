@@ -13,6 +13,7 @@
 #include <pty.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 
 #define TEST_SOCK "/tmp/smolmux-test-mcp.sock"
@@ -306,7 +307,7 @@ static void test_tools_list(void)
 
     cJSON *tools = cJSON_GetObjectItemCaseSensitive(result, "tools");
     ASSERT(cJSON_IsArray(tools), "tools is array");
-    ASSERT(cJSON_GetArraySize(tools) == 17, "17 tools registered");
+    ASSERT(cJSON_GetArraySize(tools) == 18, "18 tools registered");
 
     /* Wave 4: annotations on at least one RO and one destructive tool */
     int saw_ro = 0, saw_destr = 0;
@@ -922,6 +923,78 @@ static void test_serial_write_mutate_off_refused(void)
     setenv("SMOLMUX_MCP_MUTATE", "1", 1);
 }
 
+/* Fake link: data over a socketpair, set_param records dtr/rts so the
+ * sink's serial_reset can succeed (a PTY rejects modem-line ioctls). */
+typedef struct mfk_data {
+    int fd;
+    char log[16][16];
+    volatile int n;
+} mfk_data_t;
+static int  mfk_open(sm_link_t *s) { (void)s; return 0; }
+static void mfk_close(sm_link_t *s) { (void)s; }
+static int  mfk_fd(sm_link_t *s) { return ((mfk_data_t *)s->data)->fd; }
+static int  mfk_write(sm_link_t *s, const uint8_t *d, size_t n) {
+    ssize_t w = write(((mfk_data_t *)s->data)->fd, d, n);
+    return w < 0 ? -1 : (int)w;
+}
+static int  mfk_zero(sm_link_t *s) { (void)s; return 0; }
+static int  mfk_brk(sm_link_t *s, int ms) { (void)s; (void)ms; return 0; }
+static int  mfk_set_param(sm_link_t *s, const char *k, const char *v) {
+    mfk_data_t *d = s->data;
+    if (d->n < 16) snprintf(d->log[d->n], 16, "%s=%s", k, v);
+    d->n++;
+    return 0;
+}
+static int  mfk_status(sm_link_t *s, cJSON *o) { (void)s; (void)o; return 0; }
+static void mfk_destroy(sm_link_t *s) { free(s->data); free(s); }
+
+/* setup() with the fake link instead of a PTY UART; dev_fd is the device
+ * end of the socketpair. */
+static void setup_fake(test_ctx_t *ctx, int *dev_fd)
+{
+    int sp[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+    fcntl(sp[0], F_SETFL, O_NONBLOCK);
+    mfk_data_t *d = calloc(1, sizeof(*d));
+    d->fd = sp[0];
+    sm_link_t *l = calloc(1, sizeof(*l));
+    l->name = "fake";
+    l->open = mfk_open; l->close = mfk_close;
+    l->read_fd = mfk_fd; l->write_fd = mfk_fd;
+    l->write_data = mfk_write; l->has_write_pending = mfk_zero;
+    l->flush_write_queue = mfk_zero; l->send_break = mfk_brk;
+    l->set_param = mfk_set_param; l->get_status = mfk_status;
+    l->destroy = mfk_destroy;
+    l->silence_normal = 1;
+    l->data = d;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->master = sp[1];
+    ctx->slave = -1;
+    ctx->link = l;
+    *dev_fd = sp[1];
+    sm_broker_init(&ctx->broker, l, TEST_SOCK);
+    snprintf(ctx->broker.port, sizeof(ctx->broker.port), "fake");
+    ctx->broker.baudrate = 115200;
+    sm_profile_init_default(&ctx->broker.profile);
+
+    int stdin_pipe[2], stdout_pipe[2];
+    pipe(stdin_pipe);
+    pipe(stdout_pipe);
+    ctx->mcp_stdin_read = stdin_pipe[0];
+    ctx->mcp_stdin_write = stdin_pipe[1];
+    ctx->mcp_stdout_read = stdout_pipe[0];
+    ctx->mcp_stdout_write = stdout_pipe[1];
+    int flags = fcntl(ctx->mcp_stdout_read, F_GETFL, 0);
+    fcntl(ctx->mcp_stdout_read, F_SETFL, flags | O_NONBLOCK);
+    ctx->saved_stdin = dup(STDIN_FILENO);
+    ctx->saved_stdout = dup(STDOUT_FILENO);
+    dup2(ctx->mcp_stdin_read, STDIN_FILENO);
+    dup2(ctx->mcp_stdout_write, STDOUT_FILENO);
+    sm_broker_add_sink(&ctx->broker, sm_mcp_sink_new(&ctx->broker));
+    pthread_create(&ctx->tid, NULL, broker_thread, &ctx->broker);
+    usleep(STARTUP_DELAY);
+}
+
 /* Call one tool and return the parsed JSON-RPC response (caller frees). */
 static cJSON *call_tool(test_ctx_t *ctx, int id, const char *name,
                         cJSON *args)
@@ -1063,6 +1136,83 @@ static void test_structured_output(void)
     teardown(&ctx);
 }
 
+/* serial_reset on the sink (todo #23): answered on release with the exact
+ * line sequence; with wait_pattern, a banner after the release answers. */
+static void test_serial_reset_sink(void)
+{
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+    test_ctx_t ctx;
+    int dev = -1;
+    setup_fake(&ctx, &dev);
+    mfk_data_t *d = ctx.link->data;
+    static char buf[65536];
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize", NULL));
+    usleep(100000);
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddNumberToObject(args, "hold_ms", 200);
+    cJSON *resp = call_tool(&ctx, 2, "serial_reset", args);
+    ASSERT_NOT_NULL(resp);
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    const char *text = sm_json_get_string(
+        cJSON_GetArrayItem(cJSON_GetObjectItem(result, "content"), 0), "text");
+    ASSERT(text && strstr(text, "OK (reset via rts") != NULL, "reset answered OK");
+    ASSERT(cJSON_GetObjectItem(result, "isError") == NULL, "not an error");
+    ASSERT_INT_EQ(d->n, 3);
+    if (d->n >= 3) {
+        ASSERT_STR_EQ(d->log[0], "dtr=clear");
+        ASSERT_STR_EQ(d->log[1], "rts=set");
+        ASSERT_STR_EQ(d->log[2], "rts=clear");
+    }
+    cJSON_Delete(resp);
+
+    /* wait_pattern: the device prints its banner after the release. */
+    args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "wait_pattern", "commands:");
+    cJSON_AddNumberToObject(args, "timeout_ms", 3000);
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "name", "serial_reset");
+    cJSON_AddItemToObject(params, "arguments", args);
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(3, "tools/call", params));
+    for (int i = 0; i < 100 && d->n < 6; i++)
+        usleep(10000);
+    ASSERT_INT_EQ(d->n, 6);
+    const char *banner = "ESP-ROM boot\r\ncommands: help temp\r\n";
+    write(dev, banner, strlen(banner));
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    resp = cJSON_Parse(buf);
+    result = cJSON_GetObjectItem(resp, "result");
+    text = sm_json_get_string(
+        cJSON_GetArrayItem(cJSON_GetObjectItem(result, "content"), 0), "text");
+    ASSERT(text && strstr(text, "commands:") != NULL, "wait saw the banner");
+    ASSERT(cJSON_GetObjectItem(result, "isError") == NULL, "wait result ok");
+    cJSON_Delete(resp);
+
+    teardown(&ctx);
+}
+
+/* On a link that cannot drive modem lines (PTY), serial_reset is an error. */
+static void test_serial_reset_unsupported_link(void)
+{
+    setenv("SMOLMUX_MCP_MUTATE", "1", 1);
+    test_ctx_t ctx;
+    setup(&ctx);
+    static char buf[65536];
+    send_jsonrpc(ctx.mcp_stdin_write, jsonrpc_request(1, "initialize", NULL));
+    usleep(100000);
+    read_line(ctx.mcp_stdout_read, buf, sizeof(buf));
+    cJSON *resp = call_tool(&ctx, 2, "serial_reset", NULL);
+    cJSON *result = cJSON_GetObjectItem(resp, "result");
+    const char *text = sm_json_get_string(
+        cJSON_GetArrayItem(cJSON_GetObjectItem(result, "content"), 0), "text");
+    ASSERT(text && strstr(text, "[ERROR] reset busy or unavailable") != NULL,
+           "PTY reset refused with a reason");
+    ASSERT(cJSON_IsTrue(cJSON_GetObjectItem(result, "isError")), "flagged isError");
+    cJSON_Delete(resp);
+    teardown(&ctx);
+}
+
 int main(void)
 {
     setenv("SMOLMUX_MCP_MUTATE", "1", 1);
@@ -1086,6 +1236,8 @@ int main(void)
     RUN_TEST(test_tools_list_mutate_off);
     RUN_TEST(test_serial_write_mutate_off_refused);
     RUN_TEST(test_structured_output);
+    RUN_TEST(test_serial_reset_sink);
+    RUN_TEST(test_serial_reset_unsupported_link);
 
     TEST_REPORT();
 }

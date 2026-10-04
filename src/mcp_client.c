@@ -529,6 +529,64 @@ static char *tool_serial_pin_control(cJSON *args)
     return strdup("OK");
 }
 
+/* serial_reset: the broker runs the reset (pin_control action "reset":
+ * clear the other modem line, hold `pin`, release) and acks on release. The
+ * optional wait is registered first, so a banner printed at release counts. */
+static char *tool_serial_reset(cJSON *args)
+{
+    const char *pin = sm_json_get_string(args, "pin");
+    if (!pin || !pin[0]) pin = "rts";
+    if (strcmp(pin, "rts") != 0 && strcmp(pin, "dtr") != 0)
+        return strdup("[ERROR] pin must be rts or dtr");
+    int hold_ms = sm_json_get_int(args, "hold_ms", SM_DEFAULT_RESET_HOLD_MS);
+    if (hold_ms < 1) hold_ms = 1;
+    if (hold_ms > SM_MAX_RESET_HOLD_MS) hold_ms = SM_MAX_RESET_HOLD_MS;
+    const char *wait_pat = sm_json_get_string(args, "wait_pattern");
+    if (wait_pat && !wait_pat[0]) wait_pat = NULL;
+    int wait_ms = sm_json_get_int(args, "timeout_ms", 10000);
+    if (wait_ms < 100) wait_ms = 100;
+    if (wait_ms > SM_MAX_EXPECT_TIMEOUT_MS) wait_ms = SM_MAX_EXPECT_TIMEOUT_MS;
+
+    char wait_id[64] = "";
+    if (wait_pat) {
+        gen_wire_id(wait_id, sizeof(wait_id));
+        if (broker_send(sm_msg_listen_expect(wait_id, wait_pat, wait_ms)) != 0)
+            return strdup("[ERROR] broker send failed");
+    }
+
+    char wire_id[64];
+    gen_wire_id(wire_id, sizeof(wire_id));
+    cJSON *resp = broker_request(
+        sm_msg_pin_control(wire_id, pin, "reset", hold_ms),
+        wire_id, hold_ms + 5000);
+    if (!resp) return strdup("[ERROR] timeout");
+    const char *resp_type = sm_json_get_string(resp, "type");
+    if (resp_type && strcmp(resp_type, "error") == 0) {
+        const char *emsg = sm_json_get_string(resp, "message");
+        char err[512];
+        snprintf(err, sizeof(err), "[ERROR] %s", emsg ? emsg : "reset failed");
+        cJSON_Delete(resp);
+        return strdup(err);
+    }
+    cJSON_Delete(resp);
+
+    char out[256];
+    if (!wait_pat) {
+        snprintf(out, sizeof(out), "OK (reset via %s, held %d ms)", pin, hold_ms);
+        return strdup(out);
+    }
+    cJSON *res = wait_for_response(wait_id, wait_ms + 5000);
+    int matched = res ? sm_json_get_bool(res, "matched", 0) : 0;
+    cJSON_Delete(res);
+    if (matched)
+        snprintf(out, sizeof(out), "OK (reset via %s; boot line /%.120s/ seen)",
+                 pin, wait_pat);
+    else
+        snprintf(out, sizeof(out), "[TIMEOUT] reset via %s done, but /%.120s/ "
+                 "not seen within %d ms", pin, wait_pat, wait_ms);
+    return strdup(out);
+}
+
 static char *tool_serial_sysrq(cJSON *args)
 {
     const char *key = sm_json_get_string(args, "key");
@@ -1166,6 +1224,7 @@ static char *dispatch_tool(const char *name, cJSON *args, cJSON *jsonrpc_id,
     else if (strcmp(name, "serial_add_autoresponder") == 0)
         result = tool_serial_add_autoresponder(args);
     else if (strcmp(name, "serial_pin_control") == 0)   result = tool_serial_pin_control(args);
+    else if (strcmp(name, "serial_reset") == 0)         result = tool_serial_reset(args);
     else if (strcmp(name, "serial_sysrq") == 0)         result = tool_serial_sysrq(args);
     else if (strcmp(name, "serial_suspend") == 0)        result = tool_serial_suspend();
     else if (strcmp(name, "serial_resume") == 0)         result = tool_serial_resume();

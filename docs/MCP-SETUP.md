@@ -74,9 +74,9 @@ tools in `~/.local/bin`, see `MCP-SETUP-FULL.md`. Do not `sudo install` to
 `serial_output_history`, `serial_port_status`, `serial_boot_status`,
 `serial_list_ports`, `serial_get_incidents`, `serial_generate_report`
 
-**With `SMOLMUX_MCP_MUTATE=1` (8 more, 17 total):**
+**With `SMOLMUX_MCP_MUTATE=1` (9 more, 18 total):**
 `serial_write`, `serial_send_command`, `serial_pin_control`,
-`serial_sysrq`, `serial_suspend`, `serial_resume`,
+`serial_reset`, `serial_sysrq`, `serial_suspend`, `serial_resume`,
 `serial_add_watchdog`, `serial_add_autoresponder`
 
 **Capture notes:** `serial_read` drains the MCP session buffer only.

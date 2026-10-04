@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.5.2
+
+- Version is 0.5.2.
+- Reset through a USB-serial auto-reset circuit: `smolmux-cli reset` and
+  the MCP write tool `serial_reset` (listed with `SMOLMUX_MCP_MUTATE=1`).
+  The broker clears the other modem line, asserts the reset line (default
+  `rts`) for the hold (default 100 ms) and releases it, on its event loop
+  (wire: `pin_control` action `reset`, acked on release). A bare
+  `pin rts pulse` does nothing on ESP32-style boards right after the broker
+  starts, because the broker opens the port with DTR asserted. An optional
+  wait for a boot line (`--wait` / `wait_pattern`) is armed before the
+  release, so a fast banner is not missed.
+
 ## 0.5.1
 
 - Version is 0.5.1.

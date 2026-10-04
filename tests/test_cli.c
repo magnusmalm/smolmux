@@ -1344,6 +1344,192 @@ static void test_setup_failure_not_blamed_on_port_holder(void)
 }
 #endif
 
+#if SM_ENABLE_UART   /* uses wp_broker_thread */
+/* --- reset verb (todo #23) ---
+ * A fake link records set_param("dtr"/"rts", action) so the test sees the
+ * exact line sequence the real smolmux-cli produces (PTYs reject modem
+ * ioctls, so a UART link on a PTY cannot be used here). */
+typedef struct rs_link_data {
+    int fd;
+    char log[16][16];
+    volatile int n;
+} rs_link_data_t;
+
+static int  rs_open(sm_link_t *s) { (void)s; return 0; }
+static void rs_close(sm_link_t *s) { (void)s; }
+static int  rs_fd(sm_link_t *s) { return ((rs_link_data_t *)s->data)->fd; }
+static int  rs_write(sm_link_t *s, const uint8_t *d, size_t n) {
+    ssize_t w = write(((rs_link_data_t *)s->data)->fd, d, n);
+    return w < 0 ? -1 : (int)w;
+}
+static int  rs_zero(sm_link_t *s) { (void)s; return 0; }
+static int  rs_brk(sm_link_t *s, int ms) { (void)s; (void)ms; return 0; }
+static int  rs_set_param(sm_link_t *s, const char *k, const char *v) {
+    rs_link_data_t *d = s->data;
+    if (d->n < 16)
+        snprintf(d->log[d->n], 16, "%s=%s", k, v);
+    d->n++;
+    return 0;
+}
+static int  rs_status(sm_link_t *s, cJSON *o) { (void)s; (void)o; return 0; }
+static void rs_destroy(sm_link_t *s) { free(s->data); free(s); }
+
+typedef struct {
+    int sp[2];
+    sm_link_t *link;
+    sm_broker_t broker;
+    pthread_t tid;
+    char sock[128];
+} rs_ctx_t;
+
+static void rs_setup(rs_ctx_t *c)
+{
+    memset(c, 0, sizeof(*c));
+    socketpair(AF_UNIX, SOCK_STREAM, 0, c->sp);
+    fcntl(c->sp[0], F_SETFL, O_NONBLOCK);
+    rs_link_data_t *d = calloc(1, sizeof(*d));
+    d->fd = c->sp[0];
+    sm_link_t *l = calloc(1, sizeof(*l));
+    l->name = "fake";
+    l->open = rs_open; l->close = rs_close;
+    l->read_fd = rs_fd; l->write_fd = rs_fd;
+    l->write_data = rs_write; l->has_write_pending = rs_zero;
+    l->flush_write_queue = rs_zero; l->send_break = rs_brk;
+    l->set_param = rs_set_param; l->get_status = rs_status;
+    l->destroy = rs_destroy;
+    l->silence_normal = 1;
+    l->data = d;
+    c->link = l;
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    snprintf(c->sock, sizeof(c->sock), "%s/smolmux-test-clireset-%d.sock",
+             rt && rt[0] ? rt : "/tmp", (int)getpid());
+    sm_broker_init(&c->broker, l, c->sock);
+    snprintf(c->broker.port, sizeof(c->broker.port), "fake");
+    pthread_create(&c->tid, NULL, wp_broker_thread, &c->broker);
+    usleep(150000);
+}
+
+static void rs_teardown(rs_ctx_t *c)
+{
+    sm_broker_stop(&c->broker);
+    pthread_join(c->tid, NULL);
+    sm_broker_destroy(&c->broker);
+    close(c->sp[1]);
+}
+
+/* Fork the real smolmux-cli; return its pid (stdout/stderr to /dev/null). */
+static pid_t rs_spawn(const char *cli, char *const extra[], int nextra,
+                      const char *sock)
+{
+    char *argv[16];
+    int a = 0;
+    argv[a++] = (char *)cli;
+    argv[a++] = "-s";
+    argv[a++] = (char *)sock;
+    argv[a++] = "reset";
+    for (int i = 0; i < nextra && a < 15; i++)
+        argv[a++] = extra[i];
+    argv[a] = NULL;
+    pid_t pid = fork();
+    if (pid == 0) {
+        int dn = open("/dev/null", O_WRONLY);
+        dup2(dn, STDOUT_FILENO);
+        dup2(dn, STDERR_FILENO);
+        execv(cli, argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int rs_wait(pid_t pid, int ms)
+{
+    int st = 0;
+    for (int i = 0; i < ms / 10; i++) {
+        if (waitpid(pid, &st, WNOHANG) == pid)
+            return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        usleep(10000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+    return -2;
+}
+
+/* Default: DTR cleared first, then RTS asserted and released - the only
+ * sequence that pulls EN low on an ESP32 auto-reset circuit. */
+static void test_reset_sequence_rts(void)
+{
+    char clipath[4200];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+    if (!cli) return;
+    rs_ctx_t c;
+    rs_setup(&c);
+    rs_link_data_t *d = c.link->data;
+    int rc = rs_wait(rs_spawn(cli, NULL, 0, c.sock), 5000);
+    ASSERT_INT_EQ(rc, 0);
+    ASSERT_INT_EQ(d->n, 3);
+    ASSERT_STR_EQ(d->log[0], "dtr=clear");
+    ASSERT_STR_EQ(d->log[1], "rts=set");
+    ASSERT_STR_EQ(d->log[2], "rts=clear");
+    rs_teardown(&c);
+}
+
+static void test_reset_sequence_dtr(void)
+{
+    char clipath[4200];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+    if (!cli) return;
+    rs_ctx_t c;
+    rs_setup(&c);
+    rs_link_data_t *d = c.link->data;
+    char *extra[] = { "--pin", "dtr" };
+    int rc = rs_wait(rs_spawn(cli, extra, 2, c.sock), 5000);
+    ASSERT_INT_EQ(rc, 0);
+    ASSERT_INT_EQ(d->n, 3);
+    ASSERT_STR_EQ(d->log[0], "rts=clear");
+    ASSERT_STR_EQ(d->log[1], "dtr=set");
+    ASSERT_STR_EQ(d->log[2], "dtr=clear");
+    rs_teardown(&c);
+}
+
+/* --wait is armed before the release: a banner the device prints the moment
+ * the reset line is released must still match. */
+static void test_reset_wait_sees_immediate_banner(void)
+{
+    char clipath[4200];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+    if (!cli) return;
+    rs_ctx_t c;
+    rs_setup(&c);
+    rs_link_data_t *d = c.link->data;
+    char *extra[] = { "--wait", "commands:", "--timeout", "3000" };
+    pid_t pid = rs_spawn(cli, extra, 4, c.sock);
+    for (int i = 0; i < 300 && d->n < 3; i++)
+        usleep(10000);
+    ASSERT_INT_EQ(d->n, 3);
+    const char *banner = "ESP-ROM boot\r\ncommands: help temp\r\n";
+    write(c.sp[1], banner, strlen(banner));
+    ASSERT_INT_EQ(rs_wait(pid, 5000), 0);
+    rs_teardown(&c);
+}
+
+/* No banner: --wait times out and the command fails (exit 1). */
+static void test_reset_wait_timeout_fails(void)
+{
+    char clipath[4200];
+    const char *cli = find_smolmux_cli(clipath, sizeof(clipath));
+    ASSERT_NOT_NULL(cli);
+    if (!cli) return;
+    rs_ctx_t c;
+    rs_setup(&c);
+    char *extra[] = { "--wait", "commands:", "--timeout", "300" };
+    ASSERT_INT_EQ(rs_wait(rs_spawn(cli, extra, 4, c.sock), 6000), 1);
+    rs_teardown(&c);
+}
+#endif /* SM_ENABLE_UART */
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1364,6 +1550,10 @@ int main(void)
     RUN_TEST(test_list_ports_json_flag_before_or_after);
 #if SM_ENABLE_UART
     RUN_TEST(test_setup_failure_not_blamed_on_port_holder);
+    RUN_TEST(test_reset_sequence_rts);
+    RUN_TEST(test_reset_sequence_dtr);
+    RUN_TEST(test_reset_wait_sees_immediate_banner);
+    RUN_TEST(test_reset_wait_timeout_fails);
     RUN_TEST(test_with_port_success_resumes);
     RUN_TEST(test_with_port_propagates_exit_code);
     RUN_TEST(test_with_port_exec_failure);

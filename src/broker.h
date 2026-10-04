@@ -57,6 +57,7 @@ typedef struct sm_broker {
      * event loop). One operation in flight at a time. */
     int break_timer_fd;
     int break_state;
+    char break_pin[8];          /* line the machine pulses: break, rts, dtr */
     uint8_t break_followup[8];  /* bytes to send after break (SysRq key) */
     size_t break_followup_len;
     int break_delay_ms;         /* pause between break release and followup */
@@ -178,6 +179,17 @@ typedef void (*sm_break_done_fn)(struct sm_broker *b, void *ctx, int rc);
 int  sm_broker_schedule_break(sm_broker_t *b, int duration_ms,
                               const uint8_t *followup, size_t followup_len,
                               int delay_ms, sm_break_done_fn done, void *ctx);
+
+/* Reset through a USB-serial auto-reset circuit without blocking the event
+ * loop: clear the other modem line, assert `pin` (rts|dtr), release it after
+ * hold_ms, then call done. ESP32-style boards reset only while RTS is
+ * asserted with DTR released, and the port opens with both asserted, so a
+ * bare pulse does nothing. Shares the break machine's single in-flight slot
+ * (suspend/link loss cancel it the same way). Returns 0 if started, -1 if
+ * rejected (busy, suspended, link down, bad pin, line not drivable); done is
+ * never called on rejection. */
+int  sm_broker_schedule_line_reset(sm_broker_t *b, const char *pin, int hold_ms,
+                                   sm_break_done_fn done, void *ctx);
 
 /* Start a proactive keystroke flood (break into a 0-delay bootloader). Streams
  * `key` every interval_ms until `stop_pattern` (optional regex) matches the

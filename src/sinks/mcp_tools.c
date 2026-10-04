@@ -325,6 +325,86 @@ static char *tool_serial_resume(sm_mcp_sink_t *mcp)
     return strdup("OK - serial port re-acquired.");
 }
 
+/* Completion of serial_reset without wait_pattern: answer on release. */
+typedef struct mcp_reset_ctx {
+    cJSON *jsonrpc_id;   /* owned copy; NULL when an expect answers instead */
+    char pin[4];
+    int hold_ms;
+} mcp_reset_ctx_t;
+
+static void mcp_reset_done(sm_broker_t *b, void *ctx_, int rc)
+{
+    (void)b;
+    mcp_reset_ctx_t *ctx = ctx_;
+    if (ctx->jsonrpc_id) {
+        char result[96];
+        if (rc != 0)
+            snprintf(result, sizeof(result), "[ERROR] reset via %s failed",
+                     ctx->pin);
+        else
+            snprintf(result, sizeof(result), "OK (reset via %s, held %d ms)",
+                     ctx->pin, ctx->hold_ms);
+        mcp_send_tool_result(ctx->jsonrpc_id, result);
+        cJSON_Delete(ctx->jsonrpc_id);
+    } else if (rc != 0) {
+        SM_LOG_WARN(LOG_TAG, "serial_reset via %s failed while waiting", ctx->pin);
+    }
+    free(ctx);
+}
+
+/* serial_reset on the in-broker sink: the broker's line-reset machine runs
+ * it on the event loop (never blocks). Scheduling asserts the line first,
+ * then the optional wait is registered - still before the timer releases
+ * the line - and answers the call; otherwise the release answers it. */
+static char *tool_serial_reset(sm_mcp_sink_t *mcp, cJSON *args,
+                               cJSON *jsonrpc_id)
+{
+    sm_broker_t *b = mcp->broker;
+    const char *pin = sm_json_get_string(args, "pin");
+    if (!pin || !pin[0]) pin = "rts";
+    if (strcmp(pin, "rts") != 0 && strcmp(pin, "dtr") != 0)
+        return strdup("[ERROR] pin must be rts or dtr");
+    int hold_ms = sm_json_get_int(args, "hold_ms", SM_DEFAULT_RESET_HOLD_MS);
+    if (hold_ms < 1) hold_ms = 1;
+    if (hold_ms > SM_MAX_RESET_HOLD_MS) hold_ms = SM_MAX_RESET_HOLD_MS;
+    const char *wait_pat = sm_json_get_string(args, "wait_pattern");
+    if (wait_pat && !wait_pat[0]) wait_pat = NULL;
+    int wait_ms = sm_json_get_int(args, "timeout_ms", 10000);
+    if (wait_ms < 100) wait_ms = 100;
+    if (wait_ms > SM_MAX_EXPECT_TIMEOUT_MS) wait_ms = SM_MAX_EXPECT_TIMEOUT_MS;
+
+    mcp_reset_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return strdup("[ERROR] out of memory");
+    snprintf(ctx->pin, sizeof(ctx->pin), "%s", pin);
+    ctx->hold_ms = hold_ms;
+    if (!wait_pat)
+        ctx->jsonrpc_id = cJSON_Duplicate(jsonrpc_id, 1);
+    if (sm_broker_schedule_line_reset(b, pin, hold_ms, mcp_reset_done, ctx) != 0) {
+        cJSON_Delete(ctx->jsonrpc_id);
+        free(ctx);
+        return strdup("[ERROR] reset busy or unavailable (suspended, link "
+                      "down, or modem lines not drivable)");
+    }
+    if (!wait_pat)
+        return NULL;  /* answered by mcp_reset_done on release */
+
+    char expect_id[16];
+    mcp_gen_expect_id(mcp, expect_id, sizeof(expect_id));
+    int erc = sm_expect_add(&b->expect, expect_id, wait_pat,
+                            (double)wait_ms / 1000.0, SM_MCP_CLIENT_ID);
+    if (erc != 0) {
+        char err[160];
+        snprintf(err, sizeof(err), "[ERROR] reset started, but wait_pattern "
+                 "rejected: %s", sm_expect_add_errstr(erc));
+        return strdup(err);
+    }
+    if (!mcp_alloc_pending(mcp, jsonrpc_id, expect_id)) {
+        sm_expect_cancel_id(&b->expect, expect_id);
+        return strdup("[ERROR] reset started, but too many pending calls");
+    }
+    return NULL;  /* answered by the expect result */
+}
+
 static char *tool_serial_wait_for(sm_mcp_sink_t *mcp, cJSON *args,
                                     cJSON *jsonrpc_id)
 {
@@ -671,6 +751,8 @@ char *mcp_tool_dispatch(sm_mcp_sink_t *mcp, const char *name, cJSON *args,
         result = tool_serial_add_autoresponder(mcp, args);
     else if (strcmp(name, "serial_pin_control") == 0)
         result = tool_serial_pin_control(mcp, args, jsonrpc_id);
+    else if (strcmp(name, "serial_reset") == 0)
+        result = tool_serial_reset(mcp, args, jsonrpc_id);
     else if (strcmp(name, "serial_sysrq") == 0)
         result = tool_serial_sysrq(mcp, args, jsonrpc_id);
     else if (strcmp(name, "serial_suspend") == 0)

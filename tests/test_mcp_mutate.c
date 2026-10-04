@@ -29,7 +29,7 @@ static const char *const k_ro_tools[] = {
 static const char *const k_mutate_tools[] = {
     "serial_write", "serial_send_command", "serial_sysrq",
     "serial_pin_control", "serial_add_autoresponder", "serial_suspend",
-    "serial_resume", "serial_add_watchdog",
+    "serial_resume", "serial_add_watchdog", "serial_reset",
 };
 
 static void test_default_hides_sysrq(void)
@@ -57,8 +57,10 @@ static void test_opt_in_lists_sysrq(void)
     ASSERT(sm_mcp_mutate_enabled(), "mutate on");
     cJSON *tools = sm_mcp_build_tools_list();
     ASSERT_NOT_NULL(tools);
-    ASSERT_INT_EQ(cJSON_GetArraySize(tools), 17);
+    ASSERT_INT_EQ(cJSON_GetArraySize(tools), 18);
     ASSERT(list_has(tools, "serial_sysrq"), "sysrq listed when opted in");
+    ASSERT(list_has(tools, "serial_reset"), "reset listed when opted in");
+    ASSERT(sm_mcp_tool_is_mutate("serial_reset"), "reset is a write tool");
     ASSERT(list_has(tools, "serial_write"), "write listed when opted in");
     ASSERT(list_has(tools, "serial_read"), "read still listed");
     cJSON_Delete(tools);

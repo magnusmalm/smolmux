@@ -219,8 +219,29 @@ static void break_cancel(sm_broker_t *b)
 {
     if (b->break_state == SM_BRK_IDLE) return;
     if (b->break_state == SM_BRK_ASSERTED)
-        b->link->set_param(b->link, "break", "clear");
+        b->link->set_param(b->link, b->break_pin, "clear");
     break_complete(b, -1);
+}
+
+/* Lazily create the machine's timerfd and register it with epoll. */
+static int break_timer_ensure(sm_broker_t *b)
+{
+    if (b->break_timer_fd >= 0) return 0;
+    b->break_timer_fd =
+        timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (b->break_timer_fd >= 0) {
+        struct epoll_event ev = {.events = EPOLLIN,
+                                 .data.ptr = EPOLL_TAG_BRKTIMER};
+        if (epoll_ctl(b->epoll_fd, EPOLL_CTL_ADD, b->break_timer_fd, &ev) < 0) {
+            close(b->break_timer_fd);
+            b->break_timer_fd = -1;
+        }
+    }
+    if (b->break_timer_fd < 0) {
+        SM_LOG_ERROR(LOG_TAG, "break timerfd: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int sm_broker_schedule_break(sm_broker_t *b, int duration_ms,
@@ -237,6 +258,7 @@ int sm_broker_schedule_break(sm_broker_t *b, int duration_ms,
     if (delay_ms < 0) delay_ms = 0;
     if (delay_ms > SM_MAX_SYSRQ_DELAY_MS) delay_ms = SM_MAX_SYSRQ_DELAY_MS;
 
+    snprintf(b->break_pin, sizeof(b->break_pin), "break");
     if (b->link->set_param(b->link, "break", "set") != 0) {
         /* Link without break assert/release (e.g. GDB, where send_break is
          * an instantaneous signal) — run the whole sequence synchronously. */
@@ -248,23 +270,9 @@ int sm_broker_schedule_break(sm_broker_t *b, int duration_ms,
         return 0;
     }
 
-    if (b->break_timer_fd < 0) {
-        b->break_timer_fd =
-            timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        if (b->break_timer_fd >= 0) {
-            struct epoll_event ev = {.events = EPOLLIN,
-                                     .data.ptr = EPOLL_TAG_BRKTIMER};
-            if (epoll_ctl(b->epoll_fd, EPOLL_CTL_ADD, b->break_timer_fd,
-                          &ev) < 0) {
-                close(b->break_timer_fd);
-                b->break_timer_fd = -1;
-            }
-        }
-        if (b->break_timer_fd < 0) {
-            SM_LOG_ERROR(LOG_TAG, "break timerfd: %s", strerror(errno));
-            b->link->set_param(b->link, "break", "clear");
-            return -1;
-        }
+    if (break_timer_ensure(b) != 0) {
+        b->link->set_param(b->link, "break", "clear");
+        return -1;
     }
 
     b->break_state = SM_BRK_ASSERTED;
@@ -289,6 +297,38 @@ int sm_broker_schedule_break(sm_broker_t *b, int duration_ms,
     return 0;
 }
 
+int sm_broker_schedule_line_reset(sm_broker_t *b, const char *pin, int hold_ms,
+                                  sm_break_done_fn done, void *ctx)
+{
+    if (b->suspended || b->link_disconnected) return -1;
+    if (b->break_state != SM_BRK_IDLE) return -1;  /* shares the break slot */
+    if (!pin || (strcmp(pin, "rts") != 0 && strcmp(pin, "dtr") != 0)) return -1;
+    if (hold_ms <= 0) hold_ms = SM_DEFAULT_RESET_HOLD_MS;
+    if (hold_ms > SM_MAX_RESET_HOLD_MS) hold_ms = SM_MAX_RESET_HOLD_MS;
+    const char *other = strcmp(pin, "rts") == 0 ? "dtr" : "rts";
+
+    if (b->link->set_param(b->link, other, "clear") != 0) return -1;
+    if (break_timer_ensure(b) != 0) return -1;
+    if (b->link->set_param(b->link, pin, "set") != 0) return -1;
+
+    snprintf(b->break_pin, sizeof(b->break_pin), "%s", pin);
+    b->break_state = SM_BRK_ASSERTED;
+    b->break_followup_len = 0;
+    b->break_done = done;
+    b->break_done_ctx = ctx;
+    if (break_timer_arm(b, hold_ms) < 0) {
+        SM_LOG_ERROR(LOG_TAG, "reset timer arm: %s", strerror(errno));
+        b->link->set_param(b->link, pin, "clear");
+        b->break_state = SM_BRK_IDLE;
+        b->break_done = NULL;
+        b->break_done_ctx = NULL;
+        return -1;
+    }
+    SM_LOG_INFO(LOG_TAG, "reset scheduled: %s clear, %s held %dms", other, pin,
+                hold_ms);
+    return 0;
+}
+
 static void handle_break_timer(sm_broker_t *b)
 {
     uint64_t expirations;
@@ -298,16 +338,18 @@ static void handle_break_timer(sm_broker_t *b)
 
     switch (b->break_state) {
     case SM_BRK_ASSERTED: {
-        int rc = b->link->set_param(b->link, "break", "clear");
+        int rc = b->link->set_param(b->link, b->break_pin, "clear");
         if (rc != 0) {
             /* Clearing the BREAK failed — it is still physically asserted and
              * would block all further TX on the line. Retry once before
              * giving up. */
-            SM_LOG_WARN(LOG_TAG, "break clear failed (rc=%d), retrying", rc);
-            rc = b->link->set_param(b->link, "break", "clear");
+            SM_LOG_WARN(LOG_TAG, "%s clear failed (rc=%d), retrying",
+                        b->break_pin, rc);
+            rc = b->link->set_param(b->link, b->break_pin, "clear");
             if (rc != 0)
-                SM_LOG_ERROR(LOG_TAG, "break clear retry failed (rc=%d); "
-                             "BREAK may remain asserted on %s", rc, b->port);
+                SM_LOG_ERROR(LOG_TAG, "%s clear retry failed (rc=%d); "
+                             "it may remain asserted on %s", b->break_pin, rc,
+                             b->port);
         }
         if (rc == 0 && b->break_followup_len) {
             if (b->break_delay_ms > 0 &&
@@ -1224,6 +1266,30 @@ static void handle_pin_control(sm_broker_t *b, sm_client_t *c, sm_msg_t *msg)
     }
     if (!pin_is_line_control(pin)) {
         send_to_client(c, sm_msg_error(id, "unknown pin (expected dtr, rts, or break)"));
+        return;
+    }
+
+    /* action "reset" (rts|dtr): clear the other line, hold this one,
+     * release; the ack comes when the line is released. */
+    if (strcmp(action, "reset") == 0 && strcmp(pin, "break") != 0) {
+        pin_break_ctx_t *ctx = calloc(1, sizeof(*ctx));
+        if (!ctx) {
+            send_to_client(c, sm_msg_error(id, "out of memory"));
+            return;
+        }
+        snprintf(ctx->client_id, sizeof(ctx->client_id), "%s", c->id);
+        if (id) {
+            ctx->has_id = 1;
+            snprintf(ctx->msg_id, sizeof(ctx->msg_id), "%s", id);
+        }
+        int hold_ms = sm_json_get_int(msg->root, "duration_ms",
+                                      SM_DEFAULT_RESET_HOLD_MS);
+        if (sm_broker_schedule_line_reset(b, pin, hold_ms, pin_break_done,
+                                          ctx) != 0) {
+            free(ctx);
+            send_to_client(c, sm_msg_error(id, "reset busy or unavailable "
+                           "(suspended, link down, or modem lines not drivable)"));
+        }
         return;
     }
 

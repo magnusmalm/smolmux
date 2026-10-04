@@ -1679,6 +1679,13 @@ static void usage(FILE *out, const char *prog)
         "    action: set, clear, toggle, pulse\n"
         "    --duration <ms>       Break/pulse duration (default: 250)\n"
         "\n"
+        "  reset                   Reset the target via the auto-reset circuit:\n"
+        "                          clear the other line, assert --pin, release\n"
+        "    --pin <rts|dtr>       Reset line (default: rts, ESP32-style)\n"
+        "    --hold <ms>           Assert time (default: 100)\n"
+        "    --wait <regex>        Then wait for a boot line (armed before release)\n"
+        "    --timeout <ms>        For --wait (default: 10000)\n"
+        "\n"
         "  suspend                 Release the serial port for external tools\n"
         "  resume                  Re-acquire the serial port\n"
         "  with-port <cmd> [args]  Suspend, run <cmd>, then always resume\n"
@@ -2365,6 +2372,73 @@ typedef struct {
 /* Proactively flood a key to break into a 0-delay bootloader (the thing an
  * agent-in-the-loop can't win reactively). The broker streams the key from
  * inside its event loop and stops the instant the prompt appears. */
+/* Reset the target through the USB-serial auto-reset circuit. The broker
+ * runs the sequence (pin_control action "reset": clear the other modem line,
+ * hold --pin for --hold ms, release) on its event loop and acks on release.
+ * On ESP32-style boards EN goes low only while RTS is asserted with DTR
+ * released, and a broker opens the port with both asserted - so a bare
+ * `pin rts pulse` does nothing. --wait is armed before the reset request,
+ * so a boot banner printed right at release cannot be missed. */
+static int cmd_reset(int argc, char **argv)
+{
+    const char *pin = "rts";
+    int hold_ms = SM_DEFAULT_RESET_HOLD_MS;
+    const char *wait_pat = NULL;
+    int wait_ms = 10000;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--pin") == 0 && i + 1 < argc) pin = argv[++i];
+        else if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) hold_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc) wait_pat = argv[++i];
+        else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) wait_ms = atoi(argv[++i]);
+        else {
+            fprintf(stderr, "usage: smolmux-cli reset [--pin rts|dtr] [--hold <ms>] "
+                    "[--wait <regex> [--timeout <ms>]]\n");
+            return 1;
+        }
+    }
+    if (strcmp(pin, "rts") != 0 && strcmp(pin, "dtr") != 0) {
+        fprintf(stderr, "error: --pin must be 'rts' or 'dtr'\n");
+        return 1;
+    }
+    if (hold_ms < 1 || hold_ms > SM_MAX_RESET_HOLD_MS) {
+        fprintf(stderr, "error: --hold must be 1..%d ms\n", SM_MAX_RESET_HOLD_MS);
+        return 1;
+    }
+    if (wait_ms < 100) wait_ms = 100;
+    if (wait_ms > SM_MAX_EXPECT_TIMEOUT_MS) wait_ms = SM_MAX_EXPECT_TIMEOUT_MS;
+
+    if (wait_pat)
+        send_msg(sm_msg_listen_expect("cli-reset-wait", wait_pat, wait_ms));
+    send_msg(sm_msg_pin_control("cli-reset", pin, "reset", hold_ms));
+    cJSON *res = NULL;
+    int rc = wait_for_response(SM_MSG_PIN_CONTROL, "cli-reset",
+                               hold_ms + (cli.timeout_ms > 0 ? cli.timeout_ms : 5000),
+                               &res, NULL);
+    if (res) cJSON_Delete(res);
+    if (rc != 0) return 1;   /* error already printed by wait_for_response */
+
+    if (!wait_pat) {
+        if (cli.json_output) printf("{\"status\":\"ok\",\"pin\":\"%s\"}\n", pin);
+        else printf("OK (reset via %s, %d ms)\n", pin, hold_ms);
+        return 0;
+    }
+    res = NULL;
+    rc = wait_for_response(SM_MSG_EXPECT_RESULT, "cli-reset-wait",
+                           wait_ms + 2000, &res, NULL);
+    if (rc != 0) return 1;
+    int matched = res ? sm_json_get_bool(res, "matched", 0) : 0;
+    if (cli.json_output)
+        printf("{\"status\":\"ok\",\"pin\":\"%s\",\"matched\":%s}\n", pin,
+               matched ? "true" : "false");
+    else if (matched)
+        printf("OK (reset via %s; matched /%s/)\n", pin, wait_pat);
+    else
+        fprintf(stderr, "[reset via %s; timeout — /%s/ not matched]\n", pin, wait_pat);
+    if (res) cJSON_Delete(res);
+    return matched ? 0 : 1;
+}
+
 static int cmd_break_uboot(int argc, char **argv)
 {
     const char *key = " ";
@@ -2668,6 +2742,7 @@ static const subcmd_t subcmds[] = {
     {"sysrq",      cmd_sysrq,     1, "controller"},
     {"break-uboot", cmd_break_uboot, 1, "controller"},
     {"pin",        cmd_pin,       1, "controller"},
+    {"reset",      cmd_reset,     1, "controller"},
     {"suspend",    cmd_suspend,   1, "controller"},
     {"resume",     cmd_resume,    1, "controller"},
     {"with-port",  cmd_with_port, 1, "controller"},

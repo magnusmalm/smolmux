@@ -141,6 +141,24 @@ port; a PTY/virtual port can't drive modem lines and the request is rejected.
 Many USB-UART dongles do **not** wire RTS/DTR to board NRST - `--reset` then
 does nothing; use a physical reset or power-cycle while the flood runs.
 
+### Resetting an ESP32-style board (`reset`)
+
+Boards with the usual auto-reset pair on RTS/DTR (ESP32 dev kits, many
+CH340/CH343/CP210x adapters) reset only while RTS is asserted **and DTR is
+not**. The broker opens the port with both asserted, so a bare
+`pin rts pulse` does nothing. `reset` clears the other line first, asserts
+the reset line for `--hold` ms and releases it:
+
+```bash
+smolmux-cli reset                                  # DTR clear, RTS pulse
+smolmux-cli reset --wait 'commands:' --timeout 8000   # then wait for a boot line
+smolmux-cli reset --pin dtr                        # boards that reset on DTR
+```
+
+`--wait` is armed before the release, so a fast boot banner is not missed
+(unlike `pin ... && wait-for ...`). Exit status: 0 = reset (and matched),
+1 = no match before the timeout or a pin error.
+
 ### Tracking cold-boot progress (which stage did it die at?)
 
 The flood gets you *into* U-Boot; boot-stage tracking tells you *where a boot

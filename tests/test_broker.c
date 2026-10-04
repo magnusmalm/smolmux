@@ -1,4 +1,5 @@
 #include "test_main.h"
+#include "util/timeutil.h"
 #include "broker.h"
 #include "client.h"
 #include "links/uart.h"
@@ -3018,6 +3019,107 @@ static void test_reset_and_interrupt(void)
     close(sp[1]);
 }
 
+/* pin_control action "reset" (todo #23 / serial_reset): the broker clears
+ * the other modem line, asserts the reset line, and releases it after the
+ * hold on its timerfd. The ack arrives only on release, and the event loop
+ * keeps serving clients during the hold. */
+static void test_pin_reset_sequence_nonblocking(void)
+{
+    int sp[2];
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair");
+    fcntl(sp[0], F_SETFL, O_NONBLOCK);
+    sm_link_t *link = fake_link_new(sp[0]);
+    fake_link_data_t *ld = link->data;
+    sm_broker_t broker;
+    sm_broker_init(&broker, link, TEST_SOCK);
+    snprintf(broker.port, sizeof(broker.port), "fake");
+    pthread_t tid;
+    pthread_create(&tid, NULL, broker_thread, &broker);
+    usleep(STARTUP_DELAY);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("t", "controller"));
+    sm_msg_t w = recv_json(fd);
+    sm_msg_free(&w);
+
+    double t0 = sm_now_monotonic();
+    send_json(fd, sm_msg_pin_control("rst1", "rts", "reset", 300));
+    usleep(50000);
+    ASSERT_INT_EQ(ld->pin_log_n, 2);   /* asserted, not yet released */
+    if (ld->pin_log_n >= 2) {
+        ASSERT_STR_EQ(ld->pin_log[0], "dtr=clear");
+        ASSERT_STR_EQ(ld->pin_log[1], "rts=set");
+    }
+    /* Mid-hold, the loop still answers. */
+    double ts = sm_now_monotonic();
+    send_json(fd, sm_msg_status("st-mid"));
+    cJSON *st = recv_type(fd, "status_response", 1000);
+    ASSERT_NOT_NULL(st);
+    ASSERT(sm_now_monotonic() - ts < 0.15, "status answered during the hold");
+    cJSON_Delete(st);
+
+    cJSON *ack = recv_type(fd, "pin_control", 2000);
+    ASSERT_NOT_NULL(ack);
+    if (ack) {
+        ASSERT_STR_EQ(sm_json_get_string(ack, "status"), "ok");
+        cJSON_Delete(ack);
+    }
+    ASSERT(sm_now_monotonic() - t0 >= 0.28, "ack only after the hold");
+    ASSERT_INT_EQ(ld->pin_log_n, 3);
+    if (ld->pin_log_n >= 3)
+        ASSERT_STR_EQ(ld->pin_log[2], "rts=clear");
+
+    close(fd);
+    sm_broker_stop(&broker);
+    pthread_join(tid, NULL);
+    sm_broker_destroy(&broker);
+    close(sp[1]);
+}
+
+/* A suspend mid-hold cancels the reset: the line is released and the
+ * requester gets an error instead of an ack. */
+static void test_pin_reset_cancelled_by_suspend(void)
+{
+    int sp[2];
+    ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair");
+    fcntl(sp[0], F_SETFL, O_NONBLOCK);
+    sm_link_t *link = fake_link_new(sp[0]);
+    fake_link_data_t *ld = link->data;
+    sm_broker_t broker;
+    sm_broker_init(&broker, link, TEST_SOCK);
+    snprintf(broker.port, sizeof(broker.port), "fake");
+    pthread_t tid;
+    pthread_create(&tid, NULL, broker_thread, &broker);
+    usleep(STARTUP_DELAY);
+
+    int fd = connect_unix(TEST_SOCK);
+    send_json(fd, sm_msg_hello("t", "controller"));
+    sm_msg_t w = recv_json(fd);
+    sm_msg_free(&w);
+
+    send_json(fd, sm_msg_pin_control("rst2", "dtr", "reset", 1500));
+    usleep(50000);
+    send_json(fd, sm_msg_suspend("sus1"));
+    cJSON *err = recv_type(fd, "error", 1000);
+    ASSERT_NOT_NULL(err);
+    if (err) {
+        ASSERT_STR_EQ(sm_json_get_string(err, "id"), "rst2");
+        cJSON_Delete(err);
+    }
+    ASSERT(ld->pin_log_n >= 3, "line touched three times");
+    if (ld->pin_log_n >= 3) {
+        ASSERT_STR_EQ(ld->pin_log[0], "rts=clear");
+        ASSERT_STR_EQ(ld->pin_log[1], "dtr=set");
+        ASSERT_STR_EQ(ld->pin_log[2], "dtr=clear");   /* released on cancel */
+    }
+
+    close(fd);
+    sm_broker_stop(&broker);
+    pthread_join(tid, NULL);
+    sm_broker_destroy(&broker);
+    close(sp[1]);
+}
+
 /* reset_and_interrupt with hold >= duration is rejected (flood must outlast the
  * reset hold, else keys stop before the device boots). */
 static void test_reset_and_interrupt_bad_hold(void)
@@ -3317,6 +3419,8 @@ int main(void)
     RUN_TEST(test_autoboot_flood_timeout);
     RUN_TEST(test_reset_and_interrupt);
     RUN_TEST(test_reset_and_interrupt_bad_hold);
+    RUN_TEST(test_pin_reset_sequence_nonblocking);
+    RUN_TEST(test_pin_reset_cancelled_by_suspend);
     RUN_TEST(test_autoresponder_fires);
     RUN_TEST(test_boot_stage_progress);
     RUN_TEST(test_output_before_boot_stage);

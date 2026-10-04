@@ -173,7 +173,8 @@ smolmux-mcp -s /tmp/smolmux-<board>-console.sock -p configs/linux-shell.smolmux-
  - U-Boot: `version`, `bdinfo`, `printenv`, `md <addr>`
  - Linux: `uname -a`, `cat /proc/cpuinfo`, `cat /proc/meminfo`, `dmesg | head`
  - RTOS/bare-metal shell: the shell's own `help`/`version`/`ps`
-- Use `serial_pin_control` (DTR/RTS/break) or `serial_sysrq` where the target
+- Use `serial_reset` to reboot through the adapter's auto-reset circuit,
+  `serial_pin_control` (DTR/RTS/break) or `serial_sysrq` where the target
   supports it; `serial_add_watchdog` to watch for a pattern while you work.
 
 ## Step 4 - Enumerate peripherals
@@ -194,7 +195,7 @@ where reality diverges from the datasheet; write those down.
 
 **Serial (`smolmux-mcp`):** serial_send_command, serial_read, serial_write,
 serial_port_status, serial_boot_status, serial_add_autoresponder,
-serial_pin_control, serial_sysrq, serial_suspend, serial_resume,
+serial_pin_control, serial_reset, serial_sysrq, serial_suspend, serial_resume,
 serial_output_history, serial_get_incidents, serial_add_watchdog, serial_monitor,
 serial_generate_report, serial_list_ports.
 

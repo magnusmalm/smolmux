@@ -28,8 +28,9 @@ static const char SM_SERIAL_INSTRUCTIONS_RO[] =
     "when write tools are listed.\n"
     "5. Baud must match firmware and the broker profile; garbage text is "
     "often the wrong baud or the wrong port (list_ports, by-id paths).\n"
-    "6. Write tools (serial_write, serial_send_command, pins, SysRq, "
-    "suspend, autoresponder add) are listed only when SMOLMUX_MCP_MUTATE=1. "
+    "6. Write tools (serial_write, serial_send_command, pins, reset, "
+    "SysRq, suspend, autoresponder add) are listed only when "
+    "SMOLMUX_MCP_MUTATE=1. "
     "Default tools/list is read-only.\n";
 
 static const char SM_SERIAL_INSTRUCTIONS_RW[] =
@@ -142,9 +143,10 @@ static char *build_bringup(const char *port_hint)
         "for a new broker; this MCP talks to the already-running broker.\n"
         "3. serial_boot_status — report furthest boot stage / stall if "
         "the device profile declares boot_stages.\n"
-        "4. If the board needs a hard reset: serial_pin_control "
-        "(dtr/rts/break) as appropriate for the board, then re-check "
-        "serial_boot_status and serial_output_history.\n"
+        "4. If the board needs a hard reset: serial_reset (clears the "
+        "other modem line, holds rts or dtr; pass wait_pattern for the "
+        "boot line), then re-check serial_boot_status and "
+        "serial_output_history.\n"
         "5. Proof of life: serial_monitor briefly, or serial_read after "
         "history, looking for a banner, prompt, or heartbeat line. "
         "If silent, serial_get_incidents — a crash-loop is not quiet.\n"

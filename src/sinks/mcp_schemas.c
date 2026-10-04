@@ -101,6 +101,7 @@ int sm_mcp_tool_is_mutate(const char *name)
         "serial_write",
         "serial_add_autoresponder",
         "serial_pin_control",
+        "serial_reset",
         "serial_sysrq",
         "serial_suspend",
         "serial_resume",
@@ -241,6 +242,29 @@ cJSON *sm_mcp_build_tools_list(void)
             "boot-mode lines (ESP32, many dev boards), so a pulse can reset "
             "the target. For a Linux SysRq use serial_sysrq, which sends the "
             "break and the key together.", s));
+    }
+
+    /* serial_reset */
+    if (mutate) {
+        cJSON *s = schema_object();
+        cJSON *props = cJSON_CreateObject();
+        schema_add_string(props, "pin",
+            "Reset line: rts (default; ESP32 dev kits, most CH340/CP210x "
+            "auto-reset circuits) or dtr.");
+        schema_add_integer(props, "hold_ms",
+            "How long the reset line is held (default 100, max 2000).");
+        schema_add_string(props, "wait_pattern",
+            "Optional regex for a boot line to wait for after the reset "
+            "(armed before the release, so a fast banner is not missed).");
+        schema_add_integer(props, "timeout_ms",
+            "With wait_pattern: max wait in ms (default 10000).");
+        cJSON_AddItemToObject(s, "properties", props);
+        cJSON_AddItemToArray(tools, make_tool_destr("serial_reset",
+            "Reset the target through the USB-serial auto-reset circuit: "
+            "clears the other modem line, holds the reset line, releases it. "
+            "Use this instead of serial_pin_control pulses, which do nothing "
+            "on ESP32-style boards while DTR is asserted (it is, right after "
+            "the broker opens the port). Then check serial_boot_status.", s));
     }
 
     /* serial_sysrq */
