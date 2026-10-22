@@ -1,5 +1,7 @@
 # smolmux
 
+[![Smolmux Gdb MCP on mcprush](https://mcprush.com/badge/smolmux-gdb-mcp/score.svg)](https://mcprush.com/to/smolmux-gdb-mcp?ref=badge)
+
 A portable C11 device multiplexer. Holds a device connection open (serial UART, GDB stub) and multiplexes access to multiple clients over Unix sockets using newline-delimited JSON.
 
 Single static binary, low latency, small footprint - built for daily serial and
